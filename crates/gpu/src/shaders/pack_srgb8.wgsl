@@ -1,0 +1,96 @@
+// Final stage: read one intermediate Rgba32Float slot (Oklcha) and pack to
+// a sRGB-encoded Rgba8Unorm texture ready for egui display. Storage format
+// stays Rgba8Unorm because wgpu does not allow storage bindings to
+// sRGB-view formats; we apply the gamma encoding manually here.
+//
+// Mode controls the interpretation of the source slot:
+//   0 = color   — Oklcha -> sRGB gamma
+//   1 = scalar-const (unused: const path baked into a Color layer instead)
+//   2 = scalar-layer — take .L, put in RGB, alpha=1
+//   3 = normal — assume the slot holds `normal_to_color(n)` (Oklcha of the
+//                encoded normal), convert back to sRGB and display
+
+struct PackParams {
+    size: vec2<u32>,
+    mode: u32,
+    _pad: u32,
+    // used only when mode == 1
+    const_value: vec4<f32>,
+}
+
+// common.wgsl (inlined by the pipeline creation code below at build time)
+// ---------------------------------------------------------------------
+const PI: f32 = 3.14159265358979323846;
+const DEG_TO_RAD: f32 = PI / 180.0;
+
+fn oklch_to_oklab(l: f32, c: f32, h_deg: f32) -> vec3<f32> {
+    let h_rad = h_deg * DEG_TO_RAD;
+    return vec3<f32>(l, c * cos(h_rad), c * sin(h_rad));
+}
+
+fn oklab_to_linear_srgb(l: f32, a: f32, b: f32) -> vec3<f32> {
+    let l_ = l + 0.3963377774 * a + 0.2158037573 * b;
+    let m_ = l - 0.1055613458 * a - 0.0638541728 * b;
+    let s_ = l - 0.0894841775 * a - 1.2914855480 * b;
+    let lc = l_ * l_ * l_;
+    let mc = m_ * m_ * m_;
+    let sc = s_ * s_ * s_;
+    return vec3<f32>(
+         4.0767416621 * lc - 3.3077115913 * mc + 0.2309699292 * sc,
+        -1.2684380046 * lc + 2.6097574011 * mc - 0.3413193965 * sc,
+        -0.0041960863 * lc - 0.7034186147 * mc + 1.7076147010 * sc,
+    );
+}
+
+fn linear_to_srgb_component(x: f32) -> f32 {
+    let clamped = clamp(x, 0.0, 1.0);
+    if (clamped <= 0.0031308) {
+        return 12.92 * clamped;
+    } else {
+        return 1.055 * pow(clamped, 1.0 / 2.4) - 0.055;
+    }
+}
+
+fn linear_to_srgb(lin: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        linear_to_srgb_component(lin.x),
+        linear_to_srgb_component(lin.y),
+        linear_to_srgb_component(lin.z),
+    );
+}
+
+fn oklcha_to_srgb(v: vec4<f32>) -> vec4<f32> {
+    let l_clamped = clamp(v.x, 0.0, 1.0);
+    let c_clamped = max(v.y, 0.0);
+    let lab = oklch_to_oklab(l_clamped, c_clamped, v.z);
+    let lin = oklab_to_linear_srgb(lab.x, lab.y, lab.z);
+    let srgb = linear_to_srgb(lin);
+    return vec4<f32>(srgb, clamp(v.w, 0.0, 1.0));
+}
+// ---------------------------------------------------------------------
+
+@group(0) @binding(0) var<uniform> params: PackParams;
+@group(0) @binding(1) var src: texture_2d<f32>;
+@group(0) @binding(2) var dst: texture_storage_2d<rgba8unorm, write>;
+
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= params.size.x || gid.y >= params.size.y) { return; }
+    let coord = vec2<i32>(i32(gid.x), i32(gid.y));
+    let src_px = textureLoad(src, coord, 0);
+    var packed: vec4<f32>;
+    if (params.mode == 0u) {
+        packed = oklcha_to_srgb(src_px);
+    } else if (params.mode == 2u) {
+        // scalar-from-layer — take L, encode as gray sRGB.
+        let l = clamp(src_px.x, 0.0, 1.0);
+        let g = linear_to_srgb_component(l);
+        packed = vec4<f32>(g, g, g, 1.0);
+    } else {
+        // mode == 3: source already holds a normal encoded via
+        // normal_to_color (Oklcha of an sRGB-encoded normal). Round-trip
+        // it back to sRGB and display; matches the CPU path exactly.
+        packed = oklcha_to_srgb(src_px);
+    }
+    textureStore(dst, coord, packed);
+}

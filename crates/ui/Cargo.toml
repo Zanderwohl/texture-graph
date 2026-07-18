@@ -15,11 +15,13 @@ path = "src/main.rs"
 texture-graph-core = { path = "../core" }
 eframe = { version = "0.35", default-features = false, features = [
     "default_fonts",
-    "glow",
+    "wgpu",
     "wayland",
     "x11",
 ] }
 egui = "0.35"
+egui-wgpu = "0.35"
+wgpu = "26"
 palette.workspace = true
 serde.workspace = true
 ron.workspace = true
