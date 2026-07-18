@@ -18,7 +18,7 @@ pub mod id;
 pub mod kind;
 
 pub use color::{BlendSpace, Color};
-pub use eval::{EvalCtx, Sample, evaluate_material};
+pub use eval::{EvalCtx, Material, Sample, evaluate, evaluate_material};
 pub use file::{
     CURRENT_FORMAT_VERSION, FILE_EXTENSION, FileMetadata, LoadError, SaveError, TextureGraphFile,
     load_from_path, load_from_str, save_to_path, save_to_string,
