@@ -73,6 +73,68 @@ fn oklcha_to_srgb(v: vec4<f32>) -> vec4<f32> {
 @group(0) @binding(1) var src: texture_2d<f32>;
 @group(0) @binding(2) var dst: texture_storage_2d<rgba8unorm, write>;
 
+// Out-of-range "presentation" checker. Only affects what the user sees in
+// previews — the underlying Rgba32Float intermediates that flow between
+// layers stay unclamped, so a signed-noise Mix::Add stack composes exactly
+// as before. We just refuse to silently clamp negatives to black etc.
+//
+// 10-px checker cells alternating bright magenta and black.
+const CHECKER_CELL: u32 = 10u;
+
+fn checker_srgb(gid_xy: vec2<u32>) -> vec4<f32> {
+    let cell = vec2<u32>(gid_xy.x / CHECKER_CELL, gid_xy.y / CHECKER_CELL);
+    let parity = (cell.x + cell.y) & 1u;
+    if (parity == 0u) {
+        return vec4<f32>(1.0, 0.0, 1.0, 1.0);
+    }
+    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+}
+
+// Alpha-backing checker — the Photoshop-style light/dark gray pattern
+// shown under partially-transparent pixels so the user actually notices
+// alpha < 1. Blended in gamma sRGB, which matches how apps like Photoshop
+// display transparency (not physically correct, but the familiar look).
+const ALPHA_CHECKER_CELL: u32 = 8u;
+
+fn alpha_backing_srgb(gid_xy: vec2<u32>) -> vec3<f32> {
+    let cell = vec2<u32>(gid_xy.x / ALPHA_CHECKER_CELL, gid_xy.y / ALPHA_CHECKER_CELL);
+    let parity = (cell.x + cell.y) & 1u;
+    if (parity == 0u) {
+        return vec3<f32>(0.75, 0.75, 0.75);
+    }
+    return vec3<f32>(0.55, 0.55, 0.55);
+}
+
+// Composite `packed` (foreground, straight-alpha sRGB) over the alpha
+// checker if `packed.w < 1`. Result has alpha = 1 so the display never
+// blends with whatever's underneath the preview panel.
+fn composite_alpha(packed: vec4<f32>, gid_xy: vec2<u32>) -> vec4<f32> {
+    let a = clamp(packed.w, 0.0, 1.0);
+    if (a >= 1.0 - RANGE_EPS) {
+        return vec4<f32>(packed.xyz, 1.0);
+    }
+    let bg = alpha_backing_srgb(gid_xy);
+    let mixed = packed.xyz * a + bg * (1.0 - a);
+    return vec4<f32>(mixed, 1.0);
+}
+
+// Tolerance so f32 wobble near the boundaries doesn't flicker a valid
+// image between "in gamut" and "checker".
+const RANGE_EPS: f32 = 1e-4;
+
+fn oklcha_out_of_range(v: vec4<f32>) -> bool {
+    // L outside [0, 1], negative chroma, or alpha outside [0, 1].
+    return v.x < -RANGE_EPS
+        || v.x > 1.0 + RANGE_EPS
+        || v.y < -RANGE_EPS
+        || v.w < -RANGE_EPS
+        || v.w > 1.0 + RANGE_EPS;
+}
+
+fn scalar_out_of_range(l: f32) -> bool {
+    return l < -RANGE_EPS || l > 1.0 + RANGE_EPS;
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.size.x || gid.y >= params.size.y) { return; }
@@ -80,17 +142,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let src_px = textureLoad(src, coord, 0);
     var packed: vec4<f32>;
     if (params.mode == 0u) {
-        packed = oklcha_to_srgb(src_px);
+        if (oklcha_out_of_range(src_px)) {
+            packed = checker_srgb(gid.xy);
+        } else {
+            packed = composite_alpha(oklcha_to_srgb(src_px), gid.xy);
+        }
     } else if (params.mode == 2u) {
         // scalar-from-layer — take L, encode as gray sRGB.
-        let l = clamp(src_px.x, 0.0, 1.0);
-        let g = linear_to_srgb_component(l);
-        packed = vec4<f32>(g, g, g, 1.0);
+        if (scalar_out_of_range(src_px.x)) {
+            packed = checker_srgb(gid.xy);
+        } else {
+            let g = linear_to_srgb_component(clamp(src_px.x, 0.0, 1.0));
+            packed = vec4<f32>(g, g, g, 1.0);
+        }
     } else {
         // mode == 3: source already holds a normal encoded via
-        // normal_to_color (Oklcha of an sRGB-encoded normal). Round-trip
-        // it back to sRGB and display; matches the CPU path exactly.
-        packed = oklcha_to_srgb(src_px);
+        // normal_to_color (Oklcha of an sRGB-encoded normal). It's produced
+        // by our own encoder so it's always in gamut, but check anyway in
+        // case a user routed something weird into the normal slot.
+        if (oklcha_out_of_range(src_px)) {
+            packed = checker_srgb(gid.xy);
+        } else {
+            packed = composite_alpha(oklcha_to_srgb(src_px), gid.xy);
+        }
     }
     textureStore(dst, coord, packed);
 }

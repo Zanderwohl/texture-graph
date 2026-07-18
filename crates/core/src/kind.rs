@@ -12,6 +12,7 @@ pub enum LayerKind {
     Transform(Transform),
     Mix(Mix),
     Map(Map),
+    MinMax(MinMax),
     HeightToNormal(HeightToNormal),
 }
 
@@ -24,6 +25,7 @@ impl LayerKind {
             LayerKind::Transform(_) => "Transform",
             LayerKind::Mix(_) => "Mix",
             LayerKind::Map(_) => "Map",
+            LayerKind::MinMax(_) => "MinMax",
             LayerKind::HeightToNormal(_) => "HeightToNormal",
         }
     }
@@ -58,6 +60,10 @@ impl LayerKind {
             LayerKind::Map(m) => {
                 out.push(m.value);
                 out.push(m.palette);
+            }
+            LayerKind::MinMax(mm) => {
+                out.push(mm.a);
+                out.push(mm.b);
             }
             LayerKind::HeightToNormal(h) => out.push(h.source),
         }
@@ -204,4 +210,41 @@ pub struct Map {
 pub struct HeightToNormal {
     pub source: LayerId,
     pub strength: f32,
+}
+
+/// Per-pixel winner-take-all between two color layers. Whichever pixel
+/// wins on the chosen `criterion` under `mode`, its full Oklcha value
+/// (all four channels) flows to the output — useful for salvaging a
+/// specific attribute from noise while keeping the rest of that pixel
+/// coherent.
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+pub struct MinMax {
+    pub a: LayerId,
+    pub b: LayerId,
+    pub mode: MinMaxMode,
+    pub criterion: Criterion,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum MinMaxMode {
+    Min,
+    Max,
+}
+
+/// Which attribute of each pixel to compare. RGB / Saturation / Value /
+/// Luma are computed in gamma-encoded sRGB (what a monitor shows), so
+/// "brightest red" matches naïve intuition. Alpha and Chroma are read
+/// straight off the Oklcha value.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum Criterion {
+    Red,
+    Green,
+    Blue,
+    Saturation,
+    Value,
+    /// Rec.709 luma in gamma sRGB: `0.2126R + 0.7152G + 0.0722B`.
+    Luma,
+    Alpha,
+    /// Oklch chroma (colorfulness). Perceptually uniform.
+    Chroma,
 }

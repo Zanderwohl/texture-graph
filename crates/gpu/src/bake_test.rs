@@ -2,9 +2,9 @@
 //! comparing the GPU output to `core`'s CPU evaluator.
 
 use texture_graph_core::{
-    BlendMode, BlendSpace, Color, ColorInput, ColorRamp, ColorStop, CoordMode, EvalCtx, Graph,
-    HeightToNormal, LayerKind, Map, Mix, Noise, NoiseDims, NoiseOutput, NoiseRange, Output,
-    ScalarInput, Transform, color::to_srgb8,
+    BlendMode, BlendSpace, Color, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion,
+    EvalCtx, Graph, HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims,
+    NoiseOutput, NoiseRange, Output, ScalarInput, Transform, color::to_srgb8,
 };
 
 use crate::{Baker, DeviceCtx};
@@ -537,6 +537,265 @@ fn perf_fractal_stack_1024() {
     let layers = graph.layers.len();
     eprintln!("perf_fractal_stack_1024: layers={} median={:?}", layers, median);
     // Not asserted — human reads the number.
+}
+
+#[test]
+fn min_max_by_luma_picks_brighter_pixel_whole() {
+    // Two Color layers: (L=0.2, C=0, h=0) and (L=0.8, C=0.15, h=200).
+    // Max by Luma should propagate the bright layer's pixel — including its
+    // chroma and hue, not just its L.
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let dark = graph.output.color;
+    graph.set_kind(dark, LayerKind::Color(Color::new(0.2, 0.0, 0.0, 1.0))).unwrap();
+    let bright = graph
+        .add_layer("bright", LayerKind::Color(Color::new(0.8, 0.15, 200.0, 1.0)))
+        .unwrap();
+    let mm = graph
+        .add_layer(
+            "mm",
+            LayerKind::MinMax(MinMax {
+                a: dark,
+                b: bright,
+                mode: MinMaxMode::Max,
+                criterion: Criterion::Luma,
+            }),
+        )
+        .unwrap();
+    graph.set_output(Output {
+        color: mm,
+        roughness: ScalarInput::Const(0.5),
+        metallic: ScalarInput::Const(0.0),
+        normal: None,
+    }).unwrap();
+    let out = baker.bake_output(&graph, SIZE, &EvalCtx::default()).expect("bake");
+    let gpu = readback_first_pixel(&ctx, &out.color);
+    // Winner is the bright layer — compare against its packed sRGB.
+    let expect = to_srgb8(Color::new(0.8, 0.15, 200.0, 1.0));
+    for i in 0..4 {
+        let d = (expect[i] as i32 - gpu[i] as i32).abs();
+        assert!(d <= 2, "MinMax(Max, Luma) channel {i}: expect {} got {} (delta {d})", expect[i], gpu[i]);
+    }
+}
+
+#[test]
+fn min_max_matches_cpu_over_all_criteria() {
+    // Cross-check GPU vs CPU for each criterion using a fixed pair of opaque
+    // colors. Any implementation drift in `criterion_of` on either side
+    // flags here. Alpha criterion needs a separate test because using
+    // non-1.0 alpha would trip the display-side gray checker compositing
+    // and make packed-pixel equality meaningless.
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let a_col = Color::new(0.3, 0.2, 100.0, 1.0);
+    let b_col = Color::new(0.7, 0.05, 20.0, 1.0);
+    let criteria = [
+        Criterion::Red,
+        Criterion::Green,
+        Criterion::Blue,
+        Criterion::Saturation,
+        Criterion::Value,
+        Criterion::Luma,
+        Criterion::Chroma,
+    ];
+    for &crit in &criteria {
+        for &mode in &[MinMaxMode::Min, MinMaxMode::Max] {
+            let mut graph = Graph::new();
+            let a = graph.output.color;
+            graph.set_kind(a, LayerKind::Color(a_col)).unwrap();
+            let b = graph.add_layer("b", LayerKind::Color(b_col)).unwrap();
+            let mm = graph
+                .add_layer(
+                    "mm",
+                    LayerKind::MinMax(MinMax { a, b, mode, criterion: crit }),
+                )
+                .unwrap();
+            graph.set_output(Output {
+                color: mm,
+                roughness: ScalarInput::Const(0.5),
+                metallic: ScalarInput::Const(0.0),
+                normal: None,
+            }).unwrap();
+            let out = baker.bake_output(&graph, SIZE, &EvalCtx::default()).expect("bake");
+            let gpu = readback_first_pixel(&ctx, &out.color);
+            let cpu_material = texture_graph_core::evaluate_material(
+                &graph,
+                texture_graph_core::Sample::uv(0.0, 0.0),
+                &EvalCtx::default(),
+            );
+            let cpu = to_srgb8(cpu_material.color);
+            for i in 0..3 {
+                let d = (cpu[i] as i32 - gpu[i] as i32).abs();
+                assert!(
+                    d <= 3,
+                    "criterion={crit:?} mode={mode:?} channel {i}: cpu {} gpu {} (delta {d})",
+                    cpu[i], gpu[i],
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn min_max_by_alpha_picks_correct_layer() {
+    // Distinct L, distinct alpha; both opaque enough that the alpha checker
+    // barely nudges the display value. Test asserts the *winning L* — using
+    // the higher-alpha layer's L when Max, lower-alpha layer's L when Min.
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let low = Color::new(0.2, 0.0, 0.0, 0.98);
+    let high = Color::new(0.8, 0.0, 0.0, 1.0);
+    for (mode, expected_l) in [(MinMaxMode::Max, 0.8), (MinMaxMode::Min, 0.2)] {
+        let mut graph = Graph::new();
+        let a = graph.output.color;
+        graph.set_kind(a, LayerKind::Color(low)).unwrap();
+        let b = graph.add_layer(&format!("b-{mode:?}"), LayerKind::Color(high)).unwrap();
+        let mm = graph
+            .add_layer(
+                &format!("mm-{mode:?}"),
+                LayerKind::MinMax(MinMax {
+                    a, b, mode,
+                    criterion: Criterion::Alpha,
+                }),
+            )
+            .unwrap();
+        graph.set_output(Output {
+            color: mm,
+            roughness: ScalarInput::Const(0.5),
+            metallic: ScalarInput::Const(0.0),
+            normal: None,
+        }).unwrap();
+        let out = baker.bake_output(&graph, SIZE, &EvalCtx::default()).expect("bake");
+        let gpu = readback_first_pixel(&ctx, &out.color);
+        // Winning color's rough sRGB grayscale target (allow slack because
+        // low.alpha=0.98 lets a hint of gray leak in).
+        let expect = to_srgb8(Color::new(expected_l, 0.0, 0.0, 1.0));
+        let d = (expect[0] as i32 - gpu[0] as i32).abs();
+        assert!(d <= 5, "MinMax(Alpha, {mode:?}) expect~{} got {} (delta {d})", expect[0], gpu[0]);
+    }
+}
+
+#[test]
+fn alpha_lt_one_shows_gray_checker_backing() {
+    // Color layer with alpha = 0.5. Every pixel should be a blend between
+    // the color's sRGB and one of two gray checker cells — never the pure
+    // solid color and never the magenta out-of-range checker.
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let base = graph.output.color;
+    graph.set_kind(base, LayerKind::Color(Color::new(0.5, 0.0, 0.0, 0.5))).unwrap();
+    graph.set_output(Output {
+        color: base,
+        roughness: ScalarInput::Const(0.5),
+        metallic: ScalarInput::Const(0.0),
+        normal: None,
+    }).unwrap();
+    let size = (24u32, 24u32);
+    let out = baker.bake_output(&graph, size, &EvalCtx::default()).expect("bake");
+    let px = readback_all_pixels(&ctx, &out.color, size);
+    // Solid opaque sRGB of L=0.5 gray:
+    let solid = to_srgb8(Color::new(0.5, 0.0, 0.0, 1.0))[0];
+    // Never see the magenta out-of-range marker.
+    for p in &px {
+        assert!(
+            !(p[0] == 255 && p[1] == 0 && p[2] == 255),
+            "alpha < 1 should not trip the out-of-range checker: {:?}",
+            p,
+        );
+        // Alpha channel always fully opaque after compositing.
+        assert_eq!(p[3], 255, "output alpha should be 1 after alpha compositing");
+    }
+    // At least two distinct pixel values appear — the two checker cells
+    // blend to different results.
+    let unique: std::collections::HashSet<u8> = px.iter().map(|p| p[0]).collect();
+    assert!(unique.len() >= 2, "expected multiple values from checker blend, got {unique:?}");
+    // Every displayed value falls between the blended-with-lightgray and
+    // blended-with-darkgray endpoints.
+    let light_end = ((solid as f32) * 0.5 + 0.75 * 255.0 * 0.5).round() as i32;
+    let dark_end  = ((solid as f32) * 0.5 + 0.55 * 255.0 * 0.5).round() as i32;
+    let lo = light_end.min(dark_end) - 4;
+    let hi = light_end.max(dark_end) + 4;
+    for p in &px {
+        let v = p[0] as i32;
+        assert!(
+            v >= lo && v <= hi,
+            "pixel red channel {v} outside expected checker range [{lo}, {hi}]",
+        );
+    }
+}
+
+#[test]
+fn out_of_range_l_paints_magenta_black_checker() {
+    // Color layer with L = -0.5 (well outside [0,1]). Every pixel is out of
+    // range, so every cell should be one of the two checker colors: bright
+    // magenta (255, 0, 255) or black (0, 0, 0). No other colors allowed.
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let base = graph.output.color;
+    graph
+        .set_kind(base, LayerKind::Color(Color::new(-0.5, 0.0, 0.0, 1.0)))
+        .unwrap();
+    graph.set_output(Output {
+        color: base,
+        roughness: ScalarInput::Const(0.5),
+        metallic: ScalarInput::Const(0.0),
+        normal: None,
+    }).unwrap();
+    let size = (40u32, 40u32);
+    let out = baker.bake_output(&graph, size, &EvalCtx::default()).expect("bake");
+    let px = readback_all_pixels(&ctx, &out.color, size);
+    // Every pixel is either magenta or black.
+    let mut magentas = 0usize;
+    let mut blacks = 0usize;
+    for p in &px {
+        let is_magenta = p[0] == 255 && p[1] == 0 && p[2] == 255;
+        let is_black = p[0] == 0 && p[1] == 0 && p[2] == 0;
+        assert!(
+            is_magenta || is_black,
+            "unexpected non-checker pixel {:?}",
+            p,
+        );
+        if is_magenta { magentas += 1; }
+        if is_black { blacks += 1; }
+    }
+    // Both colors should be present.
+    assert!(magentas > 0, "no magenta cells");
+    assert!(blacks > 0, "no black cells");
+    // 10-px cells on a 40-px image → 4x4 = 16 cells; roughly balanced.
+    assert!(magentas > 500, "too few magenta pixels: {magentas}");
+    assert!(blacks > 500, "too few black pixels: {blacks}");
+}
+
+#[test]
+fn in_range_color_does_not_trigger_checker() {
+    // Regression: a normal in-range color must not accidentally show the
+    // checker. Uses the same L=0.6 the color_layer test does.
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let base = graph.output.color;
+    graph
+        .set_kind(base, LayerKind::Color(Color::new(0.6, 0.15, 40.0, 1.0)))
+        .unwrap();
+    graph.set_output(Output {
+        color: base,
+        roughness: ScalarInput::Const(0.5),
+        metallic: ScalarInput::Const(0.0),
+        normal: None,
+    }).unwrap();
+    let out = baker.bake_output(&graph, (16, 16), &EvalCtx::default()).expect("bake");
+    let px = readback_all_pixels(&ctx, &out.color, (16, 16));
+    // No pixel should be exactly bright magenta.
+    for p in &px {
+        assert!(
+            !(p[0] == 255 && p[1] == 0 && p[2] == 255),
+            "in-range color unexpectedly hit the checker: {:?}",
+            p,
+        );
+    }
 }
 
 #[test]

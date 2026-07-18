@@ -6,8 +6,9 @@ use crate::color::{Color, blend, normal_to_color, scalar_of};
 use crate::graph::{Graph, Layer};
 use crate::id::LayerId;
 use crate::kind::{
-    Axis, BlendMode, ColorInput, ColorRamp, CoordMode, HeightToNormal, LayerKind, Map, Mix,
-    Noise, NoiseDims, NoiseOutput, NoiseRange, RadialDim, ScalarInput, Transform,
+    Axis, BlendMode, ColorInput, ColorRamp, CoordMode, Criterion, HeightToNormal, LayerKind,
+    Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims, NoiseOutput, NoiseRange, RadialDim,
+    ScalarInput, Transform,
 };
 
 /// A sample point in the graph's canonical unit cube. Consumers of the
@@ -85,6 +86,7 @@ fn eval_layer(id: LayerId, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &Ev
         LayerKind::Transform(t) => eval_layer(t.source, apply_transform(t, s), by_id, ctx),
         LayerKind::Mix(m) => eval_mix(m, s, by_id, ctx),
         LayerKind::Map(m) => eval_map(m, s, by_id, ctx),
+        LayerKind::MinMax(mm) => eval_min_max(mm, s, by_id, ctx),
         LayerKind::HeightToNormal(h) => eval_h2n(h, s, by_id, ctx),
     }
 }
@@ -255,6 +257,48 @@ fn eval_map(m: &Map, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &EvalCtx)
     let t = scalar_of(value);
     // Look up palette at (t, 0, 0).
     eval_layer(m.palette, Sample::new(t, 0.0, 0.0), by_id, ctx)
+}
+
+fn eval_min_max(m: &MinMax, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &EvalCtx) -> Color {
+    let a = eval_layer(m.a, s, by_id, ctx);
+    let b = eval_layer(m.b, s, by_id, ctx);
+    let va = criterion_of(a, m.criterion);
+    let vb = criterion_of(b, m.criterion);
+    let a_wins = match m.mode {
+        MinMaxMode::Min => va <= vb,
+        MinMaxMode::Max => va >= vb,
+    };
+    if a_wins { a } else { b }
+}
+
+/// Read the chosen criterion off `c`. Whole pixel — including alpha and
+/// hue — flows through the winner, so this only picks the number for the
+/// compare.
+fn criterion_of(c: Color, crit: Criterion) -> f32 {
+    use palette::{Hsv, IntoColor, Srgb};
+    match crit {
+        Criterion::Alpha => return c.alpha,
+        Criterion::Chroma => return c.chroma,
+        _ => {}
+    }
+    // Everything else needs a trip through gamma-encoded sRGB.
+    let srgb: Srgb = c.color.into_color();
+    match crit {
+        Criterion::Red => srgb.red,
+        Criterion::Green => srgb.green,
+        Criterion::Blue => srgb.blue,
+        Criterion::Luma => 0.2126 * srgb.red + 0.7152 * srgb.green + 0.0722 * srgb.blue,
+        Criterion::Saturation => {
+            let hsv: Hsv = srgb.into_color();
+            hsv.saturation
+        }
+        Criterion::Value => {
+            let hsv: Hsv = srgb.into_color();
+            hsv.value
+        }
+        // Handled above.
+        Criterion::Alpha | Criterion::Chroma => unreachable!(),
+    }
 }
 
 fn eval_h2n(h: &HeightToNormal, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &EvalCtx) -> Color {

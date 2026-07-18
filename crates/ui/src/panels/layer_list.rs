@@ -50,6 +50,7 @@ fn add_layer_menu(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState) {
             "Transform",
             "Mix",
             "Map",
+            "MinMax",
             "HeightToNormal",
         ] {
             if ui.button(variant).clicked() {

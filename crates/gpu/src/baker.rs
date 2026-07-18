@@ -15,9 +15,9 @@ use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
 use texture_graph_core::{
-    Axis, BlendMode, BlendSpace, ColorInput, ColorRamp, CoordMode, EvalCtx, Graph, HeightToNormal,
-    LayerId, LayerKind, Mix, Noise, NoiseDims, NoiseOutput, NoiseRange, RadialDim, ScalarInput,
-    Transform,
+    Axis, BlendMode, BlendSpace, ColorInput, ColorRamp, CoordMode, Criterion, EvalCtx, Graph,
+    HeightToNormal, LayerId, LayerKind, MinMax, MinMaxMode, Mix, Noise, NoiseDims, NoiseOutput,
+    NoiseRange, RadialDim, ScalarInput, Transform,
 };
 
 use crate::device::DeviceCtx;
@@ -77,6 +77,8 @@ pub struct Baker {
     mix_bgl: wgpu::BindGroupLayout,
     map_pipeline: wgpu::ComputePipeline,
     map_bgl: wgpu::BindGroupLayout,
+    min_max_pipeline: wgpu::ComputePipeline,
+    // min_max reuses `map_bgl` — same binding shape (uniform + storage_out + 2 inputs).
     ramp_pipeline: wgpu::ComputePipeline,
     ramp_bgl: wgpu::BindGroupLayout,
     /// 1×1 Rgba32Float sampled-only texture. Bound into unused ramp input
@@ -100,6 +102,7 @@ impl Baker {
         let (transform_pipeline, transform_bgl) = make_transform_pipeline(&ctx.device);
         let (mix_pipeline, mix_bgl) = make_mix_pipeline(&ctx.device);
         let (map_pipeline, map_bgl) = make_map_pipeline(&ctx.device);
+        let min_max_pipeline = make_min_max_pipeline(&ctx.device, &map_bgl);
         let (ramp_pipeline, ramp_bgl) = make_ramp_pipeline(&ctx.device);
         let h2n_pipeline = make_h2n_pipeline(&ctx.device, &transform_bgl);
         let dummy_input = ctx.device.create_texture(&wgpu::TextureDescriptor {
@@ -131,6 +134,7 @@ impl Baker {
             mix_bgl,
             map_pipeline,
             map_bgl,
+            min_max_pipeline,
             ramp_pipeline,
             ramp_bgl,
             dummy_input,
@@ -324,6 +328,21 @@ impl Baker {
                     &pool_views[dst_slot],
                     &pool_views[value_slot as usize],
                     &pool_views[palette_slot as usize],
+                    size,
+                );
+            }
+            LayerKind::MinMax(mm) => {
+                let a_slot = slot_of(sched, mm.a);
+                let b_slot = slot_of(sched, mm.b);
+                dispatch_min_max(
+                    &self.ctx,
+                    encoder,
+                    &self.min_max_pipeline,
+                    &self.map_bgl,
+                    &pool_views[dst_slot],
+                    &pool_views[a_slot as usize],
+                    &pool_views[b_slot as usize],
+                    mm,
                     size,
                 );
             }
@@ -573,6 +592,14 @@ struct MapParams {
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
+struct MinMaxParams {
+    size: [u32; 2],
+    mode: u32,       // 0 = Min, 1 = Max
+    criterion: u32,  // 0=R 1=G 2=B 3=Sat 4=Val 5=Luma 6=Alpha 7=Chroma
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
 struct RampParams {
     size: [u32; 2],
     stop_count: u32,
@@ -782,6 +809,62 @@ fn dispatch_mix(
     });
     let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
         label: Some("mix-cpass"),
+        timestamp_writes: None,
+    });
+    cpass.set_pipeline(pipeline);
+    cpass.set_bind_group(0, &bg, &[]);
+    let (wg_x, wg_y) = workgroup_counts(size);
+    cpass.dispatch_workgroups(wg_x, wg_y, 1);
+}
+
+fn dispatch_min_max(
+    ctx: &DeviceCtx,
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::ComputePipeline,
+    bgl: &wgpu::BindGroupLayout,
+    dst_view: &wgpu::TextureView,
+    a_view: &wgpu::TextureView,
+    b_view: &wgpu::TextureView,
+    mm: &MinMax,
+    size: (u32, u32),
+) {
+    let mode = match mm.mode {
+        MinMaxMode::Min => 0u32,
+        MinMaxMode::Max => 1u32,
+    };
+    let criterion = match mm.criterion {
+        Criterion::Red => 0u32,
+        Criterion::Green => 1,
+        Criterion::Blue => 2,
+        Criterion::Saturation => 3,
+        Criterion::Value => 4,
+        Criterion::Luma => 5,
+        Criterion::Alpha => 6,
+        Criterion::Chroma => 7,
+    };
+    let params = MinMaxParams { size: [size.0, size.1], mode, criterion };
+    let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "min-max-params");
+    let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("min-max-bg"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: ubo.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(dst_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(a_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(b_view),
+            },
+        ],
+    });
+    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("min-max-cpass"),
         timestamp_writes: None,
     });
     cpass.set_pipeline(pipeline);
@@ -1404,6 +1487,29 @@ fn make_map_pipeline(
         cache: None,
     });
     (pipe, bgl)
+}
+
+fn make_min_max_pipeline(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+) -> wgpu::ComputePipeline {
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("min-max-pl"),
+        bind_group_layouts: &[Some(bgl)],
+        ..Default::default()
+    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("min-max-shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/min_max.wgsl").into()),
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("min-max-pipeline"),
+        layout: Some(&pl),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    })
 }
 
 fn make_ramp_pipeline(

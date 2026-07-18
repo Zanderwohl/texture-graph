@@ -26,6 +26,7 @@ pub use file::{
 pub use graph::{Canvas, Graph, GraphError, Layer, Output};
 pub use id::LayerId;
 pub use kind::{
-    Axis, BlendMode, ColorInput, ColorRamp, ColorStop, CoordMode, HeightToNormal, LayerKind,
-    Map, Mix, Noise, NoiseDims, NoiseOutput, NoiseRange, RadialDim, ScalarInput, Transform,
+    Axis, BlendMode, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion, HeightToNormal,
+    LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims, NoiseOutput, NoiseRange,
+    RadialDim, ScalarInput, Transform,
 };

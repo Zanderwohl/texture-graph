@@ -3,9 +3,9 @@
 
 use texture_graph_core::color::oklcha;
 use texture_graph_core::{
-    Axis, BlendMode, BlendSpace, ColorInput, ColorRamp, ColorStop, CoordMode, Graph,
-    HeightToNormal, LayerId, LayerKind, Map, Mix, Noise, NoiseDims, NoiseOutput, NoiseRange,
-    RadialDim, ScalarInput, Transform,
+    Axis, BlendMode, BlendSpace, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion, Graph,
+    HeightToNormal, LayerId, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims,
+    NoiseOutput, NoiseRange, RadialDim, ScalarInput, Transform,
 };
 
 use crate::state::{EditCmd, UiState};
@@ -18,6 +18,7 @@ const VARIANTS: &[VariantSpec] = &[
     VariantSpec { key: "Transform", label: "Transform" },
     VariantSpec { key: "Mix", label: "Mix" },
     VariantSpec { key: "Map", label: "Map" },
+    VariantSpec { key: "MinMax", label: "MinMax" },
     VariantSpec { key: "HeightToNormal", label: "HeightToNormal" },
 ];
 
@@ -68,6 +69,9 @@ pub fn show(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, id: LayerId) 
         LayerKind::Map(m) => {
             changed |= map_widgets(ui, graph, id, m);
         }
+        LayerKind::MinMax(mm) => {
+            changed |= min_max_widgets(ui, graph, id, mm);
+        }
         LayerKind::HeightToNormal(h) => {
             changed |= h2n_widgets(ui, graph, id, h);
         }
@@ -86,6 +90,7 @@ fn current_variant_key(k: &LayerKind) -> &'static str {
         LayerKind::Transform(_) => "Transform",
         LayerKind::Mix(_) => "Mix",
         LayerKind::Map(_) => "Map",
+        LayerKind::MinMax(_) => "MinMax",
         LayerKind::HeightToNormal(_) => "HeightToNormal",
     }
 }
@@ -126,6 +131,12 @@ pub fn default_kind(variant: &str, graph: &Graph) -> LayerKind {
             space: BlendSpace::Oklch,
         }),
         "Map" => LayerKind::Map(Map { value: first, palette: first }),
+        "MinMax" => LayerKind::MinMax(MinMax {
+            a: first,
+            b: first,
+            mode: MinMaxMode::Max,
+            criterion: Criterion::Alpha,
+        }),
         "HeightToNormal" => LayerKind::HeightToNormal(HeightToNormal { source: first, strength: 1.0 }),
         _ => LayerKind::Color(oklcha(0.5, 0.0, 0.0, 1.0)),
     }
@@ -378,6 +389,56 @@ fn map_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, m: &mut Map) -> bo
         m.palette = new;
         changed = true;
     }
+    changed
+}
+
+fn min_max_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, mm: &mut MinMax) -> bool {
+    let mut changed = false;
+    if let Some(new) = layer_ref::layer_ref(ui, ("mm-a", id.0), "a", mm.a, graph, Some(id)) {
+        mm.a = new;
+        changed = true;
+    }
+    if let Some(new) = layer_ref::layer_ref(ui, ("mm-b", id.0), "b", mm.b, graph, Some(id)) {
+        mm.b = new;
+        changed = true;
+    }
+    changed |= enum_combo(
+        ui,
+        (id.0, "mm-mode"),
+        "mode",
+        &mut mm.mode,
+        &[MinMaxMode::Min, MinMaxMode::Max],
+        |m| match m {
+            MinMaxMode::Min => "Min",
+            MinMaxMode::Max => "Max",
+        },
+    );
+    changed |= enum_combo(
+        ui,
+        (id.0, "mm-criterion"),
+        "by",
+        &mut mm.criterion,
+        &[
+            Criterion::Red,
+            Criterion::Green,
+            Criterion::Blue,
+            Criterion::Saturation,
+            Criterion::Value,
+            Criterion::Luma,
+            Criterion::Alpha,
+            Criterion::Chroma,
+        ],
+        |c| match c {
+            Criterion::Red => "Red",
+            Criterion::Green => "Green",
+            Criterion::Blue => "Blue",
+            Criterion::Saturation => "Saturation",
+            Criterion::Value => "Value",
+            Criterion::Luma => "Luma",
+            Criterion::Alpha => "Alpha",
+            Criterion::Chroma => "Chroma",
+        },
+    );
     changed
 }
 
