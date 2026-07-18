@@ -123,7 +123,12 @@ impl eframe::App for TextureGraphApp {
         let was_clean = !self.ui.dirty;
         self.ui.drain_into(&mut self.graph);
         if was_clean && self.ui.dirty {
-            self.previews.invalidate(self.gpu.as_ref());
+            // Mark the per-layer thumbnail cache stale — it will keep
+            // showing current textures until the next frame's rebake
+            // swaps in the new ones. The big-preview panel already
+            // handles this pattern via `state.dirty` + register/free
+            // ordering inside `bake_output` itself.
+            self.previews.mark_stale();
         }
     }
 }

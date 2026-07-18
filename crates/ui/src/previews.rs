@@ -1,15 +1,14 @@
 //! Per-layer preview cache.
 //!
 //! GPU path (default when eframe's wgpu backend is live): the first request
-//! after `invalidate` bulk-bakes previews for every layer at 128² via
-//! `Baker::bake_previews`, registers each result with egui-wgpu, and hands
-//! back `TextureId`s from a `HashMap`. Subsequent requests are cache hits.
+//! after `mark_stale` bulk-bakes previews for every layer at 128² via
+//! `Baker::bake_previews`, registers each result with egui-wgpu, and swaps
+//! the entries in atomically — old `TextureId`s stay displayable right up
+//! until the new ones are ready, then get freed. This means an evaluation
+//! change (e.g. tweaking noise frequency) doesn't visually blank the
+//! thumbnails for a frame.
 //!
 //! CPU path (fallback): per-request lazy bake via `evaluate`.
-//!
-//! Lifetime: on `invalidate`, GPU `TextureId`s are freed on the shared
-//! `egui_wgpu::Renderer` before the map is cleared; the backing
-//! `wgpu::Texture`s are then dropped.
 
 use std::collections::HashMap;
 
@@ -33,28 +32,25 @@ pub struct GpuThumb {
 pub struct PreviewCache {
     gpu_entries: HashMap<LayerId, GpuThumb>,
     cpu_entries: HashMap<LayerId, TextureHandle>,
+    /// Set by the app after any evaluation-affecting edit. The next
+    /// `get_or_build` will rebake and swap; entries stay displayable in
+    /// the meantime.
+    stale: bool,
 }
 
 impl PreviewCache {
-    /// Drop every cached preview. When the GPU path is active, first frees
-    /// each registered `TextureId` on the shared renderer so we don't leak
-    /// backing resources.
-    pub fn invalidate(&mut self, gpu: Option<&GpuBits>) {
-        if !self.gpu_entries.is_empty() {
-            if let Some(gpu) = gpu {
-                let mut r = gpu.renderer.write();
-                for thumb in self.gpu_entries.values() {
-                    r.free_texture(&thumb.id);
-                }
-            }
-            self.gpu_entries.clear();
-        }
-        self.cpu_entries.clear();
+    /// Mark the cache stale without dropping current entries. The next
+    /// `get_or_build` rebuilds and only then swaps the new textures in.
+    pub fn mark_stale(&mut self) {
+        self.stale = true;
     }
 
     /// Return (and cache) a 128×128 preview of `id`. Returns `None` if the
-    /// layer doesn't exist. Uses GPU when available; falls back to CPU on
-    /// any bake error.
+    /// layer doesn't exist.
+    ///
+    /// When the cache is stale, the first call this frame rebuilds all
+    /// entries via `Baker::bake_previews`, atomically swaps them in, then
+    /// frees the old `TextureId`s. Subsequent same-frame calls are hits.
     pub fn get_or_build(
         &mut self,
         egui_ctx: &egui::Context,
@@ -64,34 +60,71 @@ impl PreviewCache {
         gpu: Option<&mut GpuBits>,
     ) -> Option<TextureId> {
         graph.get(id)?;
+
+        if self.stale {
+            self.rebuild(graph, eval_ctx, gpu);
+            // Fall through to the normal lookup below regardless of
+            // rebuild success — a partial success still hits at least
+            // some entries; a total failure falls back to CPU per-layer.
+        }
+
         if let Some(thumb) = self.gpu_entries.get(&id) {
             return Some(thumb.id);
         }
         if let Some(h) = self.cpu_entries.get(&id) {
             return Some(h.id());
         }
-        // Fresh entry — try GPU bulk bake first.
-        if let Some(gpu) = gpu {
-            if let Ok(textures) = gpu.baker.bake_previews(graph, eval_ctx) {
-                let device = gpu.baker.ctx().device.clone();
-                let mut r = gpu.renderer.write();
-                for (lid, tex) in textures {
-                    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-                    let tid = r.register_native_texture(
-                        &device,
-                        &view,
-                        wgpu::FilterMode::Linear,
-                    );
-                    self.gpu_entries.insert(lid, GpuThumb { tex, id: tid });
-                }
-                return self.gpu_entries.get(&id).map(|t| t.id);
-            }
-            // GPU bake errored — fall through to CPU for this layer.
-        }
+        // First-frame path (cold cache, no stale flag): if we're still
+        // holding no entries at all, either the bulk bake failed above or
+        // GPU isn't wired at all. Fall back to a single-layer CPU bake so
+        // the row still shows something.
         let handle = bake_cpu(egui_ctx, graph, id, eval_ctx);
         let tid = handle.id();
         self.cpu_entries.insert(id, handle);
         Some(tid)
+    }
+
+    /// Bake a fresh set of GPU thumbnails, register them, and swap the
+    /// cache atomically. Old entries stay displayable until we've fully
+    /// registered the new ones, then get freed.
+    fn rebuild(
+        &mut self,
+        graph: &Graph,
+        eval_ctx: &EvalCtx,
+        gpu: Option<&mut GpuBits>,
+    ) {
+        let Some(gpu) = gpu else {
+            // No GPU — CPU entries are cheap enough to just drop; the
+            // per-layer CPU fallback rebuilds them lazily.
+            self.cpu_entries.clear();
+            self.stale = false;
+            return;
+        };
+        let bake_result = gpu.baker.bake_previews(graph, eval_ctx);
+        let Ok(new_texs) = bake_result else {
+            // Leave the current cache in place — the user still sees the
+            // previous state instead of a blank grid — and reset the flag
+            // so we don't re-attempt every frame.
+            self.stale = false;
+            return;
+        };
+        let device = gpu.baker.ctx().device.clone();
+        let mut r = gpu.renderer.write();
+        let mut new_map: HashMap<LayerId, GpuThumb> = HashMap::new();
+        for (lid, tex) in new_texs {
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            let tid = r.register_native_texture(&device, &view, wgpu::FilterMode::Linear);
+            new_map.insert(lid, GpuThumb { tex, id: tid });
+        }
+        // Only now free the outgoing ids — after the replacements are
+        // registered so nothing displayed had a "no texture" gap.
+        for old in self.gpu_entries.values() {
+            r.free_texture(&old.id);
+        }
+        drop(r);
+        self.gpu_entries = new_map;
+        self.cpu_entries.clear();
+        self.stale = false;
     }
 }
 

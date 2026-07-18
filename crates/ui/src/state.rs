@@ -80,8 +80,13 @@ impl UiState {
     /// to apply.
     pub fn drain_into(&mut self, graph: &mut Graph) {
         for cmd in std::mem::take(&mut self.pending) {
+            let affects_eval = cmd.affects_evaluation();
             match cmd.apply(graph) {
-                Ok(()) => self.dirty = true,
+                Ok(()) => {
+                    if affects_eval {
+                        self.dirty = true;
+                    }
+                }
                 Err(e) => self.last_error = Some(e),
             }
         }
@@ -107,6 +112,27 @@ pub enum EditCmd {
 }
 
 impl EditCmd {
+    /// Whether applying this command can change what the evaluator/baker
+    /// produces. Layout-only edits (canvas positions, list order, canvas
+    /// add/remove, layer rename) don't touch the DAG the baker walks and
+    /// must NOT flip `dirty` — otherwise dragging a node in the canvas
+    /// (which emits `SetPos` every frame) would rebake every preview each
+    /// frame and make thumbnails flash out of existence.
+    fn affects_evaluation(&self) -> bool {
+        match self {
+            EditCmd::AddLayer { .. }
+            | EditCmd::Remove(_)
+            | EditCmd::SetKind(_, _)
+            | EditCmd::SetOutput(_)
+            | EditCmd::Replace(_) => true,
+            EditCmd::Rename(_, _)
+            | EditCmd::SetListPos(_, _)
+            | EditCmd::SetPos { .. }
+            | EditCmd::AddCanvas(_)
+            | EditCmd::RemoveCanvas(_) => false,
+        }
+    }
+
     fn apply(self, graph: &mut Graph) -> Result<(), String> {
         match self {
             EditCmd::AddLayer { name, kind } => graph
