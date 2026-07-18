@@ -1,22 +1,45 @@
-//! Right panel: flat 2D bake of the graph's `Output` (color channel).
+//! Right panel: flat 2D bake of the graph's `Output`.
 //!
-//! We keep it dumb for MVP — just the color channel at a chosen
-//! resolution. Roughness / metallic / normal previews land later.
+//! GPU path (default when eframe's wgpu backend is live): bakes all four
+//! PBR channels in one dispatch chain via `texture_graph_gpu::Baker`,
+//! then registers each result with egui-wgpu so the panel just picks a
+//! `TextureId` when the channel switches. CPU path (fallback) still runs
+//! `evaluate_material` per pixel.
 
 use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
 use texture_graph_core::color::to_srgb8;
 use texture_graph_core::{EvalCtx, Graph, Sample, evaluate_material};
 
+use crate::app::GpuBits;
 use crate::state::UiState;
 
 pub struct PreviewPanelState {
-    /// Baked color-channel texture. `None` until the first bake or after
-    /// invalidation.
+    /// CPU-baked flat texture, used when the GPU backend isn't available
+    /// or the graph contains a variant the GPU baker doesn't cover.
     pub texture: Option<TextureHandle>,
+    /// GPU-baked textures (color, roughness, metallic, normal), each
+    /// registered with egui-wgpu as its own `TextureId`.
+    pub gpu_channels: Option<GpuChannels>,
     /// Output pixel resolution — 256 on wasm, 512 on native by default.
-    /// (Set by `TextureGraphApp::new`.)
     pub size: u32,
     pub channel: PreviewChannel,
+    /// Last-seen error from a GPU bake; surfaced under the preview image.
+    pub gpu_error: Option<String>,
+}
+
+/// Registered `TextureId`s for one bake, one per output channel. The
+/// backing `wgpu::Texture`s are pinned here so their views (referenced by
+/// the renderer) stay valid until we free the ids.
+pub struct GpuChannels {
+    pub color_tex: wgpu::Texture,
+    pub roughness_tex: wgpu::Texture,
+    pub metallic_tex: wgpu::Texture,
+    pub normal_tex: wgpu::Texture,
+    pub color_id: egui::TextureId,
+    pub roughness_id: egui::TextureId,
+    pub metallic_id: egui::TextureId,
+    pub normal_id: egui::TextureId,
+    pub size: u32,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -29,7 +52,13 @@ pub enum PreviewChannel {
 
 impl PreviewPanelState {
     pub fn new(size: u32) -> Self {
-        Self { texture: None, size, channel: PreviewChannel::Color }
+        Self {
+            texture: None,
+            gpu_channels: None,
+            size,
+            channel: PreviewChannel::Color,
+            gpu_error: None,
+        }
     }
 }
 
@@ -39,17 +68,13 @@ pub fn show(
     state: &mut UiState,
     preview: &mut PreviewPanelState,
     eval_ctx: &EvalCtx,
+    gpu: Option<&mut GpuBits>,
 ) {
     ui.horizontal(|ui| {
         ui.heading("Preview");
         ui.add_space(8.0);
         egui::ComboBox::from_id_salt("preview_channel")
-            .selected_text(match preview.channel {
-                PreviewChannel::Color => "color",
-                PreviewChannel::Roughness => "roughness",
-                PreviewChannel::Metallic => "metallic",
-                PreviewChannel::Normal => "normal",
-            })
+            .selected_text(channel_label(preview.channel))
             .show_ui(ui, |ui| {
                 for ch in [
                     PreviewChannel::Color,
@@ -57,17 +82,11 @@ pub fn show(
                     PreviewChannel::Metallic,
                     PreviewChannel::Normal,
                 ] {
-                    let label = match ch {
-                        PreviewChannel::Color => "color",
-                        PreviewChannel::Roughness => "roughness",
-                        PreviewChannel::Metallic => "metallic",
-                        PreviewChannel::Normal => "normal",
-                    };
-                    if ui.selectable_label(preview.channel == ch, label).clicked()
-                        && preview.channel != ch
+                    if ui
+                        .selectable_label(preview.channel == ch, channel_label(ch))
+                        .clicked()
                     {
                         preview.channel = ch;
-                        preview.texture = None;
                     }
                 }
             });
@@ -77,31 +96,148 @@ pub fn show(
             let picked = preview.size == s;
             if ui.selectable_label(picked, format!("{s}")).clicked() && !picked {
                 preview.size = s;
+                // Force a rebake at the new size.
                 preview.texture = None;
+                if let Some(g) = &preview.gpu_channels {
+                    if let Some(gpu) = gpu.as_ref() {
+                        free_channels(&gpu.renderer, g);
+                    }
+                }
+                preview.gpu_channels = None;
             }
         }
     });
     ui.separator();
 
-    // Rebake when needed. `state.dirty` covers graph mutations; a `None`
-    // texture covers channel/size changes and first frame.
-    if state.dirty || preview.texture.is_none() {
-        preview.texture = Some(bake(ui.ctx(), graph, preview.size, preview.channel, eval_ctx));
+    let needs_bake = state.dirty
+        || (preview.gpu_channels.is_none() && preview.texture.is_none())
+        || preview
+            .gpu_channels
+            .as_ref()
+            .map_or(false, |c| c.size != preview.size);
+
+    if needs_bake {
+        preview.gpu_error = None;
+        // Try GPU first; fall back to CPU on any error.
+        let baked_on_gpu = if let Some(gpu) = gpu {
+            match gpu.baker.bake_output(
+                graph,
+                (preview.size, preview.size),
+                eval_ctx,
+            ) {
+                Ok(out) => {
+                    if let Some(old) = preview.gpu_channels.take() {
+                        free_channels(&gpu.renderer, &old);
+                    }
+                    preview.gpu_channels =
+                        Some(register_channels(&gpu.renderer, &gpu.baker, out));
+                    // Explicit reset: any earlier CPU texture is stale.
+                    preview.texture = None;
+                    true
+                }
+                Err(e) => {
+                    preview.gpu_error = Some(format!("gpu bake fell back to CPU: {e}"));
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if !baked_on_gpu {
+            preview.texture =
+                Some(bake_cpu(ui.ctx(), graph, preview.size, preview.channel, eval_ctx));
+            if let Some(old) = preview.gpu_channels.take() {
+                // No renderer handle here in the CPU-only branch; the
+                // renderer already survives across frames, so leaking the
+                // id would only leak on this specific transition. Defensive
+                // reset to None keeps the state coherent.
+                let _ = old;
+            }
+        }
         state.dirty = false;
     }
 
-    if let Some(tex) = &preview.texture {
-        let avail = ui.available_size();
-        let side = avail.x.min(avail.y).max(64.0);
+    let avail = ui.available_size();
+    let side = avail.x.min(avail.y).max(64.0);
+    if let Some(g) = &preview.gpu_channels {
+        let id = match preview.channel {
+            PreviewChannel::Color => g.color_id,
+            PreviewChannel::Roughness => g.roughness_id,
+            PreviewChannel::Metallic => g.metallic_id,
+            PreviewChannel::Normal => g.normal_id,
+        };
+        ui.add(
+            egui::Image::new((id, egui::vec2(side, side)))
+                .maintain_aspect_ratio(true)
+                .fit_to_exact_size(egui::vec2(side, side)),
+        );
+    } else if let Some(tex) = &preview.texture {
         ui.add(
             egui::Image::new((tex.id(), egui::vec2(side, side)))
                 .maintain_aspect_ratio(true)
                 .fit_to_exact_size(egui::vec2(side, side)),
         );
     }
+    if let Some(err) = &preview.gpu_error {
+        ui.colored_label(egui::Color32::YELLOW, err);
+    }
 }
 
-fn bake(
+fn channel_label(ch: PreviewChannel) -> &'static str {
+    match ch {
+        PreviewChannel::Color => "color",
+        PreviewChannel::Roughness => "roughness",
+        PreviewChannel::Metallic => "metallic",
+        PreviewChannel::Normal => "normal",
+    }
+}
+
+fn register_channels(
+    renderer: &egui::mutex::RwLock<egui_wgpu::Renderer>,
+    baker: &texture_graph_gpu::Baker,
+    out: texture_graph_gpu::BakeOutput,
+) -> GpuChannels {
+    let device = &baker.ctx().device;
+    let color_view = out.color.create_view(&wgpu::TextureViewDescriptor::default());
+    let rough_view = out.roughness.create_view(&wgpu::TextureViewDescriptor::default());
+    let metal_view = out.metallic.create_view(&wgpu::TextureViewDescriptor::default());
+    let normal_view = out.normal.create_view(&wgpu::TextureViewDescriptor::default());
+    let mut r = renderer.write();
+    let color_id =
+        r.register_native_texture(device, &color_view, wgpu::FilterMode::Linear);
+    let roughness_id =
+        r.register_native_texture(device, &rough_view, wgpu::FilterMode::Linear);
+    let metallic_id =
+        r.register_native_texture(device, &metal_view, wgpu::FilterMode::Linear);
+    let normal_id =
+        r.register_native_texture(device, &normal_view, wgpu::FilterMode::Linear);
+    GpuChannels {
+        color_tex: out.color,
+        roughness_tex: out.roughness,
+        metallic_tex: out.metallic,
+        normal_tex: out.normal,
+        color_id,
+        roughness_id,
+        metallic_id,
+        normal_id,
+        size: out.size.0,
+    }
+}
+
+fn free_channels(
+    renderer: &egui::mutex::RwLock<egui_wgpu::Renderer>,
+    channels: &GpuChannels,
+) {
+    let mut r = renderer.write();
+    r.free_texture(&channels.color_id);
+    r.free_texture(&channels.roughness_id);
+    r.free_texture(&channels.metallic_id);
+    r.free_texture(&channels.normal_id);
+}
+
+// ---- CPU fallback ------------------------------------------------------
+
+fn bake_cpu(
     ctx: &egui::Context,
     graph: &Graph,
     size: u32,

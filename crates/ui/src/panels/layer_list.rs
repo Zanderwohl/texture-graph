@@ -1,5 +1,6 @@
 use texture_graph_core::{EvalCtx, Graph, LayerId, ScalarInput};
 
+use crate::app::GpuBits;
 use crate::panels::inspector;
 use crate::previews::{PREVIEW_SIZE, PreviewCache};
 use crate::state::{EditCmd, UiState};
@@ -14,6 +15,7 @@ pub fn show(
     state: &mut UiState,
     previews: &mut PreviewCache,
     eval_ctx: &EvalCtx,
+    mut gpu: Option<&mut GpuBits>,
 ) {
     ui.heading("Output");
     output_editor(ui, graph, state);
@@ -31,7 +33,7 @@ pub fn show(
             return;
         }
         for id in graph.list_order.iter().copied() {
-            row(ui, graph, state, previews, eval_ctx, id);
+            row(ui, graph, state, previews, eval_ctx, id, gpu.as_deref_mut());
             ui.separator();
         }
     });
@@ -138,6 +140,7 @@ fn row(
     previews: &mut PreviewCache,
     eval_ctx: &EvalCtx,
     id: LayerId,
+    gpu: Option<&mut GpuBits>,
 ) {
     let Some(layer) = graph.get(id) else { return };
     let selected = state.selected == Some(id);
@@ -146,13 +149,13 @@ fn row(
         || matches!(graph.output.roughness, ScalarInput::Layer(x) if x == id)
         || matches!(graph.output.metallic, ScalarInput::Layer(x) if x == id);
 
-    let handle = previews.get_or_build(ui.ctx(), graph, id, eval_ctx);
+    let tex_id = previews.get_or_build(ui.ctx(), graph, id, eval_ctx, gpu);
 
     ui.horizontal(|ui| {
         let thumb_size = egui::vec2(THUMB_PX, THUMB_PX);
-        let thumb_response = if let Some(h) = handle {
+        let thumb_response = if let Some(tid) = tex_id {
             ui.add(
-                egui::Image::new((h.id(), egui::vec2(PREVIEW_SIZE as f32, PREVIEW_SIZE as f32)))
+                egui::Image::new((tid, egui::vec2(PREVIEW_SIZE as f32, PREVIEW_SIZE as f32)))
                     .fit_to_exact_size(thumb_size)
                     .sense(egui::Sense::click()),
             )

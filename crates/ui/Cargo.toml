@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 texture-graph-core = { path = "../core" }
+texture-graph-gpu = { path = "../gpu" }
 eframe = { version = "0.35", default-features = false, features = [
     "default_fonts",
     "wgpu",
@@ -21,7 +22,7 @@ eframe = { version = "0.35", default-features = false, features = [
 ] }
 egui = "0.35"
 egui-wgpu = "0.35"
-wgpu = "26"
+wgpu = "29"
 palette.workspace = true
 serde.workspace = true
 ron.workspace = true

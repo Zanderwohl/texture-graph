@@ -1,5 +1,9 @@
+use std::sync::Arc;
+
 use eframe::CreationContext;
+use egui::mutex::RwLock;
 use texture_graph_core::{EvalCtx, Graph};
+use texture_graph_gpu::{Baker, DeviceCtx};
 
 use crate::file_io;
 use crate::panels;
@@ -7,27 +11,54 @@ use crate::panels::preview::PreviewPanelState;
 use crate::previews::PreviewCache;
 use crate::state::UiState;
 
+/// GPU state — Baker plus the shared egui-wgpu renderer we register
+/// textures against. Absent when the wgpu backend fails to initialize
+/// (should never happen with the eframe wgpu feature enabled, but we don't
+/// hard-crash on it).
+pub struct GpuBits {
+    pub baker: Baker,
+    pub renderer: Arc<RwLock<egui_wgpu::Renderer>>,
+}
+
 pub struct TextureGraphApp {
     pub graph: Graph,
     pub ui: UiState,
     pub previews: PreviewCache,
     pub preview_panel: PreviewPanelState,
     pub eval_ctx: EvalCtx,
+    pub gpu: Option<GpuBits>,
 }
 
 impl TextureGraphApp {
-    pub fn new(_cc: &CreationContext<'_>) -> Self {
+    pub fn new(cc: &CreationContext<'_>) -> Self {
         // Web builds default to 256² to keep per-frame cost tolerable.
         #[cfg(target_arch = "wasm32")]
         let default_size = 256;
         #[cfg(not(target_arch = "wasm32"))]
         let default_size = 512;
+
+        let gpu = cc.wgpu_render_state.as_ref().map(|rs| {
+            let device_ctx = DeviceCtx::from_shared(
+                Arc::new(rs.adapter.clone()),
+                Arc::new(rs.device.clone()),
+                Arc::new(rs.queue.clone()),
+            );
+            GpuBits {
+                baker: Baker::new(device_ctx),
+                renderer: rs.renderer.clone(),
+            }
+        });
+        if gpu.is_none() {
+            log::warn!("no wgpu render state on eframe — preview will use CPU path");
+        }
+
         Self {
             graph: Graph::new(),
             ui: UiState::default(),
             previews: PreviewCache::default(),
             preview_panel: PreviewPanelState::new(default_size),
             eval_ctx: EvalCtx::default(),
+            gpu,
         }
     }
 }
@@ -53,6 +84,7 @@ impl eframe::App for TextureGraphApp {
                     &mut self.ui,
                     &mut self.previews,
                     &self.eval_ctx,
+                    self.gpu.as_mut(),
                 );
             });
 
@@ -66,6 +98,7 @@ impl eframe::App for TextureGraphApp {
                     &mut self.ui,
                     &mut self.preview_panel,
                     &self.eval_ctx,
+                    self.gpu.as_mut(),
                 );
             });
 
@@ -90,7 +123,7 @@ impl eframe::App for TextureGraphApp {
         let was_clean = !self.ui.dirty;
         self.ui.drain_into(&mut self.graph);
         if was_clean && self.ui.dirty {
-            self.previews.invalidate();
+            self.previews.invalidate(self.gpu.as_ref());
         }
     }
 }

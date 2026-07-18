@@ -76,8 +76,8 @@ fn run_smoke() -> [f32; 4] {
     });
     let pl_layout = ctx.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("smoke-pl"),
-        bind_group_layouts: &[&bgl],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&bgl)],
+        ..Default::default()
     });
     let pipeline = ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("smoke-pipeline"),
@@ -141,7 +141,7 @@ fn run_smoke() -> [f32; 4] {
     let slice = readback.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-    ctx.device.poll(wgpu::PollType::Wait).expect("poll");
+    ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
     rx.recv().expect("map channel").expect("map");
     let data = slice.get_mapped_range();
     let pixel: [f32; 4] = bytemuck::from_bytes::<[f32; 4]>(&data[..16]).clone();

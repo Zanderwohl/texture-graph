@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 texture-graph-core = { path = "../core" }
-wgpu = "26"
+wgpu = "29"
 bytemuck = { version = "1", features = ["derive"] }
 log = "0.4"
 pollster = "0.4"

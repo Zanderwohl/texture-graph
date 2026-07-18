@@ -2,8 +2,9 @@
 //! comparing the GPU output to `core`'s CPU evaluator.
 
 use texture_graph_core::{
-    Color, EvalCtx, Graph, LayerKind, Noise, NoiseDims, NoiseOutput, NoiseRange, Output,
-    ScalarInput, color::to_srgb8,
+    BlendMode, BlendSpace, Color, ColorInput, ColorRamp, ColorStop, CoordMode, EvalCtx, Graph,
+    HeightToNormal, LayerKind, Map, Mix, Noise, NoiseDims, NoiseOutput, NoiseRange, Output,
+    ScalarInput, Transform, color::to_srgb8,
 };
 
 use crate::{Baker, DeviceCtx};
@@ -45,7 +46,7 @@ fn readback_all_pixels(ctx: &DeviceCtx, tex: &wgpu::Texture, size: (u32, u32)) -
     let slice = readback.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-    ctx.device.poll(wgpu::PollType::Wait).expect("poll");
+    ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
     rx.recv().expect("chan").expect("map");
     let data = slice.get_mapped_range();
     let mut out = Vec::with_capacity((size.0 * size.1) as usize);
@@ -94,7 +95,7 @@ fn readback_first_pixel(ctx: &DeviceCtx, tex: &wgpu::Texture) -> [u8; 4] {
     let slice = readback.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-    ctx.device.poll(wgpu::PollType::Wait).expect("poll");
+    ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
     rx.recv().expect("chan").expect("map");
     let data = slice.get_mapped_range();
     let px = [data[0], data[1], data[2], data[3]];
@@ -203,6 +204,339 @@ fn noise_layer_has_variance_and_is_deterministic() {
         .expect("bake noise 2");
     let px2 = readback_all_pixels(&ctx, &out2.color, size);
     assert_eq!(px, px2, "noise output changed across identical bakes");
+}
+
+#[test]
+fn mix_add_of_two_colors_matches_cpu() {
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let a = graph.output.color;
+    graph.set_kind(a, LayerKind::Color(Color::new(0.4, 0.0, 0.0, 1.0))).unwrap();
+    let b = graph.add_layer("b", LayerKind::Color(Color::new(0.3, 0.05, 30.0, 1.0))).unwrap();
+    let mix = graph
+        .add_layer(
+            "mix",
+            LayerKind::Mix(Mix {
+                a,
+                b,
+                mode: BlendMode::Add,
+                factor: ScalarInput::Const(0.5),
+                space: BlendSpace::Oklch,
+            }),
+        )
+        .unwrap();
+    graph.set_output(Output {
+        color: mix,
+        roughness: ScalarInput::Const(0.5),
+        metallic: ScalarInput::Const(0.0),
+        normal: None,
+    }).unwrap();
+
+    let out = baker.bake_output(&graph, SIZE, &EvalCtx::default()).expect("bake");
+    let gpu = readback_first_pixel(&ctx, &out.color);
+
+    // CPU reference — evaluate the mix directly.
+    let cpu_material = texture_graph_core::evaluate_material(
+        &graph, texture_graph_core::Sample::uv(0.5, 0.5), &EvalCtx::default(),
+    );
+    let cpu = to_srgb8(cpu_material.color);
+    for i in 0..4 {
+        let d = (cpu[i] as i32 - gpu[i] as i32).abs();
+        assert!(d <= 2, "mix add channel {i}: cpu {} gpu {} (delta {d})", cpu[i], gpu[i]);
+    }
+}
+
+#[test]
+fn ramp_black_to_white_at_midpoint_is_gray() {
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let ramp = graph
+        .add_layer(
+            "ramp",
+            LayerKind::ColorRamp(ColorRamp {
+                stops: vec![
+                    ColorStop { t: 0.0, color: ColorInput::Const(Color::new(0.0, 0.0, 0.0, 1.0)) },
+                    ColorStop { t: 1.0, color: ColorInput::Const(Color::new(1.0, 0.0, 0.0, 1.0)) },
+                ],
+                space: BlendSpace::Oklch,
+            }),
+        )
+        .unwrap();
+    graph.set_output(Output {
+        color: ramp,
+        roughness: ScalarInput::Const(0.5),
+        metallic: ScalarInput::Const(0.0),
+        normal: None,
+    }).unwrap();
+
+    let out = baker.bake_output(&graph, SIZE, &EvalCtx::default()).expect("bake ramp");
+    let px = readback_all_pixels(&ctx, &out.color, SIZE);
+    // Middle column should be roughly the sRGB encoding of Oklch L=0.5 gray.
+    // Pixel-center convention: u = (x + 0.5) / 8. The 4th column is u = 0.5625.
+    let mid_col = 4;
+    let mid_pixel = px[(SIZE.1 / 2) as usize * SIZE.0 as usize + mid_col];
+    let expected = to_srgb8(Color::new(0.5625, 0.0, 0.0, 1.0));
+    for i in 0..3 {
+        let d = (expected[i] as i32 - mid_pixel[i] as i32).abs();
+        assert!(d <= 3, "ramp mid pixel channel {i}: expect {} got {} (delta {d})", expected[i], mid_pixel[i]);
+    }
+    // Left edge dark, right edge light.
+    let left = px[0][0];
+    let right = px[SIZE.0 as usize - 1][0];
+    assert!(left < right, "ramp left {left} not < right {right}");
+}
+
+#[test]
+fn transform_passthrough_of_color_is_identity() {
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let c = graph.output.color;
+    graph.set_kind(c, LayerKind::Color(Color::new(0.5, 0.1, 20.0, 1.0))).unwrap();
+    let t = graph.add_layer(
+        "t",
+        LayerKind::Transform(Transform {
+            source: c,
+            offset: [0.0, 0.0, 0.0],
+            rotate_uv: 0.0,
+            scale: [1.0, 1.0, 1.0],
+            coord_mode: CoordMode::Passthrough,
+        }),
+    ).unwrap();
+    graph.set_output(Output {
+        color: t,
+        roughness: ScalarInput::Const(0.5),
+        metallic: ScalarInput::Const(0.0),
+        normal: None,
+    }).unwrap();
+    let out = baker.bake_output(&graph, SIZE, &EvalCtx::default()).expect("bake xform");
+    let px = readback_first_pixel(&ctx, &out.color);
+    let expected = to_srgb8(Color::new(0.5, 0.1, 20.0, 1.0));
+    for i in 0..4 {
+        let d = (expected[i] as i32 - px[i] as i32).abs();
+        assert!(d <= 1, "xform identity channel {i}: expect {} got {} (delta {d})", expected[i], px[i]);
+    }
+}
+
+#[test]
+fn map_gray_value_through_bw_ramp_matches_ramp_lookup() {
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    // value layer: uniform L=0.5.
+    let value = graph.output.color;
+    graph.set_kind(value, LayerKind::Color(Color::new(0.5, 0.0, 0.0, 1.0))).unwrap();
+    // palette: black-to-white ramp.
+    let palette = graph.add_layer(
+        "palette",
+        LayerKind::ColorRamp(ColorRamp {
+            stops: vec![
+                ColorStop { t: 0.0, color: ColorInput::Const(Color::new(0.0, 0.0, 0.0, 1.0)) },
+                ColorStop { t: 1.0, color: ColorInput::Const(Color::new(1.0, 0.0, 0.0, 1.0)) },
+            ],
+            space: BlendSpace::Oklch,
+        }),
+    ).unwrap();
+    let map = graph.add_layer(
+        "map",
+        LayerKind::Map(Map { value, palette }),
+    ).unwrap();
+    graph.set_output(Output {
+        color: map,
+        roughness: ScalarInput::Const(0.5),
+        metallic: ScalarInput::Const(0.0),
+        normal: None,
+    }).unwrap();
+    let out = baker.bake_output(&graph, (16, 16), &EvalCtx::default()).expect("bake map");
+    let px = readback_first_pixel(&ctx, &out.color);
+    // Map samples palette at t=L(value)=0.5. The 16-wide palette baked with
+    // pixel-center convention: nearest column is 8 → u=(8+0.5)/16=0.53125,
+    // ramp gives L=0.53125.
+    let expected = to_srgb8(Color::new(0.53125, 0.0, 0.0, 1.0));
+    for i in 0..3 {
+        let d = (expected[i] as i32 - px[i] as i32).abs();
+        assert!(d <= 3, "map channel {i}: expect {} got {} (delta {d})", expected[i], px[i]);
+    }
+}
+
+/// Timing observation, not a hard assertion. Runs a 15-octave fractal noise
+/// stack at 1024² five times and prints median record-and-submit latency
+/// plus the peak_slots the scheduler computed. GPU wall time isn't measured
+/// here (that needs timestamp queries — not landed yet).
+///
+/// Run with `cargo test -p texture-graph-gpu perf_fractal -- --nocapture`.
+#[test]
+fn perf_fractal_stack_1024() {
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+
+    let mut graph = Graph::new();
+    let base = graph.output.color;
+    graph
+        .set_kind(
+            base,
+            LayerKind::Noise(Noise {
+                dims: NoiseDims::D2,
+                seed_offset: 0,
+                frequency: 1.0,
+                range: NoiseRange::Signed,
+                output: NoiseOutput::Grayscale,
+            }),
+        )
+        .unwrap();
+
+    let mut cur = base;
+    for octave in 1..15 {
+        let freq = (1u32 << octave) as f32;
+        let n = graph
+            .add_layer(
+                &format!("noise-{octave}"),
+                LayerKind::Noise(Noise {
+                    dims: NoiseDims::D2,
+                    seed_offset: octave as u32,
+                    frequency: freq,
+                    range: NoiseRange::Signed,
+                    output: NoiseOutput::Grayscale,
+                }),
+            )
+            .unwrap();
+        cur = graph
+            .add_layer(
+                &format!("sum-{octave}"),
+                LayerKind::Mix(Mix {
+                    a: cur,
+                    b: n,
+                    mode: BlendMode::Add,
+                    factor: ScalarInput::Const(0.5),
+                    space: BlendSpace::Oklch,
+                }),
+            )
+            .unwrap();
+    }
+    graph
+        .set_output(Output {
+            color: cur,
+            roughness: ScalarInput::Const(0.5),
+            metallic: ScalarInput::Const(0.0),
+            normal: None,
+        })
+        .unwrap();
+
+    // Warmup — first bake compiles pipelines on some drivers.
+    let _ = baker
+        .bake_output(&graph, (1024, 1024), &EvalCtx::default())
+        .expect("warmup bake");
+
+    let mut times: Vec<std::time::Duration> = Vec::new();
+    for _ in 0..5 {
+        let t0 = std::time::Instant::now();
+        let _ = baker
+            .bake_output(&graph, (1024, 1024), &EvalCtx::default())
+            .expect("bake");
+        // Force sync so we measure through GPU completion, not just command
+        // recording.
+        ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        times.push(t0.elapsed());
+    }
+    times.sort();
+    let median = times[times.len() / 2];
+    let layers = graph.layers.len();
+    eprintln!("perf_fractal_stack_1024: layers={} median={:?}", layers, median);
+    // Not asserted — human reads the number.
+}
+
+#[test]
+fn bake_previews_returns_one_texture_per_authored_layer() {
+    // Includes unreachable layers — the no-reuse schedule adds every authored
+    // layer, not just those wired to Output.
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let base = graph.output.color;
+    graph.set_kind(base, LayerKind::Color(Color::new(0.5, 0.0, 0.0, 1.0))).unwrap();
+    let _b = graph.add_layer("b", LayerKind::Color(Color::new(0.3, 0.1, 60.0, 1.0))).unwrap();
+    let _unreachable = graph
+        .add_layer("dead", LayerKind::Color(Color::new(0.9, 0.05, 200.0, 1.0)))
+        .unwrap();
+    let previews = baker.bake_previews(&graph, &EvalCtx::default()).expect("bake previews");
+    assert_eq!(previews.len(), 3, "expected one preview per authored layer");
+    // Sanity: each output is 128² Rgba8Unorm.
+    for (_, tex) in &previews {
+        assert_eq!(tex.width(), 128);
+        assert_eq!(tex.height(), 128);
+        assert_eq!(tex.format(), wgpu::TextureFormat::Rgba8Unorm);
+    }
+}
+
+#[test]
+fn h2n_on_flat_source_gives_flat_normal() {
+    // Uniform source → zero gradient → normal = (0, 0, 1) → sRGB (128, 128, 255).
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let source = graph.output.color;
+    graph.set_kind(source, LayerKind::Color(Color::new(0.5, 0.0, 0.0, 1.0))).unwrap();
+    let n = graph
+        .add_layer("n", LayerKind::HeightToNormal(HeightToNormal { source, strength: 1.0 }))
+        .unwrap();
+    graph.set_output(Output {
+        color: graph.output.color,
+        roughness: ScalarInput::Const(0.5),
+        metallic: ScalarInput::Const(0.0),
+        normal: Some(n),
+    }).unwrap();
+    let out = baker.bake_output(&graph, (16, 16), &EvalCtx::default()).expect("bake h2n");
+    // Sample a pixel in the interior, not the edge — clamped neighbors at
+    // the edge give a phantom gradient because the "outside" is a copy of
+    // the edge and adjacent-inside pixels differ; on uniform input they
+    // agree but the pixel-center convention still yields a clean interior.
+    let px = readback_all_pixels(&ctx, &out.normal, (16, 16));
+    let interior = px[8 * 16 + 8];
+    for (i, want) in [128u8, 128, 255, 255].iter().enumerate() {
+        let d = (*want as i32 - interior[i] as i32).abs();
+        assert!(d <= 2, "flat-normal channel {i}: expect {want} got {} (delta {d})", interior[i]);
+    }
+}
+
+#[test]
+fn h2n_on_horizontal_ramp_tilts_normal_toward_negative_u() {
+    // Horizontal ramp: L increases along u. Central-difference gradient is
+    // positive in u, zero in v. Normal = (-slope, 0, 1)/norm, so x-channel
+    // of the encoded sRGB should read *less than* 128 (nx < 0 → n*0.5+0.5 < 0.5).
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let ramp = graph
+        .add_layer(
+            "ramp",
+            LayerKind::ColorRamp(ColorRamp {
+                stops: vec![
+                    ColorStop { t: 0.0, color: ColorInput::Const(Color::new(0.0, 0.0, 0.0, 1.0)) },
+                    ColorStop { t: 1.0, color: ColorInput::Const(Color::new(1.0, 0.0, 0.0, 1.0)) },
+                ],
+                space: BlendSpace::Oklch,
+            }),
+        )
+        .unwrap();
+    let n = graph
+        .add_layer("n", LayerKind::HeightToNormal(HeightToNormal { source: ramp, strength: 1.0 }))
+        .unwrap();
+    graph.set_output(Output {
+        color: graph.output.color,
+        roughness: ScalarInput::Const(0.5),
+        metallic: ScalarInput::Const(0.0),
+        normal: Some(n),
+    }).unwrap();
+    let out = baker.bake_output(&graph, (32, 32), &EvalCtx::default()).expect("bake h2n ramp");
+    let px = readback_all_pixels(&ctx, &out.normal, (32, 32));
+    let interior = px[16 * 32 + 16];
+    // Encoded (n*0.5 + 0.5). Slope is positive in u, so nx < 0 → r < 128.
+    // v-gradient is 0 → g ≈ 128. Blue always ≥ 128 (nz always ≥ 0).
+    assert!(interior[0] < 120, "expected r < 120 (tilted normal), got {}", interior[0]);
+    assert!(interior[1] >= 125 && interior[1] <= 130, "g ≈ 128, got {}", interior[1]);
+    assert!(interior[2] >= 128, "b >= 128, got {}", interior[2]);
 }
 
 #[test]
