@@ -1,10 +1,11 @@
 // LayerKind::ColorRamp — multi-stop 1D gradient, sampled along U.
 //
-// MVP scope: only ColorInput::Const stops are supported (up to
-// MAX_STOPS = 16). Layer-referenced stops error at bake time.
-//
-// A storage buffer carries the packed stops; the shader picks the segment
-// containing U and blends between them in the ramp's configured space.
+// Each stop is either a constant color or a reference to another layer.
+// Const stops carry the value inline; layer stops carry an `input_index`
+// into a fixed array of MAX_RAMP_INPUTS = 8 texture bindings (the CPU side
+// binds each referenced layer's intermediate texture into one of those
+// slots). More than 8 unique layer-referenced stops in one ramp is
+// rejected at bake time.
 
 struct RampParams {
     size: vec2<u32>,
@@ -12,20 +13,25 @@ struct RampParams {
     space: u32,      // 0=Oklch, 1=LinearSrgb, 2=Hsv
 }
 
-// 32-byte packed stop. WGSL vec3 has 16-byte alignment in storage buffers,
-// which would silently grow this struct to 48 bytes and desync it from the
-// Rust side. Three scalar pads keep it exactly 32.
 struct Stop {
-    color: vec4<f32>,   // Oklcha (L, C, hue-deg, alpha)
+    color: vec4<f32>,   // Oklcha; used when kind == 0
     t: f32,
+    kind: u32,          // 0 = const, 1 = sample tex[input_index]
+    input_index: u32,   // 0..7 into the input-texture array
     _p0: f32,
-    _p1: f32,
-    _p2: f32,
 }
 
 @group(0) @binding(0) var<uniform> params: RampParams;
 @group(0) @binding(1) var out_tex: texture_storage_2d<rgba32float, write>;
 @group(0) @binding(2) var<storage, read> stops: array<Stop>;
+@group(0) @binding(3) var in0: texture_2d<f32>;
+@group(0) @binding(4) var in1: texture_2d<f32>;
+@group(0) @binding(5) var in2: texture_2d<f32>;
+@group(0) @binding(6) var in3: texture_2d<f32>;
+@group(0) @binding(7) var in4: texture_2d<f32>;
+@group(0) @binding(8) var in5: texture_2d<f32>;
+@group(0) @binding(9) var in6: texture_2d<f32>;
+@group(0) @binding(10) var in7: texture_2d<f32>;
 
 const PI: f32 = 3.14159265358979323846;
 const DEG_TO_RAD: f32 = PI / 180.0;
@@ -153,14 +159,36 @@ fn blend_stops(a: vec4<f32>, b: vec4<f32>, t: f32) -> vec4<f32> {
     }
 }
 
+// Sample one of the 8 input textures by index. Uniform indexing into a
+// texture array requires the SAMPLED_TEXTURE_ARRAY_NON_UNIFORM_INDEXING
+// feature (native-only), so we switch by index at compile-time.
+fn sample_input(idx: u32, coord: vec2<i32>) -> vec4<f32> {
+    switch idx {
+        case 0u: { return textureLoad(in0, coord, 0); }
+        case 1u: { return textureLoad(in1, coord, 0); }
+        case 2u: { return textureLoad(in2, coord, 0); }
+        case 3u: { return textureLoad(in3, coord, 0); }
+        case 4u: { return textureLoad(in4, coord, 0); }
+        case 5u: { return textureLoad(in5, coord, 0); }
+        case 6u: { return textureLoad(in6, coord, 0); }
+        default: { return textureLoad(in7, coord, 0); }
+    }
+}
+
+fn stop_color(idx: u32, coord: vec2<i32>) -> vec4<f32> {
+    let s = stops[idx];
+    if (s.kind == 0u) {
+        return s.color;
+    }
+    return sample_input(s.input_index, coord);
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.size.x || gid.y >= params.size.y) { return; }
     let coord = vec2<i32>(i32(gid.x), i32(gid.y));
     let u = (f32(gid.x) + 0.5) / f32(params.size.x);
-    // Find the segment containing u. Emulates the CPU loop in `eval_ramp`:
-    // any span whose (t_lo, t_hi) brackets u; otherwise extrapolate through
-    // the outermost segment.
+    // Find the segment containing u. Matches the CPU loop in `eval_ramp`.
     var lo: u32 = 0u;
     var hi: u32 = params.stop_count - 1u;
     for (var i: u32 = 0u; i + 1u < params.stop_count; i = i + 1u) {
@@ -178,13 +206,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             break;
         }
     }
-    let a = stops[lo];
-    let b = stops[hi];
-    let span = b.t - a.t;
+    let ta = stops[lo].t;
+    let tb = stops[hi].t;
+    let span = tb - ta;
     var t: f32 = 0.0;
-    if (abs(span) >= 1.1754944e-38) { // f32::EPSILON floor
-        t = (u - a.t) / span;
+    if (abs(span) >= 1.1754944e-38) {
+        t = (u - ta) / span;
     }
-    let out_px = blend_stops(a.color, b.color, t);
+    let a_color = stop_color(lo, coord);
+    let b_color = stop_color(hi, coord);
+    let out_px = blend_stops(a_color, b_color, t);
     textureStore(out_tex, coord, out_px);
 }

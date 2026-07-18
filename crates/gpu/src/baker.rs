@@ -25,6 +25,9 @@ use crate::schedule::{OutputSlots, ScalarSlot, Schedule, schedule, schedule_no_r
 
 /// Max stops per ColorRamp supported by the GPU baker.
 const MAX_RAMP_STOPS: usize = 16;
+/// Max distinct layer-referenced stops per ColorRamp. Bindings must be
+/// declared at pipeline-creation time, so this is a hard cap.
+const MAX_RAMP_INPUTS: usize = 8;
 
 /// Four sRGB-encoded 8-bit-per-channel textures ready for display.
 pub struct BakeOutput {
@@ -76,6 +79,12 @@ pub struct Baker {
     map_bgl: wgpu::BindGroupLayout,
     ramp_pipeline: wgpu::ComputePipeline,
     ramp_bgl: wgpu::BindGroupLayout,
+    /// 1×1 Rgba32Float sampled-only texture. Bound into unused ramp input
+    /// slots so we never collide with an output storage binding. Kept alive
+    /// by the Baker so `dummy_input_view` stays valid.
+    #[allow(dead_code)]
+    dummy_input: wgpu::Texture,
+    dummy_input_view: wgpu::TextureView,
     h2n_pipeline: wgpu::ComputePipeline,
     // h2n reuses `transform_bgl` — same binding shape (uniform + storage_out + input_2d).
     pack_pipeline: wgpu::ComputePipeline,
@@ -93,6 +102,19 @@ impl Baker {
         let (map_pipeline, map_bgl) = make_map_pipeline(&ctx.device);
         let (ramp_pipeline, ramp_bgl) = make_ramp_pipeline(&ctx.device);
         let h2n_pipeline = make_h2n_pipeline(&ctx.device, &transform_bgl);
+        let dummy_input = ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("tg-dummy-input"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            // Sampled only — no STORAGE_BINDING so wgpu can't confuse this
+            // with an output slot.
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let dummy_input_view = dummy_input.create_view(&wgpu::TextureViewDescriptor::default());
         let (pack_pipeline, pack_bgl) = make_pack_pipeline(&ctx.device);
         let (solid_pipeline, solid_bgl) = make_solid_pipeline(&ctx.device);
         Self {
@@ -111,6 +133,8 @@ impl Baker {
             map_bgl,
             ramp_pipeline,
             ramp_bgl,
+            dummy_input,
+            dummy_input_view,
             h2n_pipeline,
             pack_pipeline,
             pack_bgl,
@@ -317,11 +341,6 @@ impl Baker {
                 );
             }
             LayerKind::ColorRamp(r) => {
-                for s in &r.stops {
-                    if let ColorInput::Layer(_) = s.color {
-                        return Err(BakeError::Unsupported("ColorRamp (layer stops)"));
-                    }
-                }
                 if r.stops.len() > MAX_RAMP_STOPS {
                     return Err(BakeError::Unsupported("ColorRamp (>16 stops)"));
                 }
@@ -332,8 +351,11 @@ impl Baker {
                     &self.ramp_bgl,
                     &pool_views[dst_slot],
                     r,
+                    sched,
+                    pool_views,
+                    &self.dummy_input_view,
                     size,
-                );
+                )?;
             }
         }
         Ok(())
@@ -568,9 +590,11 @@ struct H2NParams {
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct RampStopPacked {
-    color: [f32; 4], // Oklcha
+    color: [f32; 4],   // Oklcha; used when kind == 0
     t: f32,
-    _pad: [f32; 3],
+    kind: u32,         // 0 = const, 1 = layer
+    input_index: u32,  // 0..7 into the ramp shader's input array
+    _p0: f32,
 }
 
 fn slot_of(sched: &Schedule, id: LayerId) -> u32 {
@@ -814,32 +838,78 @@ fn dispatch_ramp(
     bgl: &wgpu::BindGroupLayout,
     dst_view: &wgpu::TextureView,
     r: &ColorRamp,
+    sched: &Schedule,
+    pool_views: &[wgpu::TextureView],
+    dummy_input_view: &wgpu::TextureView,
     size: (u32, u32),
-) {
+) -> Result<(), BakeError> {
     use wgpu::util::DeviceExt;
+
+    // Resolve unique layer-refs across stops → 0..N-1 input indices. Multiple
+    // stops pointing at the same layer share one slot.
+    let mut layer_to_input: HashMap<LayerId, u32> = HashMap::new();
+    let mut input_pool_slots: Vec<u32> = Vec::new();
+    for s in &r.stops {
+        if let ColorInput::Layer(id) = s.color {
+            if !layer_to_input.contains_key(&id) {
+                if input_pool_slots.len() >= MAX_RAMP_INPUTS {
+                    return Err(BakeError::Unsupported(
+                        "ColorRamp (>8 unique layer-referenced stops)",
+                    ));
+                }
+                layer_to_input.insert(id, input_pool_slots.len() as u32);
+                input_pool_slots.push(slot_of(sched, id));
+            }
+        }
+    }
+
     let params = RampParams {
         size: [size.0, size.1],
         stop_count: r.stops.len() as u32,
         space: blend_space_code(r.space),
     };
     let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "ramp-params");
+
     let mut packed = Vec::with_capacity(r.stops.len());
     for s in &r.stops {
-        let c = match s.color {
-            ColorInput::Const(c) => c,
-            ColorInput::Layer(_) => unreachable!("layer stops rejected earlier"),
-        };
-        packed.push(RampStopPacked {
-            color: [c.l, c.chroma, c.hue.into_degrees(), c.alpha],
-            t: s.t,
-            _pad: [0.0; 3],
-        });
+        match s.color {
+            ColorInput::Const(c) => packed.push(RampStopPacked {
+                color: [c.l, c.chroma, c.hue.into_degrees(), c.alpha],
+                t: s.t,
+                kind: 0,
+                input_index: 0,
+                _p0: 0.0,
+            }),
+            ColorInput::Layer(id) => {
+                let input_index = *layer_to_input
+                    .get(&id)
+                    .expect("layer resolved into input map above");
+                packed.push(RampStopPacked {
+                    color: [0.0; 4],
+                    t: s.t,
+                    kind: 1,
+                    input_index,
+                    _p0: 0.0,
+                });
+            }
+        }
     }
     let stops_ssbo = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("ramp-stops"),
         contents: bytemuck::cast_slice(&packed),
         usage: wgpu::BufferUsages::STORAGE,
     });
+
+    // Bindings 3..11 are the input textures. Any unused slot binds the
+    // Baker's persistent 1×1 dummy (sampled-only) so it never collides with
+    // the storage output binding. The shader only samples slots referenced
+    // by a Stop with kind == 1.
+    let mut input_views: [&wgpu::TextureView; MAX_RAMP_INPUTS] =
+        [dummy_input_view; MAX_RAMP_INPUTS];
+    for (i, &slot) in input_pool_slots.iter().enumerate() {
+        input_views[i] = &pool_views[slot as usize];
+    }
+
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("ramp-bg"),
         layout: bgl,
@@ -850,6 +920,14 @@ fn dispatch_ramp(
                 resource: wgpu::BindingResource::TextureView(dst_view),
             },
             wgpu::BindGroupEntry { binding: 2, resource: stops_ssbo.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(input_views[0]) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(input_views[1]) },
+            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(input_views[2]) },
+            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(input_views[3]) },
+            wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(input_views[4]) },
+            wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(input_views[5]) },
+            wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(input_views[6]) },
+            wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(input_views[7]) },
         ],
     });
     let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -860,6 +938,7 @@ fn dispatch_ramp(
     cpass.set_bind_group(0, &bg, &[]);
     let (wg_x, wg_y) = workgroup_counts(size);
     cpass.dispatch_workgroups(wg_x, wg_y, 1);
+    Ok(())
 }
 
 fn dispatch_noise(
@@ -1336,6 +1415,14 @@ fn make_ramp_pipeline(
             uniform_bgle(0),
             storage_texture_bgle(1, wgpu::TextureFormat::Rgba32Float),
             storage_buffer_bgle(2),
+            input_texture_bgle(3),
+            input_texture_bgle(4),
+            input_texture_bgle(5),
+            input_texture_bgle(6),
+            input_texture_bgle(7),
+            input_texture_bgle(8),
+            input_texture_bgle(9),
+            input_texture_bgle(10),
         ],
     });
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {

@@ -204,34 +204,14 @@ fn ramp_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, r: &mut ColorRamp
             changed |= ui
                 .add(egui::DragValue::new(&mut stop.t).speed(0.01).range(0.0..=1.0))
                 .changed();
-            match &mut stop.color {
-                ColorInput::Const(c) => {
-                    changed |= color_edit::oklcha_edit(ui, c);
-                    if ui.small_button("use layer").clicked() {
-                        stop.color = ColorInput::Layer(
-                            graph.layers.first().map(|l| l.id).unwrap_or(LayerId(0)),
-                        );
-                        changed = true;
-                    }
-                }
-                ColorInput::Layer(lref) => {
-                    if let Some(new) = layer_ref::layer_ref(
-                        ui,
-                        ("ramp-stop", id.0, i),
-                        "stop",
-                        *lref,
-                        graph,
-                        Some(id),
-                    ) {
-                        *lref = new;
-                        changed = true;
-                    }
-                    if ui.small_button("use const").clicked() {
-                        stop.color = ColorInput::Const(oklcha(0.5, 0.0, 0.0, 1.0));
-                        changed = true;
-                    }
-                }
-            }
+            changed |= crate::widgets::color_input::color_input_widget(
+                ui,
+                graph,
+                (id.0, "ramp-stop", i),
+                "stop",
+                &mut stop.color,
+                Some(id),
+            );
             if stop_count > 2 && ui.small_button("remove").clicked() {
                 remove_at = Some(i);
             }

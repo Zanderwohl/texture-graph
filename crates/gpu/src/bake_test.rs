@@ -289,6 +289,98 @@ fn ramp_black_to_white_at_midpoint_is_gray() {
 }
 
 #[test]
+fn ramp_with_layer_ref_stops_reads_from_source_layers() {
+    // Ramp with two stops, both layer-refs. Stop 0 points at "black" layer,
+    // stop 1 points at "white" layer. Baked into a 16-wide texture — middle
+    // column should read as gray L≈0.5.
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let black = graph.output.color;
+    graph.set_kind(black, LayerKind::Color(Color::new(0.0, 0.0, 0.0, 1.0))).unwrap();
+    let white = graph
+        .add_layer("white", LayerKind::Color(Color::new(1.0, 0.0, 0.0, 1.0)))
+        .unwrap();
+    let ramp = graph
+        .add_layer(
+            "ramp",
+            LayerKind::ColorRamp(ColorRamp {
+                stops: vec![
+                    ColorStop { t: 0.0, color: ColorInput::Layer(black) },
+                    ColorStop { t: 1.0, color: ColorInput::Layer(white) },
+                ],
+                space: BlendSpace::Oklch,
+            }),
+        )
+        .unwrap();
+    graph.set_output(Output {
+        color: ramp,
+        roughness: ScalarInput::Const(0.5),
+        metallic: ScalarInput::Const(0.0),
+        normal: None,
+    }).unwrap();
+
+    let out = baker.bake_output(&graph, (16, 16), &EvalCtx::default()).expect("bake");
+    let px = readback_all_pixels(&ctx, &out.color, (16, 16));
+    // Column 8 is u = 8.5/16 = 0.53125 → L ≈ 0.53125.
+    let mid_pixel = px[16 * 8 + 8];
+    let expected = to_srgb8(Color::new(0.53125, 0.0, 0.0, 1.0));
+    for i in 0..3 {
+        let d = (expected[i] as i32 - mid_pixel[i] as i32).abs();
+        assert!(d <= 3, "layer-ref ramp mid channel {i}: expect {} got {} (delta {d})", expected[i], mid_pixel[i]);
+    }
+    // Left edge should read the black layer (~0), right edge the white (~255).
+    let left = px[16 * 8][0];
+    let right = px[16 * 8 + 15][0];
+    assert!(left < 30, "left edge should read black layer, got {left}");
+    assert!(right > 220, "right edge should read white layer, got {right}");
+}
+
+#[test]
+fn ramp_rejects_more_than_eight_unique_layer_stops() {
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    // Auto-created base color layer + 8 more colors = 9 distinct layers.
+    let mut layer_ids = vec![graph.output.color];
+    for i in 0..8u32 {
+        layer_ids.push(
+            graph
+                .add_layer(
+                    &format!("c{i}"),
+                    LayerKind::Color(Color::new(0.1 * i as f32, 0.0, 0.0, 1.0)),
+                )
+                .unwrap(),
+        );
+    }
+    let stops: Vec<_> = layer_ids
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| ColorStop {
+            t: i as f32 / 8.0,
+            color: ColorInput::Layer(id),
+        })
+        .collect();
+    let ramp = graph
+        .add_layer(
+            "ramp",
+            LayerKind::ColorRamp(ColorRamp { stops, space: BlendSpace::Oklch }),
+        )
+        .unwrap();
+    graph.set_output(Output {
+        color: ramp,
+        roughness: ScalarInput::Const(0.5),
+        metallic: ScalarInput::Const(0.0),
+        normal: None,
+    }).unwrap();
+    match baker.bake_output(&graph, (8, 8), &EvalCtx::default()) {
+        Ok(_) => panic!("expected 9-layer ramp to be rejected"),
+        Err(crate::BakeError::Unsupported(msg)) => assert!(msg.contains(">8")),
+        Err(other) => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
 fn transform_passthrough_of_color_is_identity() {
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
     let mut baker = Baker::new(ctx.clone());
