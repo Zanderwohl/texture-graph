@@ -38,6 +38,19 @@ pub struct BakeOutput {
     pub size: (u32, u32),
 }
 
+/// A solid-texture bake: the four PBR channels evaluated over a full
+/// `res × res × depth` volume (w = slice center), stored as 3D
+/// `Rgba8Unorm` textures. The 3D preview samples these at each fragment's
+/// object-space position instead of UV-mapping a single flat slice.
+pub struct VolumeOutput {
+    pub color: wgpu::Texture,
+    pub roughness: wgpu::Texture,
+    pub metallic: wgpu::Texture,
+    pub normal: wgpu::Texture,
+    /// (width, height, depth) in texels.
+    pub size: (u32, u32, u32),
+}
+
 #[derive(Debug)]
 pub enum BakeError {
     Schedule(crate::schedule::ScheduleError),
@@ -89,6 +102,13 @@ pub struct Baker {
     dummy_input_view: wgpu::TextureView,
     h2n_pipeline: wgpu::ComputePipeline,
     // h2n reuses `transform_bgl` — same binding shape (uniform + storage_out + input_2d).
+    // missing reuses `color_bgl`: same binding shape (uniform + storage_texture).
+    missing_pipeline: wgpu::ComputePipeline,
+    /// Pool-sized texture holding the magenta/black "missing texture"
+    /// grid, bound wherever a layer input is `None`. Refilled at the
+    /// start of every bake (per slice for volumes, so the grid is 3D).
+    missing_tex: Option<wgpu::Texture>,
+    missing_view: Option<wgpu::TextureView>,
     pack_pipeline: wgpu::ComputePipeline,
     pack_bgl: wgpu::BindGroupLayout,
     solid_pipeline: wgpu::ComputePipeline,
@@ -118,6 +138,7 @@ impl Baker {
             view_formats: &[],
         });
         let dummy_input_view = dummy_input.create_view(&wgpu::TextureViewDescriptor::default());
+        let missing_pipeline = make_missing_pipeline(&ctx.device, &color_bgl);
         let (pack_pipeline, pack_bgl) = make_pack_pipeline(&ctx.device);
         let (solid_pipeline, solid_bgl) = make_solid_pipeline(&ctx.device);
         Self {
@@ -135,6 +156,9 @@ impl Baker {
             map_pipeline,
             map_bgl,
             min_max_pipeline,
+            missing_pipeline,
+            missing_tex: None,
+            missing_view: None,
             ramp_pipeline,
             ramp_bgl,
             dummy_input,
@@ -209,6 +233,14 @@ impl Baker {
                 label: Some("tg-bake-previews"),
             });
 
+        // Preview-sized missing-texture grid (the pool-sized one on
+        // `self` may be a different resolution).
+        let (_missing_tex, missing_view) = make_missing_texture(&device, size);
+        dispatch_missing(
+            &self.ctx, &mut encoder, &self.missing_pipeline, &self.color_bgl,
+            &missing_view, size, 0.5,
+        );
+
         // 1. Dispatch every layer into its own intermediate slot.
         for &id in &sched.order {
             let slot = *sched.slot_of.get(&id).unwrap() as usize;
@@ -221,6 +253,8 @@ impl Baker {
                 &inter_views,
                 size,
                 slot,
+                0.5,
+                &missing_view,
             )?;
         }
 
@@ -238,6 +272,8 @@ impl Baker {
                 size,
                 0,
                 [0.0; 4],
+                false,
+                0,
             );
         }
 
@@ -246,8 +282,10 @@ impl Baker {
     }
 
     /// Emit compute dispatches for one layer, writing its output into
-    /// `pool_views[dst_slot]`. Shared between `bake_output` and
-    /// `bake_previews`.
+    /// `pool_views[dst_slot]`. Shared between `bake_output`,
+    /// `bake_previews`, and `bake_volume`. `w` is the third texture
+    /// coordinate for this pass — 0.5 for flat bakes, the slice center for
+    /// volume bakes.
     fn dispatch_kind(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -257,7 +295,16 @@ impl Baker {
         pool_views: &[wgpu::TextureView],
         size: (u32, u32),
         dst_slot: usize,
+        w: f32,
+        missing_view: &wgpu::TextureView,
     ) -> Result<(), BakeError> {
+        // A `None` input has no slot — it samples the missing-texture grid.
+        let resolve = |opt: Option<texture_graph_core::LayerId>| -> &wgpu::TextureView {
+            match opt {
+                Some(id) => &pool_views[slot_of(sched, id) as usize],
+                None => missing_view,
+            }
+        };
         match &layer.kind {
             LayerKind::Color(c) => {
                 dispatch_color(
@@ -280,29 +327,29 @@ impl Baker {
                     n,
                     eval_ctx.seed,
                     size,
+                    w,
                 );
             }
             LayerKind::Transform(t) => {
-                let src_slot = slot_of(sched, t.source);
                 dispatch_transform(
                     &self.ctx,
                     encoder,
                     &self.transform_pipeline,
                     &self.transform_bgl,
                     &pool_views[dst_slot],
-                    &pool_views[src_slot as usize],
+                    resolve(t.source),
                     t,
                     size,
+                    w,
                 );
             }
             LayerKind::Mix(m) => {
-                let a_slot = slot_of(sched, m.a);
-                let b_slot = slot_of(sched, m.b);
-                let factor_slot = match m.factor {
-                    ScalarInput::Layer(id) => slot_of(sched, id),
+                let a_view = resolve(m.a);
+                let factor_view = match m.factor {
+                    ScalarInput::Layer(id) => resolve(Some(id)),
                     // Bind `a` as a placeholder for the factor texture; the
                     // shader only samples it when factor_is_layer == 1.
-                    ScalarInput::Const(_) => a_slot,
+                    ScalarInput::Const(_) => a_view,
                 };
                 dispatch_mix(
                     &self.ctx,
@@ -310,51 +357,46 @@ impl Baker {
                     &self.mix_pipeline,
                     &self.mix_bgl,
                     &pool_views[dst_slot],
-                    &pool_views[a_slot as usize],
-                    &pool_views[b_slot as usize],
-                    &pool_views[factor_slot as usize],
+                    a_view,
+                    resolve(m.b),
+                    factor_view,
                     m,
                     size,
                 );
             }
             LayerKind::Map(m) => {
-                let value_slot = slot_of(sched, m.value);
-                let palette_slot = slot_of(sched, m.palette);
                 dispatch_map(
                     &self.ctx,
                     encoder,
                     &self.map_pipeline,
                     &self.map_bgl,
                     &pool_views[dst_slot],
-                    &pool_views[value_slot as usize],
-                    &pool_views[palette_slot as usize],
+                    resolve(m.value),
+                    resolve(m.palette),
                     size,
                 );
             }
             LayerKind::MinMax(mm) => {
-                let a_slot = slot_of(sched, mm.a);
-                let b_slot = slot_of(sched, mm.b);
                 dispatch_min_max(
                     &self.ctx,
                     encoder,
                     &self.min_max_pipeline,
                     &self.map_bgl,
                     &pool_views[dst_slot],
-                    &pool_views[a_slot as usize],
-                    &pool_views[b_slot as usize],
+                    resolve(mm.a),
+                    resolve(mm.b),
                     mm,
                     size,
                 );
             }
             LayerKind::HeightToNormal(h) => {
-                let src_slot = slot_of(sched, h.source);
                 dispatch_h2n(
                     &self.ctx,
                     encoder,
                     &self.h2n_pipeline,
                     &self.transform_bgl,
                     &pool_views[dst_slot],
-                    &pool_views[src_slot as usize],
+                    resolve(h.source),
                     h,
                     size,
                 );
@@ -386,6 +428,13 @@ impl Baker {
             self.pool.clear();
             self.pool_views.clear();
             self.pool_size = size;
+            self.missing_tex = None;
+            self.missing_view = None;
+        }
+        if self.missing_tex.is_none() {
+            let (tex, view) = make_missing_texture(&self.ctx.device, size);
+            self.missing_tex = Some(tex);
+            self.missing_view = Some(view);
         }
         while self.pool.len() < needed as usize {
             let tex = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
@@ -412,11 +461,17 @@ impl Baker {
 
     /// Bake the graph's output at `size`. Only variants with pipelines
     /// implemented so far are supported; others return `Unsupported`.
+    ///
+    /// `object_alpha` switches the presentation of partial alpha: `false`
+    /// composites the gray backing checker into the color channel (flat
+    /// previews), `true` keeps the real alpha so the 3D preview can blend
+    /// the object itself.
     pub fn bake_output(
         &mut self,
         graph: &Graph,
         size: (u32, u32),
         _ctx: &EvalCtx,
+        object_alpha: bool,
     ) -> Result<BakeOutput, BakeError> {
         let t0 = std::time::Instant::now();
         let sched = schedule(graph)?;
@@ -428,6 +483,12 @@ impl Baker {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("tg-bake-output"),
             });
+
+        let missing_view = self.missing_view.as_ref().unwrap();
+        dispatch_missing(
+            &self.ctx, &mut encoder, &self.missing_pipeline, &self.color_bgl,
+            missing_view, size, 0.5,
+        );
 
         // Dispatch each layer.
         for &id in &sched.order {
@@ -441,6 +502,8 @@ impl Baker {
                 &self.pool_views,
                 size,
                 slot,
+                0.5,
+                missing_view,
             )?;
         }
 
@@ -462,6 +525,8 @@ impl Baker {
             size,
             OutputChannel::Color,
             &sched.output_slots,
+            object_alpha,
+            0,
         );
         pack_channel(
             &self.ctx,
@@ -475,6 +540,8 @@ impl Baker {
             size,
             OutputChannel::Roughness,
             &sched.output_slots,
+            object_alpha,
+            0,
         );
         pack_channel(
             &self.ctx,
@@ -488,6 +555,8 @@ impl Baker {
             size,
             OutputChannel::Metallic,
             &sched.output_slots,
+            object_alpha,
+            0,
         );
         pack_channel(
             &self.ctx,
@@ -501,6 +570,8 @@ impl Baker {
             size,
             OutputChannel::Normal,
             &sched.output_slots,
+            object_alpha,
+            0,
         );
 
         self.ctx.queue.submit([encoder.finish()]);
@@ -516,6 +587,133 @@ impl Baker {
             inter_bytes / (1024 * 1024),
         );
         Ok(BakeOutput { color, roughness, metallic, normal, size })
+    }
+
+    /// Bake the graph as a solid 3D texture: run the whole per-slice 2D
+    /// pipeline `depth` times with w advancing through the slice centers,
+    /// packing each slice and copying it into layer `z` of four 3D
+    /// textures. Reuses every existing 2D shader — the only per-slice
+    /// difference is the `w` uniform fed to the coordinate-generating
+    /// stages (noise, transform).
+    ///
+    /// Known limitation (same as the flat GPU path): a Transform's w
+    /// *offset/scale* can't re-sample its input at a different w, because
+    /// each slice only has its inputs baked at the same w.
+    pub fn bake_volume(
+        &mut self,
+        graph: &Graph,
+        res: u32,
+        depth: u32,
+        eval_ctx: &EvalCtx,
+    ) -> Result<VolumeOutput, BakeError> {
+        let t0 = std::time::Instant::now();
+        let sched = schedule(graph)?;
+        let size = (res, res);
+        self.ensure_pool(size, sched.peak_slots.max(1));
+
+        // Reusable 2D slice targets (storage-written by pack, then copied
+        // out) and the four 3D destination volumes.
+        let slices: Vec<wgpu::Texture> = ["color", "rough", "metal", "normal"]
+            .iter()
+            .map(|n| make_output_texture(&self.ctx.device, size, &format!("tg-vol-slice-{n}")))
+            .collect();
+        let slice_views: Vec<wgpu::TextureView> = slices
+            .iter()
+            .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()))
+            .collect();
+        let volumes: Vec<wgpu::Texture> = ["color", "rough", "metal", "normal"]
+            .iter()
+            .map(|n| make_volume_texture(&self.ctx.device, res, depth, &format!("tg-vol-{n}")))
+            .collect();
+
+        let mut encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("tg-bake-volume"),
+            });
+
+        const CHANNELS: [OutputChannel; 4] = [
+            OutputChannel::Color,
+            OutputChannel::Roughness,
+            OutputChannel::Metallic,
+            OutputChannel::Normal,
+        ];
+        let missing_view = self.missing_view.as_ref().unwrap();
+        for z in 0..depth {
+            let w = (z as f32 + 0.5) / depth as f32;
+            // Refill per slice — the grid alternates along w too.
+            dispatch_missing(
+                &self.ctx, &mut encoder, &self.missing_pipeline, &self.color_bgl,
+                missing_view, size, w,
+            );
+            for &id in &sched.order {
+                let slot = *sched.slot_of.get(&id).unwrap() as usize;
+                let layer = graph.get(id).unwrap();
+                self.dispatch_kind(
+                    &mut encoder,
+                    layer,
+                    eval_ctx,
+                    &sched,
+                    &self.pool_views,
+                    size,
+                    slot,
+                    w,
+                    missing_view,
+                )?;
+            }
+            for (i, channel) in CHANNELS.iter().enumerate() {
+                pack_channel(
+                    &self.ctx,
+                    &mut encoder,
+                    &self.pack_pipeline,
+                    &self.pack_bgl,
+                    &self.solid_pipeline,
+                    &self.solid_bgl,
+                    &self.pool_views,
+                    &slice_views[i],
+                    size,
+                    *channel,
+                    &sched.output_slots,
+                    true,
+                    z,
+                );
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &slices[i],
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &volumes[i],
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x: 0, y: 0, z },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: res,
+                        height: res,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
+
+        self.ctx.queue.submit([encoder.finish()]);
+        log::debug!(
+            "bake_volume {res}³ (depth={depth}): layers/slice={} record+submit={:?}",
+            sched.order.len(),
+            t0.elapsed(),
+        );
+        let mut it = volumes.into_iter();
+        Ok(VolumeOutput {
+            color: it.next().unwrap(),
+            roughness: it.next().unwrap(),
+            metallic: it.next().unwrap(),
+            normal: it.next().unwrap(),
+            size: (res, res, depth),
+        })
     }
 }
 
@@ -538,7 +736,7 @@ struct NoiseParams {
     output_mode: u32,
     seed_base: u32,
     frequency: f32,
-    _pad: u32,
+    w_coord: f32,
 }
 
 #[repr(C)]
@@ -546,8 +744,22 @@ struct NoiseParams {
 struct PackParams {
     size: [u32; 2],
     mode: u32,
-    _pad: u32,
+    /// 0 = composite the gray alpha checker (flat previews);
+    /// 1 = keep real alpha (3D preview blends the object itself).
+    alpha_object: u32,
     const_value: [f32; 4],
+    /// Volume slice index in texels (0 for flat bakes) — third axis of
+    /// the out-of-range 3D checkerboard.
+    z_px: u32,
+    _pad: [u32; 3],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct MissingParams {
+    size: [u32; 2],
+    w_coord: f32,
+    _pad: u32,
 }
 
 #[repr(C)]
@@ -569,7 +781,8 @@ struct TransformParams {
     permute: [u32; 4], // (a, b, c, _), each 0=U 1=V 2=W
     radial_dim: u32,   // 0=D2, 1=D3
     radial_into: u32,  // 0=U 1=V 2=W
-    _pad: [u32; 2],
+    w_coord: f32,      // third texture coordinate; 0.5 for flat bakes
+    _pad: u32,
 }
 
 #[repr(C)]
@@ -697,6 +910,7 @@ fn dispatch_transform(
     src_view: &wgpu::TextureView,
     t: &Transform,
     size: (u32, u32),
+    w: f32,
 ) {
     let (coord_mode, permute, radial_dim, radial_into) = match t.coord_mode {
         CoordMode::Passthrough => (0u32, [0u32; 4], 0u32, 0u32),
@@ -725,7 +939,8 @@ fn dispatch_transform(
         permute,
         radial_dim,
         radial_into,
-        _pad: [0, 0],
+        w_coord: w,
+        _pad: 0,
     };
     let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "transform-params");
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1033,6 +1248,7 @@ fn dispatch_noise(
     n: &Noise,
     ctx_seed: u32,
     size: (u32, u32),
+    w: f32,
 ) {
     let dims = match n.dims {
         NoiseDims::D1 => 0u32,
@@ -1054,7 +1270,7 @@ fn dispatch_noise(
         output_mode,
         seed_base: ctx_seed.wrapping_add(n.seed_offset),
         frequency: n.frequency,
-        _pad: 0,
+        w_coord: w,
     };
     let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "noise-params");
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1130,11 +1346,14 @@ fn pack_channel(
     size: (u32, u32),
     channel: OutputChannel,
     out: &OutputSlots,
+    alpha_object: bool,
+    z_px: u32,
 ) {
     match channel {
         OutputChannel::Color => dispatch_pack(
             ctx, encoder, pack_pipeline, pack_bgl,
             &pool_views[out.color as usize], dst_view, size, 0, [0.0; 4],
+            alpha_object, z_px,
         ),
         OutputChannel::Roughness => match out.roughness {
             ScalarSlot::Const(v) => dispatch_solid(
@@ -1145,6 +1364,7 @@ fn pack_channel(
             ScalarSlot::Slot(s) => dispatch_pack(
                 ctx, encoder, pack_pipeline, pack_bgl,
                 &pool_views[s as usize], dst_view, size, 2, [0.0; 4],
+                alpha_object, z_px,
             ),
         },
         OutputChannel::Metallic => match out.metallic {
@@ -1156,6 +1376,7 @@ fn pack_channel(
             ScalarSlot::Slot(s) => dispatch_pack(
                 ctx, encoder, pack_pipeline, pack_bgl,
                 &pool_views[s as usize], dst_view, size, 2, [0.0; 4],
+                alpha_object, z_px,
             ),
         },
         OutputChannel::Normal => match out.normal {
@@ -1166,6 +1387,7 @@ fn pack_channel(
             Some(s) => dispatch_pack(
                 ctx, encoder, pack_pipeline, pack_bgl,
                 &pool_views[s as usize], dst_view, size, 3, [0.0; 4],
+                alpha_object, z_px,
             ),
         },
     }
@@ -1181,12 +1403,16 @@ fn dispatch_pack(
     size: (u32, u32),
     mode: u32,
     const_value: [f32; 4],
+    alpha_object: bool,
+    z_px: u32,
 ) {
     let params = PackParams {
         size: [size.0, size.1],
         mode,
-        _pad: 0,
+        alpha_object: alpha_object as u32,
         const_value,
+        z_px,
+        _pad: [0; 3],
     };
     let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "pack-params");
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1212,6 +1438,59 @@ fn dispatch_pack(
     cpass.set_bind_group(0, &bg, &[]);
     let (wg_x, wg_y) = workgroup_counts(size);
     cpass.dispatch_workgroups(wg_x, wg_y, 1);
+}
+
+/// Fill `dst_view` with the missing-texture grid at slice coordinate `w`.
+fn dispatch_missing(
+    ctx: &DeviceCtx,
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::ComputePipeline,
+    bgl: &wgpu::BindGroupLayout,
+    dst_view: &wgpu::TextureView,
+    size: (u32, u32),
+    w: f32,
+) {
+    let params = MissingParams { size: [size.0, size.1], w_coord: w, _pad: 0 };
+    let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "missing-params");
+    let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("missing-bg"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: ubo.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(dst_view),
+            },
+        ],
+    });
+    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("missing-cpass"),
+        timestamp_writes: None,
+    });
+    cpass.set_pipeline(pipeline);
+    cpass.set_bind_group(0, &bg, &[]);
+    let (wg_x, wg_y) = workgroup_counts(size);
+    cpass.dispatch_workgroups(wg_x, wg_y, 1);
+}
+
+/// Pool-format texture for the missing-input grid: storage-written by
+/// `dispatch_missing`, sampled by whatever layer has the unconnected input.
+fn make_missing_texture(
+    device: &wgpu::Device,
+    size: (u32, u32),
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("tg-missing"),
+        size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba32Float,
+        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (tex, view)
 }
 
 fn dispatch_solid(
@@ -1257,6 +1536,27 @@ fn create_uniform(device: &wgpu::Device, bytes: &[u8], label: &str) -> wgpu::Buf
 
 fn workgroup_counts(size: (u32, u32)) -> (u32, u32) {
     ((size.0 + 7) / 8, (size.1 + 7) / 8)
+}
+
+/// 3D `Rgba8Unorm` volume assembled slice-by-slice via
+/// `copy_texture_to_texture` and sampled by the solid 3D preview.
+fn make_volume_texture(device: &wgpu::Device, res: u32, depth: u32, label: &str) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: res,
+            height: res,
+            depth_or_array_layers: depth,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    })
 }
 
 fn make_output_texture(device: &wgpu::Device, size: (u32, u32), label: &str) -> wgpu::Texture {
@@ -1589,6 +1889,29 @@ fn make_pack_pipeline(
         cache: None,
     });
     (pipe, bgl)
+}
+
+fn make_missing_pipeline(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+) -> wgpu::ComputePipeline {
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("missing-pl"),
+        bind_group_layouts: &[Some(bgl)],
+        ..Default::default()
+    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("missing-shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/missing.wgsl").into()),
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("missing-pipeline"),
+        layout: Some(&pl),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    })
 }
 
 fn make_solid_pipeline(

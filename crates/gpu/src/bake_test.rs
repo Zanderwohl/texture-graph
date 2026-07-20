@@ -125,7 +125,7 @@ fn color_layer_matches_cpu_to_srgb8() {
         .unwrap();
 
     let out = baker
-        .bake_output(&graph, SIZE, &EvalCtx::default())
+        .bake_output(&graph, SIZE, &EvalCtx::default(), false)
         .expect("bake");
 
     let cpu = to_srgb8(Color::new(0.6, 0.15, 40.0, 1.0));
@@ -187,7 +187,7 @@ fn noise_layer_has_variance_and_is_deterministic() {
         .unwrap();
 
     let out = baker
-        .bake_output(&graph, size, &EvalCtx::default())
+        .bake_output(&graph, size, &EvalCtx::default(), false)
         .expect("bake noise");
     let px = readback_all_pixels(&ctx, &out.color, size);
 
@@ -200,7 +200,7 @@ fn noise_layer_has_variance_and_is_deterministic() {
 
     // Determinism: baking again with an identical graph must produce identical pixels.
     let out2 = baker
-        .bake_output(&graph, size, &EvalCtx::default())
+        .bake_output(&graph, size, &EvalCtx::default(), false)
         .expect("bake noise 2");
     let px2 = readback_all_pixels(&ctx, &out2.color, size);
     assert_eq!(px, px2, "noise output changed across identical bakes");
@@ -218,8 +218,8 @@ fn mix_add_of_two_colors_matches_cpu() {
         .add_layer(
             "mix",
             LayerKind::Mix(Mix {
-                a,
-                b,
+                a: Some(a),
+                b: Some(b),
                 mode: BlendMode::Add,
                 factor: ScalarInput::Const(0.5),
                 space: BlendSpace::Oklch,
@@ -233,7 +233,7 @@ fn mix_add_of_two_colors_matches_cpu() {
         normal: None,
     }).unwrap();
 
-    let out = baker.bake_output(&graph, SIZE, &EvalCtx::default()).expect("bake");
+    let out = baker.bake_output(&graph, SIZE, &EvalCtx::default(), false).expect("bake");
     let gpu = readback_first_pixel(&ctx, &out.color);
 
     // CPU reference — evaluate the mix directly.
@@ -271,7 +271,7 @@ fn ramp_black_to_white_at_midpoint_is_gray() {
         normal: None,
     }).unwrap();
 
-    let out = baker.bake_output(&graph, SIZE, &EvalCtx::default()).expect("bake ramp");
+    let out = baker.bake_output(&graph, SIZE, &EvalCtx::default(), false).expect("bake ramp");
     let px = readback_all_pixels(&ctx, &out.color, SIZE);
     // Middle column should be roughly the sRGB encoding of Oklch L=0.5 gray.
     // Pixel-center convention: u = (x + 0.5) / 8. The 4th column is u = 0.5625.
@@ -320,7 +320,7 @@ fn ramp_with_layer_ref_stops_reads_from_source_layers() {
         normal: None,
     }).unwrap();
 
-    let out = baker.bake_output(&graph, (16, 16), &EvalCtx::default()).expect("bake");
+    let out = baker.bake_output(&graph, (16, 16), &EvalCtx::default(), false).expect("bake");
     let px = readback_all_pixels(&ctx, &out.color, (16, 16));
     // Column 8 is u = 8.5/16 = 0.53125 → L ≈ 0.53125.
     let mid_pixel = px[16 * 8 + 8];
@@ -373,7 +373,7 @@ fn ramp_rejects_more_than_eight_unique_layer_stops() {
         metallic: ScalarInput::Const(0.0),
         normal: None,
     }).unwrap();
-    match baker.bake_output(&graph, (8, 8), &EvalCtx::default()) {
+    match baker.bake_output(&graph, (8, 8), &EvalCtx::default(), false) {
         Ok(_) => panic!("expected 9-layer ramp to be rejected"),
         Err(crate::BakeError::Unsupported(msg)) => assert!(msg.contains(">8")),
         Err(other) => panic!("unexpected error: {other}"),
@@ -390,7 +390,7 @@ fn transform_passthrough_of_color_is_identity() {
     let t = graph.add_layer(
         "t",
         LayerKind::Transform(Transform {
-            source: c,
+            source: Some(c),
             offset: [0.0, 0.0, 0.0],
             rotate_uv: 0.0,
             scale: [1.0, 1.0, 1.0],
@@ -403,7 +403,7 @@ fn transform_passthrough_of_color_is_identity() {
         metallic: ScalarInput::Const(0.0),
         normal: None,
     }).unwrap();
-    let out = baker.bake_output(&graph, SIZE, &EvalCtx::default()).expect("bake xform");
+    let out = baker.bake_output(&graph, SIZE, &EvalCtx::default(), false).expect("bake xform");
     let px = readback_first_pixel(&ctx, &out.color);
     let expected = to_srgb8(Color::new(0.5, 0.1, 20.0, 1.0));
     for i in 0..4 {
@@ -433,7 +433,7 @@ fn map_gray_value_through_bw_ramp_matches_ramp_lookup() {
     ).unwrap();
     let map = graph.add_layer(
         "map",
-        LayerKind::Map(Map { value, palette }),
+        LayerKind::Map(Map { value: Some(value), palette: Some(palette) }),
     ).unwrap();
     graph.set_output(Output {
         color: map,
@@ -441,7 +441,7 @@ fn map_gray_value_through_bw_ramp_matches_ramp_lookup() {
         metallic: ScalarInput::Const(0.0),
         normal: None,
     }).unwrap();
-    let out = baker.bake_output(&graph, (16, 16), &EvalCtx::default()).expect("bake map");
+    let out = baker.bake_output(&graph, (16, 16), &EvalCtx::default(), false).expect("bake map");
     let px = readback_first_pixel(&ctx, &out.color);
     // Map samples palette at t=L(value)=0.5. The 16-wide palette baked with
     // pixel-center convention: nearest column is 8 → u=(8+0.5)/16=0.53125,
@@ -498,8 +498,8 @@ fn perf_fractal_stack_1024() {
             .add_layer(
                 &format!("sum-{octave}"),
                 LayerKind::Mix(Mix {
-                    a: cur,
-                    b: n,
+                    a: Some(cur),
+                    b: Some(n),
                     mode: BlendMode::Add,
                     factor: ScalarInput::Const(0.5),
                     space: BlendSpace::Oklch,
@@ -518,14 +518,14 @@ fn perf_fractal_stack_1024() {
 
     // Warmup — first bake compiles pipelines on some drivers.
     let _ = baker
-        .bake_output(&graph, (1024, 1024), &EvalCtx::default())
+        .bake_output(&graph, (1024, 1024), &EvalCtx::default(), false)
         .expect("warmup bake");
 
     let mut times: Vec<std::time::Duration> = Vec::new();
     for _ in 0..5 {
         let t0 = std::time::Instant::now();
         let _ = baker
-            .bake_output(&graph, (1024, 1024), &EvalCtx::default())
+            .bake_output(&graph, (1024, 1024), &EvalCtx::default(), false)
             .expect("bake");
         // Force sync so we measure through GPU completion, not just command
         // recording.
@@ -556,8 +556,8 @@ fn min_max_by_luma_picks_brighter_pixel_whole() {
         .add_layer(
             "mm",
             LayerKind::MinMax(MinMax {
-                a: dark,
-                b: bright,
+                a: Some(dark),
+                b: Some(bright),
                 mode: MinMaxMode::Max,
                 criterion: Criterion::Luma,
             }),
@@ -569,7 +569,7 @@ fn min_max_by_luma_picks_brighter_pixel_whole() {
         metallic: ScalarInput::Const(0.0),
         normal: None,
     }).unwrap();
-    let out = baker.bake_output(&graph, SIZE, &EvalCtx::default()).expect("bake");
+    let out = baker.bake_output(&graph, SIZE, &EvalCtx::default(), false).expect("bake");
     let gpu = readback_first_pixel(&ctx, &out.color);
     // Winner is the bright layer — compare against its packed sRGB.
     let expect = to_srgb8(Color::new(0.8, 0.15, 200.0, 1.0));
@@ -608,7 +608,7 @@ fn min_max_matches_cpu_over_all_criteria() {
             let mm = graph
                 .add_layer(
                     "mm",
-                    LayerKind::MinMax(MinMax { a, b, mode, criterion: crit }),
+                    LayerKind::MinMax(MinMax { a: Some(a), b: Some(b), mode, criterion: crit }),
                 )
                 .unwrap();
             graph.set_output(Output {
@@ -617,7 +617,7 @@ fn min_max_matches_cpu_over_all_criteria() {
                 metallic: ScalarInput::Const(0.0),
                 normal: None,
             }).unwrap();
-            let out = baker.bake_output(&graph, SIZE, &EvalCtx::default()).expect("bake");
+            let out = baker.bake_output(&graph, SIZE, &EvalCtx::default(), false).expect("bake");
             let gpu = readback_first_pixel(&ctx, &out.color);
             let cpu_material = texture_graph_core::evaluate_material(
                 &graph,
@@ -655,7 +655,7 @@ fn min_max_by_alpha_picks_correct_layer() {
             .add_layer(
                 &format!("mm-{mode:?}"),
                 LayerKind::MinMax(MinMax {
-                    a, b, mode,
+                    a: Some(a), b: Some(b), mode,
                     criterion: Criterion::Alpha,
                 }),
             )
@@ -666,7 +666,7 @@ fn min_max_by_alpha_picks_correct_layer() {
             metallic: ScalarInput::Const(0.0),
             normal: None,
         }).unwrap();
-        let out = baker.bake_output(&graph, SIZE, &EvalCtx::default()).expect("bake");
+        let out = baker.bake_output(&graph, SIZE, &EvalCtx::default(), false).expect("bake");
         let gpu = readback_first_pixel(&ctx, &out.color);
         // Winning color's rough sRGB grayscale target (allow slack because
         // low.alpha=0.98 lets a hint of gray leak in).
@@ -693,7 +693,7 @@ fn alpha_lt_one_shows_gray_checker_backing() {
         normal: None,
     }).unwrap();
     let size = (24u32, 24u32);
-    let out = baker.bake_output(&graph, size, &EvalCtx::default()).expect("bake");
+    let out = baker.bake_output(&graph, size, &EvalCtx::default(), false).expect("bake");
     let px = readback_all_pixels(&ctx, &out.color, size);
     // Solid opaque sRGB of L=0.5 gray:
     let solid = to_srgb8(Color::new(0.5, 0.0, 0.0, 1.0))[0];
@@ -745,7 +745,7 @@ fn out_of_range_l_paints_magenta_black_checker() {
         normal: None,
     }).unwrap();
     let size = (40u32, 40u32);
-    let out = baker.bake_output(&graph, size, &EvalCtx::default()).expect("bake");
+    let out = baker.bake_output(&graph, size, &EvalCtx::default(), false).expect("bake");
     let px = readback_all_pixels(&ctx, &out.color, size);
     // Every pixel is either magenta or black.
     let mut magentas = 0usize;
@@ -786,7 +786,7 @@ fn in_range_color_does_not_trigger_checker() {
         metallic: ScalarInput::Const(0.0),
         normal: None,
     }).unwrap();
-    let out = baker.bake_output(&graph, (16, 16), &EvalCtx::default()).expect("bake");
+    let out = baker.bake_output(&graph, (16, 16), &EvalCtx::default(), false).expect("bake");
     let px = readback_all_pixels(&ctx, &out.color, (16, 16));
     // No pixel should be exactly bright magenta.
     for p in &px {
@@ -830,7 +830,7 @@ fn h2n_on_flat_source_gives_flat_normal() {
     let source = graph.output.color;
     graph.set_kind(source, LayerKind::Color(Color::new(0.5, 0.0, 0.0, 1.0))).unwrap();
     let n = graph
-        .add_layer("n", LayerKind::HeightToNormal(HeightToNormal { source, strength: 1.0 }))
+        .add_layer("n", LayerKind::HeightToNormal(HeightToNormal { source: Some(source), strength: 1.0 }))
         .unwrap();
     graph.set_output(Output {
         color: graph.output.color,
@@ -838,7 +838,7 @@ fn h2n_on_flat_source_gives_flat_normal() {
         metallic: ScalarInput::Const(0.0),
         normal: Some(n),
     }).unwrap();
-    let out = baker.bake_output(&graph, (16, 16), &EvalCtx::default()).expect("bake h2n");
+    let out = baker.bake_output(&graph, (16, 16), &EvalCtx::default(), false).expect("bake h2n");
     // Sample a pixel in the interior, not the edge — clamped neighbors at
     // the edge give a phantom gradient because the "outside" is a copy of
     // the edge and adjacent-inside pixels differ; on uniform input they
@@ -872,7 +872,7 @@ fn h2n_on_horizontal_ramp_tilts_normal_toward_negative_u() {
         )
         .unwrap();
     let n = graph
-        .add_layer("n", LayerKind::HeightToNormal(HeightToNormal { source: ramp, strength: 1.0 }))
+        .add_layer("n", LayerKind::HeightToNormal(HeightToNormal { source: Some(ramp), strength: 1.0 }))
         .unwrap();
     graph.set_output(Output {
         color: graph.output.color,
@@ -880,7 +880,7 @@ fn h2n_on_horizontal_ramp_tilts_normal_toward_negative_u() {
         metallic: ScalarInput::Const(0.0),
         normal: Some(n),
     }).unwrap();
-    let out = baker.bake_output(&graph, (32, 32), &EvalCtx::default()).expect("bake h2n ramp");
+    let out = baker.bake_output(&graph, (32, 32), &EvalCtx::default(), false).expect("bake h2n ramp");
     let px = readback_all_pixels(&ctx, &out.normal, (32, 32));
     let interior = px[16 * 32 + 16];
     // Encoded (n*0.5 + 0.5). Slope is positive in u, so nx < 0 → r < 128.
@@ -911,7 +911,7 @@ fn noise_signed_range_lifts_grays_around_50pct() {
             }),
         )
         .unwrap();
-    let out = baker.bake_output(&graph, size, &EvalCtx::default()).expect("bake");
+    let out = baker.bake_output(&graph, size, &EvalCtx::default(), false).expect("bake");
     let px = readback_all_pixels(&ctx, &out.color, size);
     // Signed noise produces L both negative and positive; pack clamps to
     // [0,1], so we expect at least one pixel darker than mid-gray and one
@@ -921,3 +921,69 @@ fn noise_signed_range_lifts_grays_around_50pct() {
     assert!(min < 140 && max > 100, "range spread looks wrong (min={min} max={max})");
 }
 
+
+#[test]
+fn null_inputs_render_missing_texture_grid() {
+    // The regression: with a single layer, switching it to Map (or any
+    // multi-input kind) used to default its inputs to the only available
+    // layer — itself — and die on "would create a cycle". Inputs now
+    // default to None and render as the magenta/black missing grid.
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+
+    let mut graph = Graph::new();
+    let base = graph.output.color;
+    graph
+        .set_kind(base, LayerKind::Map(Map { value: None, palette: None }))
+        .expect("null-input Map must not trip the cycle check");
+    baker
+        .bake_output(&graph, (64, 64), &EvalCtx::default(), false)
+        .expect("null-input Map bakes");
+
+    // Passthrough Transform of a null source shows the grid verbatim:
+    // 16 cells across [0,1]² → 4-px cells at 64². Every pixel is either
+    // magenta or black, and adjacent cells alternate.
+    graph
+        .set_kind(
+            base,
+            LayerKind::Transform(Transform {
+                source: None,
+                offset: [0.0; 3],
+                rotate_uv: 0.0,
+                scale: [1.0; 3],
+                coord_mode: CoordMode::Passthrough,
+            }),
+        )
+        .unwrap();
+    let out = baker
+        .bake_output(&graph, (64, 64), &EvalCtx::default(), false)
+        .expect("null-input Transform bakes");
+    let px = readback_all_pixels(&ctx, &out.color, (64, 64));
+    let is_magenta = |p: &[u8; 4]| p[0] > 235 && p[1] < 20 && p[3] == 255;
+    let is_black = |p: &[u8; 4]| p[0] < 20 && p[1] < 20 && p[2] < 20 && p[3] == 255;
+    let magenta = px.iter().filter(|p| is_magenta(p)).count();
+    let black = px.iter().filter(|p| is_black(p)).count();
+    assert_eq!(
+        magenta + black,
+        px.len(),
+        "missing grid must be only magenta/black (magenta={magenta} black={black})"
+    );
+    assert!(magenta > 0 && black > 0, "grid should contain both colors");
+    let a = px[1 * 64 + 1];
+    let b = px[1 * 64 + 5];
+    assert_ne!(is_magenta(&a), is_magenta(&b), "adjacent 4-px cells must alternate");
+
+    // CPU evaluator agrees pixel-for-pixel on the grid's layout.
+    let cpu = texture_graph_core::evaluate(
+        &graph,
+        base,
+        texture_graph_core::Sample::new(1.5 / 64.0, 1.5 / 64.0, 0.5),
+        &EvalCtx::default(),
+    );
+    let cpu_px = texture_graph_core::color::to_srgb8(cpu);
+    assert_eq!(
+        is_magenta(&a),
+        cpu_px[0] > 235,
+        "CPU and GPU disagree on cell color at (1,1): gpu={a:?} cpu={cpu_px:?}"
+    );
+}

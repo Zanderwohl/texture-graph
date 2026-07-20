@@ -12,10 +12,12 @@
 
 pub mod baker;
 pub mod device;
+pub mod scene;
 pub mod schedule;
 
-pub use baker::{BakeError, BakeOutput, Baker};
+pub use baker::{BakeError, BakeOutput, Baker, VolumeOutput};
 pub use device::DeviceCtx;
+pub use scene::{SceneCamera, SceneMaterial, SceneRenderer, SceneShape};
 pub use schedule::{OutputSlots, ScalarSlot, Schedule, ScheduleError, schedule, schedule_no_reuse};
 
 #[cfg(test)]
@@ -23,3 +25,6 @@ mod bake_test;
 
 #[cfg(test)]
 mod smoke_test;
+
+#[cfg(test)]
+mod scene_test;

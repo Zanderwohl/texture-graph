@@ -17,7 +17,7 @@ struct NoiseParams {
     output_mode: u32,     // 0=Grayscale, 1=Color
     seed_base: u32,       // ctx.seed + seed_offset
     frequency: f32,
-    _pad: u32,
+    w_coord: f32,         // third texture coordinate; 0.5 for flat bakes
 }
 
 @group(0) @binding(0) var<uniform> params: NoiseParams;
@@ -201,7 +201,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Pixel-center sample coordinates in [0, 1].
     let u = (f32(gid.x) + 0.5) / f32(params.size.x);
     let v = (f32(gid.y) + 0.5) / f32(params.size.y);
-    let w = 0.5;
+    let w = params.w_coord;
 
     if (params.output_mode == 0u) {
         let n = sample_noise(u, v, w, 0u);

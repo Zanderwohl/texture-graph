@@ -158,6 +158,43 @@ impl Graph {
         false
     }
 
+    /// True when any layer reachable from the Output actually varies along
+    /// the third (w) texture coordinate — i.e. the graph describes a solid
+    /// 3D texture rather than a flat image. The 3D preview uses this to
+    /// switch from UV mapping to volume ("solid") sampling.
+    ///
+    /// Detected sources of w-variation:
+    /// - `Noise` with `dims == D3`
+    /// - `Transform` that routes w into the sampled plane
+    ///   (a `Permute` involving `Axis::W`, or a 3D `Radial`)
+    pub fn output_is_3d(&self) -> bool {
+        use crate::kind::{Axis, CoordMode, NoiseDims, RadialDim};
+        let mut stack: Vec<LayerId> = self.output.referenced();
+        let mut seen: HashSet<LayerId> = HashSet::new();
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur) {
+                continue;
+            }
+            let Some(l) = self.get(cur) else { continue };
+            let is_3d = match &l.kind {
+                LayerKind::Noise(n) => matches!(n.dims, NoiseDims::D3),
+                LayerKind::Transform(t) => match &t.coord_mode {
+                    CoordMode::Permute(axes) => {
+                        axes.iter().any(|a| matches!(a, Axis::W))
+                    }
+                    CoordMode::Radial { dim: RadialDim::D3, .. } => true,
+                    _ => false,
+                },
+                _ => false,
+            };
+            if is_3d {
+                return true;
+            }
+            stack.extend(l.kind.inputs());
+        }
+        false
+    }
+
     // ---- Layer mutation -------------------------------------------------
 
     /// Add a new layer. New IDs are always the current max + 1, so pushing

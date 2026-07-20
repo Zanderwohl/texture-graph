@@ -3,7 +3,7 @@ use std::sync::Arc;
 use eframe::CreationContext;
 use egui::mutex::RwLock;
 use texture_graph_core::{EvalCtx, Graph};
-use texture_graph_gpu::{Baker, DeviceCtx};
+use texture_graph_gpu::{Baker, DeviceCtx, SceneRenderer};
 
 use crate::file_io;
 use crate::panels;
@@ -17,6 +17,7 @@ use crate::state::UiState;
 /// hard-crash on it).
 pub struct GpuBits {
     pub baker: Baker,
+    pub scene: SceneRenderer,
     pub renderer: Arc<RwLock<egui_wgpu::Renderer>>,
 }
 
@@ -43,8 +44,10 @@ impl TextureGraphApp {
                 Arc::new(rs.device.clone()),
                 Arc::new(rs.queue.clone()),
             );
+            let scene = SceneRenderer::new(&device_ctx.device);
             GpuBits {
                 baker: Baker::new(device_ctx),
+                scene,
                 renderer: rs.renderer.clone(),
             }
         });

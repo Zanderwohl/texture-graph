@@ -95,11 +95,10 @@ fn current_variant_key(k: &LayerKind) -> &'static str {
     }
 }
 
-/// Default kind for a given variant key. Kinds that need a layer input
-/// pick the first non-`id` layer if one exists, otherwise the graph's
-/// first layer.
-pub fn default_kind(variant: &str, graph: &Graph) -> LayerKind {
-    let first = graph.layers.first().map(|l| l.id).unwrap_or(LayerId(0));
+/// Default kind for a given variant key. Layer inputs start unconnected
+/// (`None`) — they render as the missing-texture grid until the user picks
+/// a source, and can never trip the cycle check on creation.
+pub fn default_kind(variant: &str, _graph: &Graph) -> LayerKind {
     match variant {
         "Color" => LayerKind::Color(oklcha(0.5, 0.0, 0.0, 1.0)),
         "Noise" => LayerKind::Noise(Noise {
@@ -117,27 +116,27 @@ pub fn default_kind(variant: &str, graph: &Graph) -> LayerKind {
             space: BlendSpace::Oklch,
         }),
         "Transform" => LayerKind::Transform(Transform {
-            source: first,
+            source: None,
             offset: [0.5, 0.5, 0.5],
             rotate_uv: 0.0,
             scale: [1.0; 3],
             coord_mode: CoordMode::Passthrough,
         }),
         "Mix" => LayerKind::Mix(Mix {
-            a: first,
-            b: first,
+            a: None,
+            b: None,
             mode: BlendMode::Blend,
             factor: ScalarInput::Const(0.5),
             space: BlendSpace::Oklch,
         }),
-        "Map" => LayerKind::Map(Map { value: first, palette: first }),
+        "Map" => LayerKind::Map(Map { value: None, palette: None }),
         "MinMax" => LayerKind::MinMax(MinMax {
-            a: first,
-            b: first,
+            a: None,
+            b: None,
             mode: MinMaxMode::Max,
             criterion: Criterion::Alpha,
         }),
-        "HeightToNormal" => LayerKind::HeightToNormal(HeightToNormal { source: first, strength: 1.0 }),
+        "HeightToNormal" => LayerKind::HeightToNormal(HeightToNormal { source: None, strength: 1.0 }),
         _ => LayerKind::Color(oklcha(0.5, 0.0, 0.0, 1.0)),
     }
 }
@@ -245,7 +244,7 @@ fn ramp_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, r: &mut ColorRamp
 
 fn transform_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, t: &mut Transform) -> bool {
     let mut changed = false;
-    if let Some(new) = layer_ref::layer_ref(ui, ("tform-src", id.0), "source", t.source, graph, Some(id)) {
+    if let Some(new) = layer_ref::layer_ref_opt(ui, ("tform-src", id.0), "source", t.source, graph, Some(id)) {
         t.source = new;
         changed = true;
     }
@@ -340,11 +339,11 @@ fn axis_label(a: Axis) -> &'static str {
 
 fn mix_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, m: &mut Mix) -> bool {
     let mut changed = false;
-    if let Some(new) = layer_ref::layer_ref(ui, ("mix-a", id.0), "a", m.a, graph, Some(id)) {
+    if let Some(new) = layer_ref::layer_ref_opt(ui, ("mix-a", id.0), "a", m.a, graph, Some(id)) {
         m.a = new;
         changed = true;
     }
-    if let Some(new) = layer_ref::layer_ref(ui, ("mix-b", id.0), "b", m.b, graph, Some(id)) {
+    if let Some(new) = layer_ref::layer_ref_opt(ui, ("mix-b", id.0), "b", m.b, graph, Some(id)) {
         m.b = new;
         changed = true;
     }
@@ -381,11 +380,11 @@ fn mix_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, m: &mut Mix) -> bo
 
 fn map_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, m: &mut Map) -> bool {
     let mut changed = false;
-    if let Some(new) = layer_ref::layer_ref(ui, ("map-val", id.0), "value", m.value, graph, Some(id)) {
+    if let Some(new) = layer_ref::layer_ref_opt(ui, ("map-val", id.0), "value", m.value, graph, Some(id)) {
         m.value = new;
         changed = true;
     }
-    if let Some(new) = layer_ref::layer_ref(ui, ("map-pal", id.0), "palette", m.palette, graph, Some(id)) {
+    if let Some(new) = layer_ref::layer_ref_opt(ui, ("map-pal", id.0), "palette", m.palette, graph, Some(id)) {
         m.palette = new;
         changed = true;
     }
@@ -394,11 +393,11 @@ fn map_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, m: &mut Map) -> bo
 
 fn min_max_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, mm: &mut MinMax) -> bool {
     let mut changed = false;
-    if let Some(new) = layer_ref::layer_ref(ui, ("mm-a", id.0), "a", mm.a, graph, Some(id)) {
+    if let Some(new) = layer_ref::layer_ref_opt(ui, ("mm-a", id.0), "a", mm.a, graph, Some(id)) {
         mm.a = new;
         changed = true;
     }
-    if let Some(new) = layer_ref::layer_ref(ui, ("mm-b", id.0), "b", mm.b, graph, Some(id)) {
+    if let Some(new) = layer_ref::layer_ref_opt(ui, ("mm-b", id.0), "b", mm.b, graph, Some(id)) {
         mm.b = new;
         changed = true;
     }
@@ -444,7 +443,7 @@ fn min_max_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, mm: &mut MinMa
 
 fn h2n_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, h: &mut HeightToNormal) -> bool {
     let mut changed = false;
-    if let Some(new) = layer_ref::layer_ref(ui, ("h2n-src", id.0), "source", h.source, graph, Some(id)) {
+    if let Some(new) = layer_ref::layer_ref_opt(ui, ("h2n-src", id.0), "source", h.source, graph, Some(id)) {
         h.source = new;
         changed = true;
     }

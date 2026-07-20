@@ -83,11 +83,40 @@ fn eval_layer(id: LayerId, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &Ev
         LayerKind::Color(c) => *c,
         LayerKind::Noise(n) => eval_noise(n, s, ctx),
         LayerKind::ColorRamp(r) => eval_ramp(r, s, by_id, ctx),
-        LayerKind::Transform(t) => eval_layer(t.source, apply_transform(t, s), by_id, ctx),
+        LayerKind::Transform(t) => eval_opt(t.source, apply_transform(t, s), by_id, ctx),
         LayerKind::Mix(m) => eval_mix(m, s, by_id, ctx),
         LayerKind::Map(m) => eval_map(m, s, by_id, ctx),
         LayerKind::MinMax(mm) => eval_min_max(mm, s, by_id, ctx),
         LayerKind::HeightToNormal(h) => eval_h2n(h, s, by_id, ctx),
+    }
+}
+
+/// The "missing texture" grid shown for unconnected (`None`) layer
+/// inputs: a magenta/black checkerboard, 16 cells per unit in u, v, AND w
+/// so it stays a solid 3D checker in volume bakes. Mirrored by
+/// `missing.wgsl` on the GPU — keep the cell count and colors in sync.
+/// Magenta constants are Oklch of sRGB (1, 0, 1).
+pub fn missing_texture(s: Sample) -> Color {
+    const CELLS: f32 = 16.0;
+    let cell = |x: f32| (x * CELLS).floor() as i64;
+    let parity = (cell(s.u) + cell(s.v) + cell(s.w)).rem_euclid(2);
+    if parity == 0 {
+        Color::new(0.7017, 0.3223, 328.36, 1.0)
+    } else {
+        Color::new(0.0, 0.0, 0.0, 1.0)
+    }
+}
+
+/// Evaluate an optional layer input; `None` samples the missing grid.
+fn eval_opt(
+    id: Option<LayerId>,
+    s: Sample,
+    by_id: &HashMap<LayerId, &Layer>,
+    ctx: &EvalCtx,
+) -> Color {
+    match id {
+        Some(id) => eval_layer(id, s, by_id, ctx),
+        None => missing_texture(s),
     }
 }
 
@@ -224,8 +253,8 @@ fn apply_transform(t: &Transform, s: Sample) -> Sample {
 
 fn eval_mix(m: &Mix, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &EvalCtx) -> Color {
     use palette::{IntoColor, LinSrgb, Oklab, Oklch, WithAlpha};
-    let a = eval_layer(m.a, s, by_id, ctx);
-    let b = eval_layer(m.b, s, by_id, ctx);
+    let a = eval_opt(m.a, s, by_id, ctx);
+    let b = eval_opt(m.b, s, by_id, ctx);
     match m.mode {
         // Add/Sub compose in Oklab where chroma is a Cartesian (a, b) vector.
         // Grayscale-noise + Add is the fractal-noise use case; L just sums.
@@ -253,15 +282,15 @@ fn eval_mix(m: &Mix, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &EvalCtx)
 }
 
 fn eval_map(m: &Map, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &EvalCtx) -> Color {
-    let value = eval_layer(m.value, s, by_id, ctx);
+    let value = eval_opt(m.value, s, by_id, ctx);
     let t = scalar_of(value);
     // Look up palette at (t, 0, 0).
-    eval_layer(m.palette, Sample::new(t, 0.0, 0.0), by_id, ctx)
+    eval_opt(m.palette, Sample::new(t, 0.0, 0.0), by_id, ctx)
 }
 
 fn eval_min_max(m: &MinMax, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &EvalCtx) -> Color {
-    let a = eval_layer(m.a, s, by_id, ctx);
-    let b = eval_layer(m.b, s, by_id, ctx);
+    let a = eval_opt(m.a, s, by_id, ctx);
+    let b = eval_opt(m.b, s, by_id, ctx);
     let va = criterion_of(a, m.criterion);
     let vb = criterion_of(b, m.criterion);
     let a_wins = match m.mode {
@@ -303,7 +332,7 @@ fn criterion_of(c: Color, crit: Criterion) -> f32 {
 
 fn eval_h2n(h: &HeightToNormal, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &EvalCtx) -> Color {
     let eps = ctx.normal_epsilon.max(f32::EPSILON);
-    let sample_l = |ds: Sample| scalar_of(eval_layer(h.source, ds, by_id, ctx));
+    let sample_l = |ds: Sample| scalar_of(eval_opt(h.source, ds, by_id, ctx));
     let l_px = sample_l(Sample::new(s.u + eps, s.v, s.w));
     let l_nx = sample_l(Sample::new(s.u - eps, s.v, s.w));
     let l_py = sample_l(Sample::new(s.u, s.v + eps, s.w));
@@ -366,8 +395,8 @@ mod tests {
             .add_layer(
                 "b",
                 LayerKind::Mix(Mix {
-                    a,
-                    b: a,
+                    a: Some(a),
+                    b: Some(a),
                     mode: BlendMode::Add,
                     factor: ScalarInput::Const(0.5),
                     space: BlendSpace::Oklch,
@@ -378,8 +407,8 @@ mod tests {
         let err = g.set_kind(
             a,
             LayerKind::Mix(Mix {
-                a: b,
-                b,
+                a: Some(b),
+                b: Some(b),
                 mode: BlendMode::Add,
                 factor: ScalarInput::Const(0.5),
                 space: BlendSpace::Oklch,

@@ -1,35 +1,57 @@
-//! Right panel: flat 2D bake of the graph's `Output`.
+//! Right panel: preview of the graph's `Output`.
 //!
-//! GPU path (default when eframe's wgpu backend is live): bakes all four
-//! PBR channels in one dispatch chain via `texture_graph_gpu::Baker`,
-//! then registers each result with egui-wgpu so the panel just picks a
-//! `TextureId` when the channel switches. CPU path (fallback) still runs
-//! `evaluate_material` per pixel.
+//! Three display modes selected by dropdown:
+//! - **Flat** — the four PBR channels shown as flat textures, channel
+//!   selected by a second dropdown (existing behavior).
+//! - **Sphere** / **Cube** — a lit 3D preview via the `SceneRenderer`
+//!   (Cook-Torrance BRDF, tangent-space normal mapping, auto-spin).
+//!
+//! Under the hood: the Baker always produces the four material textures.
+//! In Flat mode they're registered directly with egui-wgpu; in 3D modes
+//! they feed the scene renderer, which draws into a persistent color
+//! target that egui also holds a `TextureId` for. The color target and
+//! its `TextureId` only rebuild when the panel size or shape changes,
+//! so auto-spin doesn't churn allocations at 60 fps.
 
 use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
 use texture_graph_core::color::to_srgb8;
 use texture_graph_core::{EvalCtx, Graph, Sample, evaluate_material};
+use texture_graph_gpu::{SceneCamera, SceneMaterial, SceneShape, VolumeOutput};
 
 use crate::app::GpuBits;
 use crate::state::UiState;
 
+/// Resolution (per axis) of the solid-texture volume bake. 64³ Rgba8 is
+/// 1 MiB per channel — cheap enough to rebake on every graph edit.
+const VOLUME_RES: u32 = 64;
+
 pub struct PreviewPanelState {
-    /// CPU-baked flat texture, used when the GPU backend isn't available
-    /// or the graph contains a variant the GPU baker doesn't cover.
     pub texture: Option<TextureHandle>,
-    /// GPU-baked textures (color, roughness, metallic, normal), each
-    /// registered with egui-wgpu as its own `TextureId`.
     pub gpu_channels: Option<GpuChannels>,
-    /// Output pixel resolution — 256 on wasm, 512 on native by default.
+    /// Solid-texture volume channels; baked only when the graph is 3D
+    /// (`Graph::output_is_3d`) and a 3D shape is displayed. Never
+    /// registered with egui — only the scene pass samples it.
+    pub volume: Option<VolumeOutput>,
+    /// Persistent 3D render target + its egui id; rebuilt on size change.
+    pub scene: Option<Scene3d>,
     pub size: u32,
+    pub shape: PreviewShape,
     pub channel: PreviewChannel,
-    /// Last-seen error from a GPU bake; surfaced under the preview image.
     pub gpu_error: Option<String>,
+    pub yaw_rate_deg_per_sec: f32,
+    /// Model orientation shown in the 3D preview. Auto-spin advances it
+    /// around world Y; drag-orbit composes trackball rotations onto it.
+    pub orientation: glam::Quat,
+    /// Auto-spin runs until the user drag-orbits; the "Rotate" button
+    /// under the viewport turns it back on.
+    pub auto_spin: bool,
+    /// Staleness, per bake product. `state.dirty` is consumed once and
+    /// fans out into these so whichever mode is active rebakes its own
+    /// product now and the other lazily when the user switches to it.
+    channels_stale: bool,
+    volume_stale: bool,
 }
 
-/// Registered `TextureId`s for one bake, one per output channel. The
-/// backing `wgpu::Texture`s are pinned here so their views (referenced by
-/// the renderer) stay valid until we free the ids.
 pub struct GpuChannels {
     pub color_tex: wgpu::Texture,
     pub roughness_tex: wgpu::Texture,
@@ -39,6 +61,19 @@ pub struct GpuChannels {
     pub roughness_id: egui::TextureId,
     pub metallic_id: egui::TextureId,
     pub normal_id: egui::TextureId,
+    pub size: u32,
+    /// Which alpha presentation this bake used: `false` = gray checker
+    /// composited (flat preview), `true` = real alpha kept (3D preview
+    /// blends the object). Mode switches rebake on mismatch.
+    pub object_alpha: bool,
+}
+
+pub struct Scene3d {
+    pub color_tex: wgpu::Texture,
+    pub color_view: wgpu::TextureView,
+    pub depth_tex: wgpu::Texture,
+    pub depth_view: wgpu::TextureView,
+    pub id: egui::TextureId,
     pub size: u32,
 }
 
@@ -50,14 +85,29 @@ pub enum PreviewChannel {
     Normal,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PreviewShape {
+    Flat,
+    Sphere,
+    Cube,
+}
+
 impl PreviewPanelState {
     pub fn new(size: u32) -> Self {
         Self {
             texture: None,
             gpu_channels: None,
+            volume: None,
+            scene: None,
             size,
+            shape: PreviewShape::Flat,
             channel: PreviewChannel::Color,
             gpu_error: None,
+            yaw_rate_deg_per_sec: 30.0,
+            orientation: glam::Quat::IDENTITY,
+            auto_spin: true,
+            channels_stale: false,
+            volume_stale: false,
         }
     }
 }
@@ -68,39 +118,72 @@ pub fn show(
     state: &mut UiState,
     preview: &mut PreviewPanelState,
     eval_ctx: &EvalCtx,
-    gpu: Option<&mut GpuBits>,
+    mut gpu: Option<&mut GpuBits>,
 ) {
     ui.horizontal(|ui| {
         ui.heading("Preview");
         ui.add_space(8.0);
-        egui::ComboBox::from_id_salt("preview_channel")
-            .selected_text(channel_label(preview.channel))
+        // Shape selector (Flat / Sphere / Cube).
+        let prev_shape = preview.shape;
+        egui::ComboBox::from_id_salt("preview_shape")
+            .selected_text(shape_label(preview.shape))
             .show_ui(ui, |ui| {
-                for ch in [
-                    PreviewChannel::Color,
-                    PreviewChannel::Roughness,
-                    PreviewChannel::Metallic,
-                    PreviewChannel::Normal,
+                for sh in [
+                    PreviewShape::Flat,
+                    PreviewShape::Sphere,
+                    PreviewShape::Cube,
                 ] {
                     if ui
-                        .selectable_label(preview.channel == ch, channel_label(ch))
+                        .selectable_label(preview.shape == sh, shape_label(sh))
                         .clicked()
                     {
-                        preview.channel = ch;
+                        preview.shape = sh;
                     }
                 }
             });
+        if preview.shape != prev_shape {
+            // Coming back to Flat, we can drop the 3D target; going into
+            // 3D we lazily build it next frame.
+            if preview.shape == PreviewShape::Flat {
+                if let (Some(g), Some(scene)) = (gpu.as_ref(), preview.scene.take()) {
+                    g.renderer.write().free_texture(&scene.id);
+                }
+            }
+        }
+
+        if preview.shape == PreviewShape::Flat {
+            ui.add_space(8.0);
+            egui::ComboBox::from_id_salt("preview_channel")
+                .selected_text(channel_label(preview.channel))
+                .show_ui(ui, |ui| {
+                    for ch in [
+                        PreviewChannel::Color,
+                        PreviewChannel::Roughness,
+                        PreviewChannel::Metallic,
+                        PreviewChannel::Normal,
+                    ] {
+                        if ui
+                            .selectable_label(preview.channel == ch, channel_label(ch))
+                            .clicked()
+                        {
+                            preview.channel = ch;
+                        }
+                    }
+                });
+        }
     });
     ui.horizontal(|ui| {
         for &s in &[128u32, 256, 512, 1024] {
             let picked = preview.size == s;
             if ui.selectable_label(picked, format!("{s}")).clicked() && !picked {
                 preview.size = s;
-                // Force a rebake at the new size.
                 preview.texture = None;
-                if let Some(g) = &preview.gpu_channels {
-                    if let Some(gpu) = gpu.as_ref() {
-                        free_channels(&gpu.renderer, g);
+                if let Some(g) = gpu.as_ref() {
+                    if let Some(old) = &preview.gpu_channels {
+                        free_channels(&g.renderer, old);
+                    }
+                    if let Some(old) = preview.scene.take() {
+                        g.renderer.write().free_texture(&old.id);
                     }
                 }
                 preview.gpu_channels = None;
@@ -109,29 +192,74 @@ pub fn show(
     });
     ui.separator();
 
-    let needs_bake = state.dirty
-        || (preview.gpu_channels.is_none() && preview.texture.is_none())
-        || preview
-            .gpu_channels
-            .as_ref()
-            .map_or(false, |c| c.size != preview.size);
+    // Consume the dirty flag once; both bake products go stale and each
+    // rebakes when its mode needs it (the other lazily, on mode switch).
+    if state.dirty {
+        preview.channels_stale = true;
+        preview.volume_stale = true;
+        state.dirty = false;
+    }
 
+    // Solid 3D sampling: when a 3D shape displays a graph that actually
+    // varies along w (`Graph::output_is_3d`), bake the graph as a volume
+    // and sample it by object-space position instead of UV-wrapping a
+    // flat slice. Falls back to the UV path if the volume bake fails.
+    let want_solid = matches!(preview.shape, PreviewShape::Sphere | PreviewShape::Cube)
+        && graph.output_is_3d();
+    let mut solid_active = false;
+    if want_solid {
+        if let Some(gpu) = gpu.as_deref_mut() {
+            if preview.volume_stale || preview.volume.is_none() {
+                preview.gpu_error = None;
+                match gpu.baker.bake_volume(graph, VOLUME_RES, VOLUME_RES, eval_ctx) {
+                    Ok(v) => {
+                        preview.volume = Some(v);
+                        preview.volume_stale = false;
+                    }
+                    Err(e) => {
+                        preview.gpu_error =
+                            Some(format!("volume bake failed, using UV mapping: {e}"));
+                        preview.volume = None;
+                    }
+                }
+            }
+            solid_active = preview.volume.is_some();
+        }
+    }
+
+    // 1. Ensure the flat material textures are baked (Flat mode displays
+    //    them; the UV-mapped 3D path samples them). Skipped while solid
+    //    sampling covers the 3D view — it has its own product above.
+    //    3D shapes want real alpha (the object blends); Flat wants the
+    //    gray backing checker composited in.
+    let want_object_alpha =
+        matches!(preview.shape, PreviewShape::Sphere | PreviewShape::Cube);
+    let needs_bake = !solid_active
+        && (preview.channels_stale
+            || (preview.gpu_channels.is_none() && preview.texture.is_none())
+            || preview
+                .gpu_channels
+                .as_ref()
+                .is_some_and(|c| c.size != preview.size || c.object_alpha != want_object_alpha));
     if needs_bake {
         preview.gpu_error = None;
-        // Try GPU first; fall back to CPU on any error.
-        let baked_on_gpu = if let Some(gpu) = gpu {
+        let baked_on_gpu = if let Some(gpu) = gpu.as_deref_mut() {
             match gpu.baker.bake_output(
                 graph,
                 (preview.size, preview.size),
                 eval_ctx,
+                want_object_alpha,
             ) {
                 Ok(out) => {
                     if let Some(old) = preview.gpu_channels.take() {
                         free_channels(&gpu.renderer, &old);
                     }
-                    preview.gpu_channels =
-                        Some(register_channels(&gpu.renderer, &gpu.baker, out));
-                    // Explicit reset: any earlier CPU texture is stale.
+                    preview.gpu_channels = Some(register_channels(
+                        &gpu.renderer,
+                        &gpu.baker,
+                        out,
+                        want_object_alpha,
+                    ));
                     preview.texture = None;
                     true
                 }
@@ -146,40 +274,173 @@ pub fn show(
         if !baked_on_gpu {
             preview.texture =
                 Some(bake_cpu(ui.ctx(), graph, preview.size, preview.channel, eval_ctx));
-            if let Some(old) = preview.gpu_channels.take() {
-                // No renderer handle here in the CPU-only branch; the
-                // renderer already survives across frames, so leaking the
-                // id would only leak on this specific transition. Defensive
-                // reset to None keeps the state coherent.
-                let _ = old;
-            }
         }
-        state.dirty = false;
+        preview.channels_stale = false;
     }
 
+    // 2. In 3D mode, keep a persistent scene target + rerender each frame.
+    if matches!(preview.shape, PreviewShape::Sphere | PreviewShape::Cube)
+        && gpu.is_some()
+        && (solid_active || preview.gpu_channels.is_some())
+    {
+        // Rebuild the target first (borrows `preview` + `gpu` mutably).
+        ensure_scene_target(preview, gpu.as_deref_mut().unwrap());
+        // Then render into it. Split borrows: pull the pieces we need out
+        // as separate references so the borrow checker sees no overlap.
+        let gpu = gpu.as_deref_mut().unwrap();
+        let scene = preview.scene.as_ref().unwrap();
+        if preview.auto_spin {
+            // Incremental so pausing/orbiting resumes from the current
+            // orientation instead of snapping back to a time-derived angle.
+            let dt = ui.ctx().input(|i| i.stable_dt).min(0.1);
+            preview.orientation = glam::Quat::from_rotation_y(
+                dt * preview.yaw_rate_deg_per_sec.to_radians(),
+            ) * preview.orientation;
+        }
+        let camera = SceneCamera {
+            orientation: preview.orientation,
+            ..SceneCamera::default()
+        };
+        let shape = match preview.shape {
+            PreviewShape::Sphere => SceneShape::Sphere,
+            PreviewShape::Cube => SceneShape::Cube,
+            PreviewShape::Flat => unreachable!(),
+        };
+        // Keep the UV material's texture clones alive past the match.
+        let uv_material;
+        let material = if solid_active {
+            SceneMaterial::Solid(preview.volume.as_ref().unwrap())
+        } else {
+            let channels = preview.gpu_channels.as_ref().unwrap();
+            uv_material = texture_graph_gpu::BakeOutput {
+                color: channels.color_tex.clone(),
+                roughness: channels.roughness_tex.clone(),
+                metallic: channels.metallic_tex.clone(),
+                normal: channels.normal_tex.clone(),
+                size: (channels.size, channels.size),
+            };
+            SceneMaterial::Uv(&uv_material)
+        };
+        gpu.scene.render_into(
+            gpu.baker.ctx(),
+            material,
+            shape,
+            &scene.color_view,
+            &scene.depth_view,
+            (scene.size, scene.size),
+            &camera,
+        );
+        if preview.auto_spin {
+            ui.ctx().request_repaint();
+        }
+    }
+
+    // 3. Display.
     let avail = ui.available_size();
     let side = avail.x.min(avail.y).max(64.0);
-    if let Some(g) = &preview.gpu_channels {
-        let id = match preview.channel {
-            PreviewChannel::Color => g.color_id,
-            PreviewChannel::Roughness => g.roughness_id,
-            PreviewChannel::Metallic => g.metallic_id,
-            PreviewChannel::Normal => g.normal_id,
-        };
-        ui.add(
-            egui::Image::new((id, egui::vec2(side, side)))
-                .maintain_aspect_ratio(true)
-                .fit_to_exact_size(egui::vec2(side, side)),
-        );
-    } else if let Some(tex) = &preview.texture {
-        ui.add(
-            egui::Image::new((tex.id(), egui::vec2(side, side)))
-                .maintain_aspect_ratio(true)
-                .fit_to_exact_size(egui::vec2(side, side)),
-        );
+    match preview.shape {
+        PreviewShape::Flat => {
+            if let Some(g) = &preview.gpu_channels {
+                let id = match preview.channel {
+                    PreviewChannel::Color => g.color_id,
+                    PreviewChannel::Roughness => g.roughness_id,
+                    PreviewChannel::Metallic => g.metallic_id,
+                    PreviewChannel::Normal => g.normal_id,
+                };
+                ui.add(
+                    egui::Image::new((id, egui::vec2(side, side)))
+                        .maintain_aspect_ratio(true)
+                        .fit_to_exact_size(egui::vec2(side, side)),
+                );
+            } else if let Some(tex) = &preview.texture {
+                ui.add(
+                    egui::Image::new((tex.id(), egui::vec2(side, side)))
+                        .maintain_aspect_ratio(true)
+                        .fit_to_exact_size(egui::vec2(side, side)),
+                );
+            }
+        }
+        PreviewShape::Sphere | PreviewShape::Cube => {
+            if let Some(scene) = &preview.scene {
+                let resp = ui.add(
+                    egui::Image::new((scene.id, egui::vec2(side, side)))
+                        .maintain_aspect_ratio(true)
+                        .fit_to_exact_size(egui::vec2(side, side))
+                        .sense(egui::Sense::drag()),
+                );
+                // Drag-orbit. egui only starts a drag when the press began
+                // inside the widget, so a button already held down when the
+                // pointer enters never grabs the model.
+                if resp.drag_started_by(egui::PointerButton::Primary) {
+                    preview.auto_spin = false;
+                }
+                if resp.dragged_by(egui::PointerButton::Primary) {
+                    let d = resp.drag_delta();
+                    if d != egui::Vec2::ZERO {
+                        // Trackball on a large sphere: the grabbed surface
+                        // point follows the pointer. Screen-space delta
+                        // (right, down) maps to a world rotation axis
+                        // (x=down-drag, y=right-drag); magnitude scales by
+                        // the sphere radius (half the viewport).
+                        let radius = (side * 0.5).max(1.0);
+                        let axis = glam::Vec3::new(d.y, d.x, 0.0);
+                        let angle = axis.length() / radius;
+                        preview.orientation =
+                            glam::Quat::from_axis_angle(axis.normalize(), angle)
+                                * preview.orientation;
+                    }
+                }
+                if ui.button("Rotate").clicked() {
+                    preview.auto_spin = true;
+                }
+            } else {
+                ui.weak("(3D preview needs the wgpu backend)");
+            }
+        }
     }
     if let Some(err) = &preview.gpu_error {
         ui.colored_label(egui::Color32::YELLOW, err);
+    }
+}
+
+/// Create-or-reuse the persistent scene render target. Rebuilds when the
+/// panel size changes; frees the old egui id first so we don't leak.
+fn ensure_scene_target(preview: &mut PreviewPanelState, gpu: &mut GpuBits) {
+    let needs_new = match &preview.scene {
+        Some(s) => s.size != preview.size,
+        None => true,
+    };
+    if !needs_new {
+        return;
+    }
+    if let Some(old) = preview.scene.take() {
+        gpu.renderer.write().free_texture(&old.id);
+    }
+    let device = &gpu.baker.ctx().device;
+    let color_tex = gpu.scene.make_color_target(device, (preview.size, preview.size));
+    let color_view = color_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let depth_tex = gpu.scene.make_depth_target(device, (preview.size, preview.size));
+    let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let id = gpu.renderer.write().register_native_texture(
+        device,
+        &color_view,
+        wgpu::FilterMode::Linear,
+    );
+    preview.scene = Some(Scene3d {
+        color_tex,
+        color_view,
+        depth_tex,
+        depth_view,
+        id,
+        size: preview.size,
+    });
+}
+
+fn shape_label(sh: PreviewShape) -> &'static str {
+    match sh {
+        PreviewShape::Flat => "flat",
+        PreviewShape::Sphere => "sphere",
+        PreviewShape::Cube => "cube",
     }
 }
 
@@ -196,6 +457,7 @@ fn register_channels(
     renderer: &egui::mutex::RwLock<egui_wgpu::Renderer>,
     baker: &texture_graph_gpu::Baker,
     out: texture_graph_gpu::BakeOutput,
+    object_alpha: bool,
 ) -> GpuChannels {
     let device = &baker.ctx().device;
     let color_view = out.color.create_view(&wgpu::TextureViewDescriptor::default());
@@ -221,6 +483,7 @@ fn register_channels(
         metallic_id,
         normal_id,
         size: out.size.0,
+        object_alpha,
     }
 }
 
@@ -234,8 +497,6 @@ fn free_channels(
     r.free_texture(&channels.metallic_id);
     r.free_texture(&channels.normal_id);
 }
-
-// ---- CPU fallback ------------------------------------------------------
 
 fn bake_cpu(
     ctx: &egui::Context,

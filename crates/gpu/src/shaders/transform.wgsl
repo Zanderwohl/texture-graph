@@ -20,7 +20,8 @@ struct TransformParams {
     permute: vec4<u32>,  // (axis_a, axis_b, axis_c, _), each 0=U 1=V 2=W
     radial_dim: u32,     // 0=D2, 1=D3
     radial_into: u32,    // 0=U, 1=V, 2=W
-    _pad: vec2<u32>,
+    w_coord: f32,        // third texture coordinate; 0.5 for flat bakes
+    _pad: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: TransformParams;
@@ -85,7 +86,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let coord = vec2<i32>(i32(gid.x), i32(gid.y));
     let u = (f32(gid.x) + 0.5) / f32(params.size.x);
     let v = (f32(gid.y) + 0.5) / f32(params.size.y);
-    let w = 0.5;
+    let w = params.w_coord;
     let t = apply_transform(u, v, w);
     // Sample source at t.uv; clamped to [0, size).
     let sx = clamp(t.x * f32(params.size.x), 0.0, f32(params.size.x) - 1.0);

@@ -280,8 +280,8 @@ mod tests {
         g.add_layer(
             name,
             LayerKind::Mix(Mix {
-                a,
-                b,
+                a: Some(a),
+                b: Some(b),
                 mode: BlendMode::Add,
                 factor: ScalarInput::Const(0.5),
                 space: BlendSpace::Oklch,

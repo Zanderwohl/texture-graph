@@ -105,7 +105,12 @@ pub fn load_from_str(s: &str) -> Result<TextureGraphFile, LoadError> {
     if !trimmed.starts_with(MAGIC_PREFIX) {
         return Err(LoadError::NotATextureGraph);
     }
-    let file: TextureGraphFile = ron::from_str(s)?;
+    // `implicit_some` lets files from before layer inputs became
+    // `Option<LayerId>` (bare `source: 3` instead of `Some(3)`) keep
+    // loading unchanged.
+    let options = ron::Options::default()
+        .with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME);
+    let file: TextureGraphFile = options.from_str(s)?;
     if file.format_version > CURRENT_FORMAT_VERSION {
         return Err(LoadError::UnsupportedVersion(file.format_version));
     }

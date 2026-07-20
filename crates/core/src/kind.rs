@@ -51,21 +51,21 @@ impl LayerKind {
                     push_color(&mut out, s.color);
                 }
             }
-            LayerKind::Transform(t) => out.push(t.source),
+            LayerKind::Transform(t) => out.extend(t.source),
             LayerKind::Mix(m) => {
-                out.push(m.a);
-                out.push(m.b);
+                out.extend(m.a);
+                out.extend(m.b);
                 push_scalar(&mut out, m.factor);
             }
             LayerKind::Map(m) => {
-                out.push(m.value);
-                out.push(m.palette);
+                out.extend(m.value);
+                out.extend(m.palette);
             }
             LayerKind::MinMax(mm) => {
-                out.push(mm.a);
-                out.push(mm.b);
+                out.extend(mm.a);
+                out.extend(mm.b);
             }
-            LayerKind::HeightToNormal(h) => out.push(h.source),
+            LayerKind::HeightToNormal(h) => out.extend(h.source),
         }
         out
     }
@@ -143,7 +143,8 @@ pub struct ColorStop {
 /// `coord_mode`.
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub struct Transform {
-    pub source: LayerId,
+    /// `None` renders as the missing-texture grid.
+    pub source: Option<LayerId>,
     pub offset: [f32; 3],
     /// Radians, in the UV plane, about the origin (after `offset` subtracts).
     pub rotate_uv: f32,
@@ -178,8 +179,9 @@ pub enum RadialDim {
 /// Blend two color layers.
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub struct Mix {
-    pub a: LayerId,
-    pub b: LayerId,
+    /// `None` renders as the missing-texture grid.
+    pub a: Option<LayerId>,
+    pub b: Option<LayerId>,
     pub mode: BlendMode,
     /// Only consulted for `BlendMode::Blend`.
     pub factor: ScalarInput,
@@ -199,8 +201,9 @@ pub enum BlendMode {
 /// `palette` at `(t, 0, 0)`.
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub struct Map {
-    pub value: LayerId,
-    pub palette: LayerId,
+    /// `None` renders as the missing-texture grid.
+    pub value: Option<LayerId>,
+    pub palette: Option<LayerId>,
 }
 
 /// Convert a heightfield (from `source`'s L channel) into a tangent-space
@@ -208,7 +211,8 @@ pub struct Map {
 /// values produce steeper apparent slopes.
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub struct HeightToNormal {
-    pub source: LayerId,
+    /// `None` renders as the missing-texture grid.
+    pub source: Option<LayerId>,
     pub strength: f32,
 }
 
@@ -219,8 +223,9 @@ pub struct HeightToNormal {
 /// coherent.
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub struct MinMax {
-    pub a: LayerId,
-    pub b: LayerId,
+    /// `None` renders as the missing-texture grid.
+    pub a: Option<LayerId>,
+    pub b: Option<LayerId>,
     pub mode: MinMaxMode,
     pub criterion: Criterion,
 }

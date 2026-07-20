@@ -13,9 +13,20 @@
 struct PackParams {
     size: vec2<u32>,
     mode: u32,
-    _pad: u32,
+    // 0 = composite the gray alpha checker behind partial alpha (flat
+    // previews); 1 = keep the real alpha in the output so the 3D preview
+    // can blend the object itself.
+    alpha_object: u32,
     // used only when mode == 1
     const_value: vec4<f32>,
+    // Volume slice index in texels (0 for flat bakes) — makes the
+    // out-of-range checker a true 3D checkerboard across slices.
+    z_px: u32,
+    // Three scalar pads, NOT vec3<u32> — vec3 aligns to 16 which would
+    // grow the struct to 64 bytes and desync from the 48-byte Rust side.
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 // common.wgsl (inlined by the pipeline creation code below at build time)
@@ -83,7 +94,9 @@ const CHECKER_CELL: u32 = 10u;
 
 fn checker_srgb(gid_xy: vec2<u32>) -> vec4<f32> {
     let cell = vec2<u32>(gid_xy.x / CHECKER_CELL, gid_xy.y / CHECKER_CELL);
-    let parity = (cell.x + cell.y) & 1u;
+    // Volume bakes contribute a third cell axis so the pattern is a solid
+    // 3D checkerboard, not the same 2D checker extruded through w.
+    let parity = (cell.x + cell.y + params.z_px / CHECKER_CELL) & 1u;
     if (parity == 0u) {
         return vec4<f32>(1.0, 0.0, 1.0, 1.0);
     }
@@ -105,11 +118,18 @@ fn alpha_backing_srgb(gid_xy: vec2<u32>) -> vec3<f32> {
     return vec3<f32>(0.55, 0.55, 0.55);
 }
 
-// Composite `packed` (foreground, straight-alpha sRGB) over the alpha
-// checker if `packed.w < 1`. Result has alpha = 1 so the display never
-// blends with whatever's underneath the preview panel.
+// Presentation of partial alpha, switched by `alpha_object`:
+// - 0: composite `packed` (foreground, straight-alpha sRGB) over the gray
+//   checker; result has alpha = 1 so the flat preview never blends with
+//   whatever's underneath the panel.
+// - 1: pass the real alpha through untouched — the 3D preview blends the
+//   object itself against the scene background instead of faking a
+//   backing grid.
 fn composite_alpha(packed: vec4<f32>, gid_xy: vec2<u32>) -> vec4<f32> {
     let a = clamp(packed.w, 0.0, 1.0);
+    if (params.alpha_object == 1u) {
+        return vec4<f32>(packed.xyz, a);
+    }
     if (a >= 1.0 - RANGE_EPS) {
         return vec4<f32>(packed.xyz, 1.0);
     }
