@@ -326,20 +326,49 @@ detach-and-reconnect on the same node into one `SetKind` so the intermediate
 state never exists (`wires::apply_socket_edits`), which MBG gave up when it
 moved connection handling into the model. Keep ours unless that changes.
 
-# Tier 3 — cheap tests (PARTLY DONE)
+# Tier 3 — cheap tests (DONE)
 
-Already landed alongside the tiers above: `rename_command` (nodes.rs),
+Landed alongside the tiers above: `rename_command` (nodes.rs),
 `hovered_output` (wires.rs), the `refusal` agreement pair (wires.rs), the
 dirty-closure trio (state.rs) and the catalog's four (catalog.rs).
 
-Still to do — the `canvas/layout.rs` consistency sweep:
+The `graph_canvas/layout.rs` sweep is now in too — six tests: every catalog
+default lays out exactly the sockets `input_sockets()` reports, the same for the
+Output pseudo-node, `socket_label` agrees with the model's own labels, a
+conditional row actually changes `node_height` (Mix's Blend rows, Transform's
+Radial rows), a ramp lays out one socket per stop, and the general invariant
+below.
 
-From `canvas/layout.rs`, all applicable as-is:
+## The bug the sweep found
 
-- every kind in the catalog lays out exactly the sockets `input_sockets()`
-  reports (a mismatch silently loses an input, with no error)
-- `socket_label(key)` agrees with the model's own `socket.label`
-- a conditional row actually changes `node_height` — we have these: Mix's `Blend`
-  factor row, Transform's `CoordMode` rows
+`Mix::input_sockets()` reports a factor socket in **every** blend mode, but
+`rows_for` only emitted a row for it under `BlendMode::Blend`. Wire a layer into
+a Blend mix's factor and switch the mode to Add, and that edge became invisible
+and unreachable while staying completely real:
 
-Plus `rename_command` and `hovered_output` tests in `nodes.rs` / `wires.rs`.
+- the canvas had no anchor to draw the wire from, so it vanished;
+- `mix_widgets` in the inspector hides the factor for non-Blend too, so there
+  was nowhere left to disconnect it;
+- `LayerKind::inputs()` still counted it, so it remained a scheduling
+  dependency and a cycle edge, keeping an otherwise-unused branch alive;
+- `eval_mix` ignored it, so it had no effect on the picture.
+
+Fixed in `rows_for`: the factor row appears under Blend **or** whenever
+`m.factor` is a `ScalarInput::Layer`. `socket_row` already renders a connected
+factor as a bare label (the slider is `Const`-only), so the stranded wire now
+shows up with somewhere to be pulled off.
+
+The tempting fix — making `input_sockets()` conditional on mode — is **unsafe**:
+`Graph::remove` scrubs references to a deleted layer by walking
+`input_sockets()`, so hiding the socket there would leave a dangling `LayerId`
+in the file that later `set_kind`/`add_layer` validation would reject.
+
+This is also why `every_node_lays_out_exactly_the_sockets_it_has` only sweeps
+catalog defaults. The rule that holds everywhere is the weaker, truer one:
+**a socket with a wire in it must have a row to hang that wire on**
+(`a_connected_socket_always_has_a_row_to_hang_its_wire_on`, which checks Mix
+across all four modes).
+
+Mix is the only kind with a conditional *socket* row — ColorRamp's stop rows
+track `stops.len()` exactly, and Transform's conditionals are parameter rows
+with no socket to strand.
