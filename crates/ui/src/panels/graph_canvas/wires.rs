@@ -122,18 +122,36 @@ fn anchor(
     }
 }
 
-/// Whether a connection would be admitted, decided while the wire is still
-/// in the air so the socket can turn red before the user commits.
+/// Why a drop would be refused, decided while the wire is still in the air
+/// so the socket can ring red *before* the user commits — and reused as the
+/// message when they commit anyway. One function so the colour and the
+/// sentence cannot disagree about what is wrong.
 ///
-/// Only cycles for now — every layer produces a `Color`, so there is no
-/// type mismatch to catch. The graph stays the authority: a drop always
-/// goes through `set_input`, and anything this misses is refused there.
-pub fn eligible(graph: &Graph, node: NodeRef, src: LayerId) -> bool {
-    match node {
-        // Nothing depends on the Output node, so it can never cycle.
-        NodeRef::Output => true,
-        NodeRef::Layer(dst) => !graph.would_cycle(dst, src),
+/// Only cycles, for now. Every layer produces a `Color` and every socket
+/// takes one, so there is no type mismatch to catch; when there is, it
+/// belongs here. The graph stays the authority either way: a drop always
+/// goes through `set_kind`, and anything this misses is refused there with
+/// its own message instead of landing.
+pub fn refusal(graph: &Graph, node: NodeRef, src: LayerId) -> Option<String> {
+    // Nothing reads the material output, so it can never be part of a loop.
+    let NodeRef::Layer(dst) = node else { return None };
+    if !graph.would_cycle(dst, src) {
+        return None;
     }
+    let name = |id: LayerId| {
+        graph
+            .get(id)
+            .map(|l| l.name.clone())
+            .unwrap_or_else(|| format!("layer {}", id.0))
+    };
+    Some(if src == dst {
+        format!("{} can't read itself", name(dst))
+    } else {
+        // Naming both ends is the whole point: on a graph with a dozen
+        // nodes, "that would make a loop" leaves the user hunting for
+        // which existing wire is the other half of it.
+        format!("{} already reads {} — that would make a loop", name(src), name(dst))
+    })
 }
 
 /// Advance the wire-drag state machine: draw the live wire while the
@@ -175,14 +193,12 @@ pub fn advance_wire_drag(
         WireDrag::FromInput { node, key } => hovered_output(layouts, ptr, state.canvas_zoom)
             .map(|(src, at)| Candidate { node, key, src, at }),
     };
-    let admitted = candidate
-        .as_ref()
-        .map(|c| eligible(graph, c.node, c.src));
+    let refused = candidate.as_ref().and_then(|c| refusal(graph, c.node, c.src));
 
     if primary_down {
-        let (end, color) = match (&candidate, admitted) {
-            (Some(c), Some(true)) => (c.at, egui::Color32::from_gray(230)),
-            (Some(c), _) => (c.at, egui::Color32::LIGHT_RED),
+        let (end, color) = match (&candidate, &refused) {
+            (Some(c), None) => (c.at, egui::Color32::from_gray(230)),
+            (Some(c), Some(_)) => (c.at, egui::Color32::LIGHT_RED),
             (None, _) => (ptr, egui::Color32::from_gray(230)),
         };
         let stroke = egui::Stroke::new((2.0 * state.canvas_zoom).max(1.2), color);
@@ -197,10 +213,10 @@ pub fn advance_wire_drag(
         Some(c) => {
             if detached == Some((c.node, c.key)) {
                 // Dropped back where it came from: nothing happened.
-            } else if admitted != Some(true) {
+            } else if let Some(why) = refused {
                 // Refused before it can disturb anything — in particular
                 // the wire it was detached from stays where it is.
-                state.last_error = Some("connection would create a cycle".to_string());
+                state.last_error = Some(why);
             } else {
                 let mut edits: Vec<(NodeRef, InputKey, Option<LayerId>)> = Vec::new();
                 if let Some((n0, k0)) = detached {
@@ -315,6 +331,78 @@ fn remember_consts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{self, Kind};
+    use texture_graph_core::LayerKind;
+
+    /// A chain albedo → warp → crackle. `crackle` reads `warp` reads
+    /// `albedo`. The names are distinctive on purpose: "a" and "c" occur
+    /// inside the refusal's own wording, so asserting on them would pass
+    /// whether or not the message named anything.
+    fn chain() -> (Graph, LayerId, LayerId, LayerId) {
+        let mut g = Graph::new();
+        let albedo = g.add_layer("albedo", catalog::default_kind(Kind::Color)).unwrap();
+        let warp = g.add_layer("warp", reading(albedo)).unwrap();
+        let crackle = g.add_layer("crackle", reading(warp)).unwrap();
+        (g, albedo, warp, crackle)
+    }
+
+    fn reading(src: LayerId) -> LayerKind {
+        let LayerKind::Transform(mut t) = catalog::default_kind(Kind::Transform) else {
+            unreachable!("Transform's default is a Transform")
+        };
+        t.source = Some(src);
+        LayerKind::Transform(t)
+    }
+
+    /// The red-socket rule. This is what the user sees *before* committing,
+    /// so it has to agree with what the graph would do — a socket that
+    /// stays black and then refuses the drop is worse than one that never
+    /// looked inviting.
+    #[test]
+    fn a_socket_that_would_refuse_the_drop_says_so_in_advance() {
+        let (mut g, albedo, _warp, crackle) = chain();
+
+        // crackle already reads albedo transitively, so wiring crackle
+        // back into albedo closes the loop.
+        let why = refusal(&g, NodeRef::Layer(albedo), crackle)
+            .expect("albedo → warp → crackle → albedo is a loop");
+        assert!(why.contains("loop"), "unhelpful: {why}");
+        assert!(
+            why.contains("albedo") && why.contains("crackle"),
+            "the message names neither end of the loop: {why}"
+        );
+
+        // And the graph agrees: what the socket predicted, `set_kind` does.
+        assert!(g.set_kind(albedo, reading(crackle)).is_err());
+    }
+
+    /// The other half of the same agreement: a socket that rings black has
+    /// to actually accept the drop, or the wire bounces with an error the
+    /// user was given no warning about.
+    #[test]
+    fn a_socket_that_admits_the_drop_really_takes_it() {
+        let (mut g, albedo, _warp, crackle) = chain();
+        // albedo into crackle runs with the flow, not against it.
+        assert_eq!(refusal(&g, NodeRef::Layer(crackle), albedo), None);
+        assert!(g.set_kind(crackle, reading(albedo)).is_ok());
+    }
+
+    #[test]
+    fn a_layer_cannot_read_itself() {
+        let (g, albedo, _warp, _crackle) = chain();
+        let why =
+            refusal(&g, NodeRef::Layer(albedo), albedo).expect("a self-loop is a loop");
+        assert!(why.contains("itself"), "unhelpful: {why}");
+        assert!(why.contains("albedo"), "the message names no layer: {why}");
+    }
+
+    /// Nothing reads the material output, so no wire into it can close a
+    /// loop — including one from a layer that reads everything else.
+    #[test]
+    fn the_material_output_never_refuses_a_wire() {
+        let (g, _albedo, _warp, crackle) = chain();
+        assert_eq!(refusal(&g, NodeRef::Output, crackle), None);
+    }
 
     fn layout_at(node: NodeRef, min: egui::Pos2, output: Option<egui::Pos2>) -> NodeLayout {
         NodeLayout {

@@ -1156,7 +1156,7 @@ fn socket_style(
         // A wire pulled out of an input is hunting for an *output*; no
         // input socket is a candidate for it, so none of them react.
         Some(WireDrag::FromOutput { src, .. }) if hovered => {
-            eligibility(super::wires::eligible(graph, node, src), z)
+            eligibility(super::wires::refusal(graph, node, src).is_none(), z)
         }
         _ => plain(hovered, z),
     }
@@ -1173,7 +1173,7 @@ fn output_socket_style(
 ) -> (f32, egui::Color32) {
     match state.wire_drag {
         Some(WireDrag::FromInput { node, .. }) if hovered => {
-            eligibility(super::wires::eligible(graph, node, src), z)
+            eligibility(super::wires::refusal(graph, node, src).is_none(), z)
         }
         _ => plain(hovered, z),
     }

@@ -179,11 +179,11 @@ the panel default.
 
 ---
 
-# Tier 2 — real wins, need adaptation
+# Tier 2 — real wins, need adaptation (DONE)
 
 - [x] **8. Per-layer preview staleness** (done; no bake budget — see below)
 - [x] **9. A `catalog` module**
-- [ ] **10. `refusal()` pre-flight with a message**
+- [x] **10. `refusal()` pre-flight with a message**
 
 ### 8. Per-layer preview staleness — DONE
 
@@ -287,15 +287,52 @@ Note there is a third copy of these strings, deliberately left alone:
 `LayerKind::category_label()` in core, which the node header paints as its
 subtitle. That one is the model describing itself and is fine where it is.
 
-### 10. `refusal()` pre-flight with a message — NOT STARTED
+### 10. `refusal()` pre-flight with a message — DONE
 
-`wires::refusal(graph, node, key, src) -> Option<String>` runs while the wire is
-still in the air, turns the target socket red, and supplies the drop-time error
-text. We only check `would_cycle` and report a generic message *after* the drop.
-The type half does not transfer (everything is a `Color`), but `set_input` can
-already fail, and the shape is worth having before a type system arrives.
+`wires::eligible(graph, node, src) -> bool` became
+`wires::refusal(graph, node, src) -> Option<String>`. Both the socket ring
+(`socket_style` / `output_socket_style` in `nodes.rs`) and the drop-time status
+message read from it, so the colour and the sentence cannot disagree about
+what is wrong — previously the message was a hardcoded string sitting a hundred
+lines away from the check that decided the colour.
 
-# Tier 3 — cheap tests (NOT STARTED)
+**A cycle is still the only thing a wire drop can be refused for**, and that is
+a fact about the model rather than a gap here. `Graph::set_kind` can return
+`UnknownId` (impossible from a drop — both ends exist), `Cycle` (pre-checked),
+and `RampTooFewStops` (connecting a wire never removes a stop). Every layer
+produces a `Color` and every socket takes one, so there is no type mismatch to
+catch. When there is, it goes in `refusal` and everything downstream already
+works.
+
+**No `key` parameter**, unlike MBG's. It needs the key to look up the socket's
+type; we have nothing that varies by key, and an unused parameter is dead
+weight. Both call sites have the key to hand if that changes.
+
+What did improve for the user: the message now names both ends of the loop
+(`crackle already reads albedo — that would make a loop`) instead of
+`connection would create a cycle`, and self-loops say so separately. On a graph
+with a dozen nodes the old message left you hunting for which existing wire was
+the other half.
+
+Four tests, and the first two are the ones worth keeping: a socket that would
+refuse says so in advance **and `set_kind` agrees**, and a socket that rings
+black **really does take the drop**. Those hold the preview against the
+authority, which is the property that matters when a type system lands.
+
+### Not adopted from MBG's version
+
+`EditCmd::Connect` + a `Graph::connect` method in core. Ours batches a
+detach-and-reconnect on the same node into one `SetKind` so the intermediate
+state never exists (`wires::apply_socket_edits`), which MBG gave up when it
+moved connection handling into the model. Keep ours unless that changes.
+
+# Tier 3 — cheap tests (PARTLY DONE)
+
+Already landed alongside the tiers above: `rename_command` (nodes.rs),
+`hovered_output` (wires.rs), the `refusal` agreement pair (wires.rs), the
+dirty-closure trio (state.rs) and the catalog's four (catalog.rs).
+
+Still to do — the `canvas/layout.rs` consistency sweep:
 
 From `canvas/layout.rs`, all applicable as-is:
 
