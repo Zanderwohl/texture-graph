@@ -10,7 +10,11 @@ wgpu = "29"
 bytemuck = { version = "1", features = ["derive"] }
 glam = { version = "0.30", features = ["bytemuck"] }
 log = "0.4"
-pollster = "0.4"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures = "0.4"
+
+[dev-dependencies]
+# Only the test modules block on `DeviceCtx::request_headless`; a consumer
+# drives that future with its own executor.
+pollster = "0.4"

@@ -50,7 +50,7 @@ pub enum ParamRow {
 /// Row table for a layer node. Height is fully determined by the current
 /// kind (including conditional rows), never by widget measurement.
 pub fn rows_for(kind: &LayerKind) -> Vec<Row> {
-    use texture_graph_core::{BlendMode, CoordMode};
+    use texture_graph_core::{BlendMode, CoordMode, ScalarInput};
     let mut rows = Vec::new();
     match kind {
         LayerKind::Color(_) => rows.push(Row::Param(ParamRow::ColorValue)),
@@ -94,6 +94,19 @@ pub fn rows_for(kind: &LayerKind) -> Vec<Row> {
             ]);
             if matches!(m.mode, BlendMode::Blend) {
                 rows.push(Row::Param(ParamRow::MixSpace));
+            }
+            // Only Blend reads the factor, so the row is hidden for the
+            // other modes — but the *socket* exists in every mode:
+            // `LayerKind::inputs` counts it as a dependency and
+            // `Graph::remove` scrubs it through `input_sockets`. A factor
+            // wired up in Blend and then switched to Add is still a real
+            // edge, so keep the row whenever something is attached to it.
+            // Hiding it there would strand the wire: no anchor to draw it
+            // from, and the inspector hides it too, so nothing could reach
+            // it again.
+            if matches!(m.mode, BlendMode::Blend)
+                || matches!(m.factor, ScalarInput::Layer(_))
+            {
                 rows.push(Row::Socket(InputKey::MixFactor));
             }
         }
@@ -279,5 +292,179 @@ fn build_layout(
         row_rects,
         inputs,
         output_socket,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{self, Kind};
+    use texture_graph_core::color::oklcha;
+    use texture_graph_core::{
+        Axis, BlendMode, ColorInput, ColorStop, CoordMode, Graph, RadialDim, ScalarInput,
+    };
+
+    /// The graph's Output as a fresh graph has it.
+    fn output() -> texture_graph_core::Output {
+        Graph::new().output
+    }
+
+    /// The socket keys `rows_for` lays out, in order.
+    fn laid_out(kind: &LayerKind) -> Vec<InputKey> {
+        rows_for(kind)
+            .into_iter()
+            .filter_map(|r| match r {
+                Row::Socket(key) => Some(key),
+                Row::Param(_) => None,
+            })
+            .collect()
+    }
+
+    /// The socket keys the model reports, in order.
+    fn modelled(kind: &LayerKind) -> Vec<InputKey> {
+        kind.input_sockets().into_iter().map(|s| s.key).collect()
+    }
+
+    /// A socket the layout draws but the model doesn't report has no wire
+    /// anchor, so its edge silently vanishes; a socket the model reports
+    /// but the layout omits cannot be connected at all. Neither shows up as
+    /// an error — the node just quietly loses an input.
+    ///
+    /// Exact equality holds for the catalog's defaults, which is what a
+    /// freshly added node is. It is deliberately *not* the general rule:
+    /// `Mix` reports a factor socket in every mode but only shows a row for
+    /// it when Blend reads it or something is wired to it. The invariant
+    /// that does hold everywhere is
+    /// [`a_connected_socket_always_has_a_row_to_hang_its_wire_on`].
+    #[test]
+    fn every_node_lays_out_exactly_the_sockets_it_has() {
+        for variant in catalog::VARIANTS {
+            let kind = catalog::default_kind(variant.kind);
+            assert_eq!(
+                laid_out(&kind),
+                modelled(&kind),
+                "{} lays out the wrong sockets",
+                variant.label
+            );
+        }
+    }
+
+    /// The Output pseudo-node isn't a catalog variant, so the sweep above
+    /// never reaches it.
+    #[test]
+    fn the_output_lays_out_exactly_the_sockets_it_has() {
+        let output = output();
+        let laid_out: Vec<InputKey> = rows_for_output()
+            .into_iter()
+            .filter_map(|r| match r {
+                Row::Socket(key) => Some(key),
+                Row::Param(_) => None,
+            })
+            .collect();
+        let modelled: Vec<InputKey> =
+            output.input_sockets().into_iter().map(|s| s.key).collect();
+        assert_eq!(laid_out, modelled);
+    }
+
+    /// Row labels are written out here rather than read from the model, so
+    /// they can drift from it. A wire labelled "source" landing in a socket
+    /// the model calls "value" is the kind of thing nobody notices until
+    /// they're debugging the wrong node.
+    #[test]
+    fn socket_labels_say_what_the_model_says() {
+        for variant in catalog::VARIANTS {
+            let kind = catalog::default_kind(variant.kind);
+            for socket in kind.input_sockets() {
+                assert_eq!(
+                    socket_label(socket.key),
+                    socket.label,
+                    "{} socket {:?}",
+                    variant.label,
+                    socket.key
+                );
+            }
+        }
+        for socket in output().input_sockets() {
+            assert_eq!(socket_label(socket.key), socket.label, "output {:?}", socket.key);
+        }
+    }
+
+    /// Height is meant to be a pure function of the kind. If a conditional
+    /// row were forgotten in `rows_for`, the node would draw a widget
+    /// outside its own body — visible, but only for the kinds that have one.
+    #[test]
+    fn conditional_rows_change_the_height_they_are_on() {
+        // Mix: Blend adds a space row and a factor socket.
+        let LayerKind::Mix(mut m) = catalog::default_kind(Kind::Mix) else { panic!() };
+        m.mode = BlendMode::Add;
+        let plain = node_height(&rows_for(&LayerKind::Mix(m)), true);
+        m.mode = BlendMode::Blend;
+        assert!(
+            node_height(&rows_for(&LayerKind::Mix(m)), true) > plain,
+            "Blend's extra rows did not make the node taller"
+        );
+
+        // Transform: each coord mode carries its own parameter rows.
+        let LayerKind::Transform(mut t) = catalog::default_kind(Kind::Transform) else {
+            panic!()
+        };
+        t.coord_mode = CoordMode::Passthrough;
+        let passthrough = node_height(&rows_for(&LayerKind::Transform(t)), true);
+        t.coord_mode = CoordMode::Radial { dim: RadialDim::D2, into: Axis::U };
+        assert!(
+            node_height(&rows_for(&LayerKind::Transform(t)), true) > passthrough,
+            "Radial's extra rows did not make the node taller"
+        );
+    }
+
+    /// A ColorRamp's sockets are its stops, so adding one has to add a row
+    /// — the keys are positional, and a stop with no row is a stop that
+    /// cannot be wired.
+    #[test]
+    fn a_ramp_lays_out_one_socket_per_stop() {
+        let LayerKind::ColorRamp(mut r) = catalog::default_kind(Kind::ColorRamp) else {
+            panic!()
+        };
+        assert_eq!(laid_out(&LayerKind::ColorRamp(r.clone())).len(), r.stops.len());
+        r.stops.push(ColorStop {
+            t: 0.5,
+            color: ColorInput::Const(oklcha(0.5, 0.0, 0.0, 1.0)),
+        });
+        let kind = LayerKind::ColorRamp(r);
+        assert_eq!(laid_out(&kind), modelled(&kind));
+    }
+
+    /// The invariant that survives conditional rows: a socket with a wire
+    /// in it must have somewhere to draw that wire. `Mix` reports its
+    /// factor socket in every mode — `LayerKind::inputs` counts it as a
+    /// dependency and `Graph::remove` scrubs it through `input_sockets` —
+    /// so a factor wired up in Blend and then switched to Add is still a
+    /// real edge. Without a row it has no anchor: it disappears from the
+    /// canvas, the inspector hides it too, and there is no way left to
+    /// reach it.
+    #[test]
+    fn a_connected_socket_always_has_a_row_to_hang_its_wire_on() {
+        let modes = [
+            BlendMode::Add,
+            BlendMode::Subtract,
+            BlendMode::Multiply,
+            BlendMode::Blend,
+        ];
+        for mode in modes {
+            let LayerKind::Mix(mut m) = catalog::default_kind(Kind::Mix) else { panic!() };
+            m.mode = mode;
+            m.factor = ScalarInput::Layer(LayerId(1));
+            let kind = LayerKind::Mix(m);
+            let rows = laid_out(&kind);
+            for socket in kind.input_sockets() {
+                if socket.value.connected_to().is_some() {
+                    assert!(
+                        rows.contains(&socket.key),
+                        "{mode:?}: {:?} is wired but has no row",
+                        socket.key
+                    );
+                }
+            }
+        }
     }
 }

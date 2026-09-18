@@ -1,65 +1,66 @@
 //! End-to-end bake tests. Each variant that lands should add one here
 //! comparing the GPU output to `core`'s CPU evaluator.
 
+use std::collections::HashSet;
+
 use texture_graph_core::{
     BlendMode, BlendSpace, Color, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion,
-    EdgeMode, EvalCtx, Graph, HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims,
-    NoiseOutput, NoiseRange, Output, ScalarInput, Transform, color::to_srgb8,
+    EdgeMode, EvalCtx, Graph, HeightToNormal, LayerId, LayerKind, Map, MinMax, MinMaxMode, Mix,
+    Noise, NoiseDims, NoiseOutput, NoiseRange, Output, ScalarInput, Transform, color::to_srgb8,
 };
 
 use crate::{Baker, DeviceCtx};
 
 const SIZE: (u32, u32) = (8, 8);
 
-/// Read every pixel of an Rgba8Unorm texture into a flat Vec<[u8; 4]>.
+fn add_mix(g: &mut Graph, name: &str, a: LayerId, b: LayerId) -> LayerId {
+    g.add_layer(
+        name,
+        LayerKind::Mix(Mix {
+            a: Some(a),
+            b: Some(b),
+            mode: BlendMode::Add,
+            factor: ScalarInput::Const(0.5),
+            space: BlendSpace::Oklch,
+        }),
+    )
+    .unwrap()
+}
+
+fn add_transform(
+    g: &mut Graph,
+    name: &str,
+    src: LayerId,
+    scale: [f32; 3],
+    edge_mode: EdgeMode,
+) -> LayerId {
+    g.add_layer(
+        name,
+        LayerKind::Transform(Transform {
+            source: Some(src),
+            offset: [0.0; 3],
+            rotate_uv: 0.0,
+            scale,
+            coord_mode: CoordMode::Passthrough,
+            edge_mode,
+        }),
+    )
+    .unwrap()
+}
+
+/// Every pixel of an Rgba8Unorm texture, as `[r, g, b, a]`.
+///
+/// Thin wrapper over the crate's public [`crate::readback::read_rgba8`], so
+/// the path a headless caller uses is the same one 45 tests exercise —
+/// there is no second copy of the row-padding arithmetic to get wrong.
 fn readback_all_pixels(ctx: &DeviceCtx, tex: &wgpu::Texture, size: (u32, u32)) -> Vec<[u8; 4]> {
-    // 256-byte-aligned row stride.
-    let raw_bpr = size.0 * 4;
-    let bytes_per_row = (raw_bpr + 255) & !255;
-    let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("readback-all"),
-        size: (bytes_per_row * size.1) as u64,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("readback-all-enc"),
-    });
-    enc.copy_texture_to_buffer(
-        wgpu::TexelCopyTextureInfo {
-            texture: tex,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::TexelCopyBufferInfo {
-            buffer: &readback,
-            layout: wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(bytes_per_row),
-                rows_per_image: Some(size.1),
-            },
-        },
-        wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
-    );
-    ctx.queue.submit([enc.finish()]);
-    let slice = readback.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-    ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
-    rx.recv().expect("chan").expect("map");
-    let data = slice.get_mapped_range();
-    let mut out = Vec::with_capacity((size.0 * size.1) as usize);
-    for y in 0..size.1 {
-        let row = &data[(y * bytes_per_row) as usize..][..raw_bpr as usize];
-        for x in 0..size.0 {
-            let px = &row[(x * 4) as usize..][..4];
-            out.push([px[0], px[1], px[2], px[3]]);
-        }
-    }
-    drop(data);
-    readback.unmap();
-    out
+    crate::readback::read_rgba8(ctx, tex, size)
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| [p[0], p[1], p[2], p[3]])
+        .collect()
 }
 
 fn readback_first_pixel(ctx: &DeviceCtx, tex: &wgpu::Texture) -> [u8; 4] {
@@ -812,7 +813,8 @@ fn bake_previews_returns_one_texture_per_authored_layer() {
     let _unreachable = graph
         .add_layer("dead", LayerKind::Color(Color::new(0.9, 0.05, 200.0, 1.0)))
         .unwrap();
-    let previews = baker.bake_previews(&graph, &EvalCtx::default()).expect("bake previews");
+    let previews =
+        baker.bake_previews(&graph, &EvalCtx::default(), None).expect("bake previews");
     assert_eq!(previews.len(), 3, "expected one preview per authored layer");
     // Sanity: each output is 128² Rgba8Unorm.
     for (_, tex) in &previews {
@@ -820,6 +822,74 @@ fn bake_previews_returns_one_texture_per_authored_layer() {
         assert_eq!(tex.height(), 128);
         assert_eq!(tex.format(), wgpu::TextureFormat::Rgba8Unorm);
     }
+}
+
+/// Asking for a subset must hand back exactly that subset. A layer that
+/// came along only because something wanted reads it is dispatched, but it
+/// is not packed and not returned — the caller is still showing the texture
+/// it already had for that one, and handing it a second would leak the
+/// first.
+#[test]
+fn bake_previews_returns_only_the_layers_that_were_asked_for() {
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let base = graph.output.color.unwrap();
+    graph.set_kind(base, LayerKind::Color(Color::new(0.5, 0.0, 0.0, 1.0))).unwrap();
+    let b = graph.add_layer("b", LayerKind::Color(Color::new(0.3, 0.1, 60.0, 1.0))).unwrap();
+    // `mixed` reads both, so asking for it schedules them without packing
+    // them.
+    let mixed = add_mix(&mut graph, "mixed", base, b);
+    let untouched = graph
+        .add_layer("untouched", LayerKind::Color(Color::new(0.9, 0.05, 200.0, 1.0)))
+        .unwrap();
+
+    let wanted: HashSet<LayerId> = [mixed].into_iter().collect();
+    let previews = baker
+        .bake_previews(&graph, &EvalCtx::default(), Some(&wanted))
+        .expect("bake previews");
+    assert_eq!(previews.keys().copied().collect::<Vec<_>>(), vec![mixed]);
+    assert!(!previews.contains_key(&untouched), "an unrelated layer was baked");
+}
+
+/// A thumbnail must be the same picture whichever way it was baked. The
+/// trap is bake domains: they are decided by a layer's *consumers*, so a
+/// subset schedule that only walked the subset would give a layer a
+/// narrower domain whenever the consumer that widened it was clean, and
+/// its thumbnail would come back at a different effective resolution
+/// depending on what else happened to be stale.
+#[test]
+fn a_subset_bake_gives_the_same_picture_as_a_full_one() {
+    use texture_graph_core::EdgeMode;
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let src = graph.output.color.unwrap();
+    graph
+        .set_kind(
+            src,
+            LayerKind::Noise(Noise {
+                dims: NoiseDims::D2,
+                seed_offset: 7,
+                frequency: 8.0,
+                range: NoiseRange::Unsigned,
+                output: NoiseOutput::Grayscale,
+            }),
+        )
+        .unwrap();
+    // The extend transform is what widens `src`'s bake domain past the
+    // unit square. It is not in `wanted` below.
+    let _zoom = add_transform(&mut graph, "zoom", src, [0.25, 0.25, 1.0], EdgeMode::Extend);
+
+    let full = baker.bake_previews(&graph, &EvalCtx::default(), None).expect("full");
+    let wanted: HashSet<LayerId> = [src].into_iter().collect();
+    let subset = baker
+        .bake_previews(&graph, &EvalCtx::default(), Some(&wanted))
+        .expect("subset");
+
+    let a = readback_all_pixels(&ctx, &full[&src], (128, 128));
+    let b = readback_all_pixels(&ctx, &subset[&src], (128, 128));
+    assert_eq!(a, b, "the same layer baked two ways gave two different pictures");
 }
 
 #[test]
@@ -1255,5 +1325,113 @@ fn radial_extend_past_limit_shows_missing_grid_like_cpu() {
                 );
             }
         }
+    }
+}
+
+/// CPU/GPU noise parity — the claim `core::noise` exists to make good.
+///
+/// Before that module the two backends ran different algorithms off
+/// different permutation tables (the `noise` crate's `Simplex` in f64 on one
+/// side, Gustavson's textureless simplex in f32 on the other), so a graph
+/// looked one way baked on the GPU and another way in the CPU fallback. They
+/// now run one specification twice.
+///
+/// Reported as a histogram rather than a single max, because the shape of
+/// the disagreement is the diagnostic: a handful of ±1 steps is rounding in
+/// the Oklch→sRGB stage, while a long tail means the two kernels have
+/// genuinely diverged.
+///
+/// Samples whose L falls outside `[0, 1]` are counted and skipped, not
+/// compared. That is where signed noise spends about a sixth of its range,
+/// and the two backends disagree there *on purpose*: `to_srgb8` clamps,
+/// while `pack_srgb8` paints the magenta/black out-of-range checker (see
+/// `out_of_range_l_paints_magenta_black_checker`). That is a display-stage
+/// choice, and this test is about the field underneath it.
+///
+/// Returns `(histogram, worst, compared, skipped)`.
+fn noise_parity_histogram(
+    dims: NoiseDims,
+    range: NoiseRange,
+    frequency: f32,
+) -> (Vec<u32>, u32, u32, u32) {
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let id = graph.output.color.unwrap();
+    graph
+        .set_kind(
+            id,
+            LayerKind::Noise(Noise {
+                dims,
+                seed_offset: 3,
+                frequency,
+                range,
+                output: NoiseOutput::Grayscale,
+            }),
+        )
+        .unwrap();
+
+    const RES: u32 = 64;
+    let eval = EvalCtx::default();
+    let out = baker.bake_output(&graph, (RES, RES), &eval, false).expect("bake");
+    let px = readback_all_pixels(&ctx, &out.color, (RES, RES));
+
+    let mut hist = vec![0u32; 6];
+    let (mut worst, mut compared, mut skipped) = (0u32, 0u32, 0u32);
+    for y in 0..RES {
+        for x in 0..RES {
+            let u = (x as f32 + 0.5) / RES as f32;
+            let v = (y as f32 + 0.5) / RES as f32;
+            let m = texture_graph_core::evaluate_material(
+                &graph,
+                // w = 0.5, which is where a flat GPU bake slices a 3D
+                // field (`dispatch_kind`'s `w` argument). `Sample::uv` says
+                // 0.0, so a D3 graph compared that way is two different
+                // slices of the same volume.
+                texture_graph_core::Sample::new(u, v, 0.5),
+                &eval,
+            );
+            if !(0.0..=1.0).contains(&m.color.l) {
+                skipped += 1;
+                continue;
+            }
+            compared += 1;
+            let expected = to_srgb8(m.color);
+            let got = px[(y * RES + x) as usize];
+            for i in 0..3 {
+                let d = (expected[i] as i32 - got[i] as i32).unsigned_abs();
+                worst = worst.max(d);
+                hist[(d as usize).min(5)] += 1;
+            }
+        }
+    }
+    (hist, worst, compared, skipped)
+}
+
+#[test]
+fn cpu_and_gpu_noise_agree() {
+    for (dims, range, freq) in [
+        (NoiseDims::D2, NoiseRange::Unsigned, 4.0),
+        (NoiseDims::D2, NoiseRange::Signed, 9.0),
+        (NoiseDims::D1, NoiseRange::Unsigned, 6.0),
+        (NoiseDims::D3, NoiseRange::Unsigned, 5.0),
+        (NoiseDims::D3, NoiseRange::Signed, 2.0),
+    ] {
+        let (hist, worst, compared, skipped) = noise_parity_histogram(dims, range, freq);
+        println!(
+            "{dims:?} {range:?} f={freq}: worst={worst} hist={hist:?} \
+             compared={compared} skipped={skipped}"
+        );
+        // A test that skipped everything would pass on an empty
+        // comparison. Signed noise spends a good third of its range below
+        // zero, so the floor is a quarter of the image rather than half.
+        assert!(
+            compared * 4 > 64 * 64,
+            "{dims:?} {range:?}: only {compared} samples were in range"
+        );
+        assert!(
+            worst <= 1,
+            "{dims:?} {range:?} f={freq}: worst sRGB delta {worst}, histogram {hist:?}"
+        );
     }
 }

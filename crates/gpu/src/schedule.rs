@@ -337,45 +337,102 @@ pub fn schedule(graph: &Graph) -> Result<Schedule, ScheduleError> {
 }
 
 /// One texture per layer, no reuse — used for the per-layer preview pass
-/// where every intermediate must survive to the end so it can be readback
+/// where every intermediate must survive to the end so it can be read back
 /// into egui.
 pub fn schedule_no_reuse(graph: &Graph) -> Result<Schedule, ScheduleError> {
-    let output_roots = output_referenced(graph);
-    let mut required: HashSet<LayerId> = HashSet::new();
-    let mut stack = output_roots.clone();
-    while let Some(id) = stack.pop() {
-        if !required.insert(id) {
-            continue;
-        }
-        let layer = graph.get(id).ok_or(ScheduleError::UnknownLayer(id))?;
-        for input in layer.kind.inputs() {
-            stack.push(input);
-        }
-    }
-    // For per-layer previews, users want thumbnails of *every* authored
-    // layer, not only those wired to Output. Add unreachable layers too.
-    for l in &graph.layers {
-        required.insert(l.id);
-    }
-    let mut order = Vec::with_capacity(required.len());
-    let mut done: HashSet<LayerId> = HashSet::new();
-    let mut visiting: HashSet<LayerId> = HashSet::new();
-    for id in required.iter().copied().collect::<Vec<_>>() {
-        topo_dfs(graph, id, &required, &mut visiting, &mut done, &mut order)?;
-    }
+    schedule_previews(graph, None)
+}
+
+/// The preview schedule for `wanted` — those layers and everything they
+/// transitively read, and nothing else. `None` wants every authored layer.
+///
+/// Baking a subset is what makes an edit to one corner of a graph cost one
+/// corner's worth of work. Layers outside the upstream closure of `wanted`
+/// are not dispatched, not allocated a slot, and not packed.
+///
+/// **Domains are computed over the whole graph regardless.** A layer's bake
+/// domain is decided by its *consumers* (an `EdgeMode::Extend` transform
+/// pulls its source wider), so restricting the walk to the subset would
+/// give a layer a narrower domain whenever the consumer that widened it
+/// happened to be clean — and its thumbnail would come back at a different
+/// effective resolution depending on what else was being baked. One extra
+/// topological pass buys a thumbnail that is the same picture either way.
+pub fn schedule_previews(
+    graph: &Graph,
+    wanted: Option<&HashSet<LayerId>>,
+) -> Result<Schedule, ScheduleError> {
+    // Everything, in dependency order — what the domains are computed from,
+    // and the whole schedule when `wanted` is `None`.
+    let everything: HashSet<LayerId> = graph.layers.iter().map(|l| l.id).collect();
+    let full_order = topo_over(graph, &everything)?;
+    let domain_of = compute_domains(graph, &full_order);
+
+    let order = match wanted {
+        None => full_order,
+        Some(w) => topo_over(graph, &upstream_closure(graph, w)?)?,
+    };
+
     let mut slot_of: HashMap<LayerId, u32> = HashMap::new();
     for (i, &id) in order.iter().enumerate() {
         slot_of.insert(id, i as u32);
     }
     let peak_slots = order.len() as u32;
+    // Lenient, unlike `schedule`'s: on a subset the output roots may not be
+    // scheduled at all. The preview pass never reads these — it packs each
+    // layer's own slot — so a missing root is not an error here.
     let output_slots = OutputSlots {
         color: graph.output.color.and_then(|id| slot_of.get(&id).copied()),
-        roughness: scalar_to_slot(&graph.output.roughness, &slot_of)?,
-        metallic: scalar_to_slot(&graph.output.metallic, &slot_of)?,
+        roughness: scalar_slot_lenient(&graph.output.roughness, &slot_of),
+        metallic: scalar_slot_lenient(&graph.output.metallic, &slot_of),
         normal: graph.output.normal.and_then(|id| slot_of.get(&id).copied()),
     };
-    let domain_of = compute_domains(graph, &order);
     Ok(Schedule { order, slot_of, peak_slots, output_slots, domain_of })
+}
+
+/// `roots` plus everything they transitively read.
+fn upstream_closure(
+    graph: &Graph,
+    roots: &HashSet<LayerId>,
+) -> Result<HashSet<LayerId>, ScheduleError> {
+    let mut required: HashSet<LayerId> = HashSet::new();
+    let mut stack: Vec<LayerId> = roots.iter().copied().collect();
+    while let Some(id) = stack.pop() {
+        if !required.insert(id) {
+            continue;
+        }
+        let layer = graph.get(id).ok_or(ScheduleError::UnknownLayer(id))?;
+        stack.extend(layer.kind.inputs());
+    }
+    Ok(required)
+}
+
+/// A topological order over exactly `required`, dependencies first.
+fn topo_over(graph: &Graph, required: &HashSet<LayerId>) -> Result<Vec<LayerId>, ScheduleError> {
+    let mut order = Vec::with_capacity(required.len());
+    let mut done: HashSet<LayerId> = HashSet::new();
+    let mut visiting: HashSet<LayerId> = HashSet::new();
+    // Sorted so the order is deterministic run to run: `HashSet` iteration
+    // is not, and a schedule that reshuffles between frames would make
+    // slot assignments — and so any bug in them — irreproducible.
+    let mut ids: Vec<LayerId> = required.iter().copied().collect();
+    ids.sort();
+    for id in ids {
+        topo_dfs(graph, id, required, &mut visiting, &mut done, &mut order)?;
+    }
+    Ok(order)
+}
+
+/// Like [`scalar_to_slot`], but a layer that isn't scheduled falls back to
+/// a constant instead of failing. Only for the preview pass, which doesn't
+/// read output slots.
+fn scalar_slot_lenient(s: &ScalarInput, slot_of: &HashMap<LayerId, u32>) -> ScalarSlot {
+    match *s {
+        ScalarInput::Const(v) => ScalarSlot::Const(v),
+        ScalarInput::Layer(id) => match slot_of.get(&id) {
+            Some(slot) => ScalarSlot::Slot(*slot),
+            None => ScalarSlot::Const(0.0),
+        },
+    }
 }
 
 fn output_referenced(graph: &Graph) -> Vec<LayerId> {

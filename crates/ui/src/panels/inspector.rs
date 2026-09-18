@@ -3,30 +3,15 @@
 
 use texture_graph_core::color::oklcha;
 use texture_graph_core::{
-    Axis, BlendMode, BlendSpace, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion, EdgeMode, Graph,
+    Axis, BlendMode, BlendSpace, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion, Graph,
     HeightToNormal, LayerId, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims,
     NoiseOutput, NoiseRange, RadialDim, ScalarInput, Transform,
 };
 
+use crate::catalog::{self, Kind};
 use crate::state::{EditCmd, UiState};
 use crate::widgets::enum_combo::enum_combo;
 use crate::widgets::{color_edit, layer_ref};
-
-const VARIANTS: &[VariantSpec] = &[
-    VariantSpec { key: "Color", label: "Color" },
-    VariantSpec { key: "Noise", label: "Noise" },
-    VariantSpec { key: "ColorRamp", label: "ColorRamp" },
-    VariantSpec { key: "Transform", label: "Transform" },
-    VariantSpec { key: "Mix", label: "Mix" },
-    VariantSpec { key: "Map", label: "Map" },
-    VariantSpec { key: "MinMax", label: "MinMax" },
-    VariantSpec { key: "HeightToNormal", label: "HeightToNormal" },
-];
-
-struct VariantSpec {
-    key: &'static str,
-    label: &'static str,
-}
 
 /// Render the inspector for a single layer. Emits `EditCmd::SetKind` when
 /// any control changes.
@@ -37,15 +22,18 @@ pub fn show(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, id: LayerId) 
 
     // Variant switcher — swaps the whole `LayerKind` to a fresh default of
     // the chosen variant.
-    let current_key = current_variant_key(&kind);
+    let current = Kind::of(&kind);
+    let current_label = catalog::VARIANTS
+        .iter()
+        .find(|v| v.kind == current)
+        .map_or("", |v| v.label);
     egui::ComboBox::from_id_salt(("variant", id.0))
-        .selected_text(current_key)
+        .selected_text(current_label)
         .show_ui(ui, |ui| {
-            for v in VARIANTS {
-                if ui.selectable_label(current_key == v.key, v.label).clicked()
-                    && current_key != v.key
+            for v in catalog::VARIANTS {
+                if ui.selectable_label(current == v.kind, v.label).clicked() && current != v.kind
                 {
-                    kind = default_kind(v.key, graph);
+                    kind = catalog::default_kind(v.kind);
                     changed = true;
                 }
             }
@@ -80,66 +68,6 @@ pub fn show(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, id: LayerId) 
 
     if changed {
         state.push(EditCmd::SetKind(id, kind));
-    }
-}
-
-fn current_variant_key(k: &LayerKind) -> &'static str {
-    match k {
-        LayerKind::Color(_) => "Color",
-        LayerKind::Noise(_) => "Noise",
-        LayerKind::ColorRamp(_) => "ColorRamp",
-        LayerKind::Transform(_) => "Transform",
-        LayerKind::Mix(_) => "Mix",
-        LayerKind::Map(_) => "Map",
-        LayerKind::MinMax(_) => "MinMax",
-        LayerKind::HeightToNormal(_) => "HeightToNormal",
-    }
-}
-
-/// Default kind for a given variant key. Layer inputs start unconnected
-/// (`None`) — they render as the missing-texture grid until the user picks
-/// a source, and can never trip the cycle check on creation.
-pub fn default_kind(variant: &str, _graph: &Graph) -> LayerKind {
-    match variant {
-        "Color" => LayerKind::Color(oklcha(0.5, 0.0, 0.0, 1.0)),
-        "Noise" => LayerKind::Noise(Noise {
-            dims: NoiseDims::D2,
-            seed_offset: 0,
-            frequency: 4.0,
-            range: NoiseRange::Unsigned,
-            output: NoiseOutput::Grayscale,
-        }),
-        "ColorRamp" => LayerKind::ColorRamp(ColorRamp {
-            stops: vec![
-                ColorStop { t: 0.0, color: ColorInput::Const(oklcha(0.0, 0.0, 0.0, 1.0)) },
-                ColorStop { t: 1.0, color: ColorInput::Const(oklcha(1.0, 0.0, 0.0, 1.0)) },
-            ],
-            space: BlendSpace::Oklch,
-        }),
-        "Transform" => LayerKind::Transform(Transform {
-            source: None,
-            offset: [0.5, 0.5, 0.5],
-            rotate_uv: 0.0,
-            scale: [1.0; 3],
-            coord_mode: CoordMode::Passthrough,
-                edge_mode: EdgeMode::default(),
-        }),
-        "Mix" => LayerKind::Mix(Mix {
-            a: None,
-            b: None,
-            mode: BlendMode::Blend,
-            factor: ScalarInput::Const(0.5),
-            space: BlendSpace::Oklch,
-        }),
-        "Map" => LayerKind::Map(Map { value: None, palette: None }),
-        "MinMax" => LayerKind::MinMax(MinMax {
-            a: None,
-            b: None,
-            mode: MinMaxMode::Max,
-            criterion: Criterion::Alpha,
-        }),
-        "HeightToNormal" => LayerKind::HeightToNormal(HeightToNormal { source: None, strength: 1.0 }),
-        _ => LayerKind::Color(oklcha(0.5, 0.0, 0.0, 1.0)),
     }
 }
 
