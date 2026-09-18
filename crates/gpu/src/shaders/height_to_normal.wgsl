@@ -13,11 +13,32 @@ struct H2NParams {
     size: vec2<u32>,
     strength: f32,
     _pad: u32,
+    dom: vec4<f32>,      // own bake domain (min_u, min_v, ext_u, ext_v)
+    dom_src: vec4<f32>,  // source's bake domain
 }
 
 @group(0) @binding(0) var<uniform> params: H2NParams;
 @group(0) @binding(1) var out_tex: texture_storage_2d<rgba32float, write>;
 @group(0) @binding(2) var src: texture_2d<f32>;
+
+// Map this dispatch's texel to its UV within the layer's bake domain
+// (dom = (min_u, min_v, ext_u, ext_v)).
+fn dom_uv(dom: vec4<f32>, gid: vec2<u32>, size: vec2<u32>) -> vec2<f32> {
+    return vec2<f32>(
+        dom.x + (f32(gid.x) + 0.5) / f32(size.x) * dom.z,
+        dom.y + (f32(gid.y) + 0.5) / f32(size.y) * dom.w,
+    );
+}
+
+// Nearest texel of `uv` in an input baked over `dom`, clamped to its edge.
+fn dom_texel(dom: vec4<f32>, uv: vec2<f32>, size: vec2<u32>) -> vec2<i32> {
+    let tx = (uv.x - dom.x) / dom.z * f32(size.x);
+    let ty = (uv.y - dom.y) / dom.w * f32(size.y);
+    return vec2<i32>(
+        i32(clamp(tx, 0.0, f32(size.x) - 1.0)),
+        i32(clamp(ty, 0.0, f32(size.y) - 1.0)),
+    );
+}
 
 const PI: f32 = 3.14159265358979323846;
 const RAD_TO_DEG: f32 = 180.0 / PI;
@@ -64,18 +85,21 @@ fn clamp_i(v: i32, lo: i32, hi: i32) -> i32 {
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.size.x || gid.y >= params.size.y) { return; }
-    let x = i32(gid.x);
-    let y = i32(gid.y);
     let sx = i32(params.size.x);
     let sy = i32(params.size.y);
+    // Center texel in the source's bake domain, then ±1 source texels.
+    let uv = dom_uv(params.dom, gid.xy, params.size);
+    let c = dom_texel(params.dom_src, uv, params.size);
+    let x = c.x;
+    let y = c.y;
     let l_px = textureLoad(src, vec2<i32>(clamp_i(x + 1, 0, sx - 1), y), 0).x;
     let l_nx = textureLoad(src, vec2<i32>(clamp_i(x - 1, 0, sx - 1), y), 0).x;
     let l_py = textureLoad(src, vec2<i32>(x, clamp_i(y + 1, 0, sy - 1)), 0).x;
     let l_ny = textureLoad(src, vec2<i32>(x, clamp_i(y - 1, 0, sy - 1)), 0).x;
-    // Per-pixel finite difference converted to UV-space via multiplication
-    // by the resolution.
-    let dhdx = (l_px - l_nx) * f32(sx) * 0.5;
-    let dhdy = (l_py - l_ny) * f32(sy) * 0.5;
+    // Per-pixel finite difference converted to UV-space: one source texel
+    // spans ext/size UV units.
+    let dhdx = (l_px - l_nx) * f32(sx) / params.dom_src.z * 0.5;
+    let dhdy = (l_py - l_ny) * f32(sy) / params.dom_src.w * 0.5;
     var n = vec3<f32>(-dhdx * params.strength, -dhdy * params.strength, 1.0);
     let mag = max(length(n), 1e-30);
     n = n / mag;

@@ -3,7 +3,7 @@
 
 use texture_graph_core::{
     BlendMode, BlendSpace, Color, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion,
-    EvalCtx, Graph, HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims,
+    EdgeMode, EvalCtx, Graph, HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims,
     NoiseOutput, NoiseRange, Output, ScalarInput, Transform, color::to_srgb8,
 };
 
@@ -113,7 +113,7 @@ fn color_layer_matches_cpu_to_srgb8() {
     // Overwrite the auto-created base color's kind with a specific value.
     let base = graph.output.color;
     graph
-        .set_kind(base, LayerKind::Color(Color::new(0.6, 0.15, 40.0, 1.0)))
+        .set_kind(base.unwrap(), LayerKind::Color(Color::new(0.6, 0.15, 40.0, 1.0)))
         .unwrap();
     graph
         .set_output(Output {
@@ -175,7 +175,7 @@ fn noise_layer_has_variance_and_is_deterministic() {
     let base = graph.output.color;
     graph
         .set_kind(
-            base,
+            base.unwrap(),
             LayerKind::Noise(Noise {
                 dims: NoiseDims::D2,
                 seed_offset: 0,
@@ -212,13 +212,13 @@ fn mix_add_of_two_colors_matches_cpu() {
     let mut baker = Baker::new(ctx.clone());
     let mut graph = Graph::new();
     let a = graph.output.color;
-    graph.set_kind(a, LayerKind::Color(Color::new(0.4, 0.0, 0.0, 1.0))).unwrap();
+    graph.set_kind(a.unwrap(), LayerKind::Color(Color::new(0.4, 0.0, 0.0, 1.0))).unwrap();
     let b = graph.add_layer("b", LayerKind::Color(Color::new(0.3, 0.05, 30.0, 1.0))).unwrap();
     let mix = graph
         .add_layer(
             "mix",
             LayerKind::Mix(Mix {
-                a: Some(a),
+                a: Some(a.unwrap()),
                 b: Some(b),
                 mode: BlendMode::Add,
                 factor: ScalarInput::Const(0.5),
@@ -227,7 +227,7 @@ fn mix_add_of_two_colors_matches_cpu() {
         )
         .unwrap();
     graph.set_output(Output {
-        color: mix,
+        color: Some(mix),
         roughness: ScalarInput::Const(0.5),
         metallic: ScalarInput::Const(0.0),
         normal: None,
@@ -265,7 +265,7 @@ fn ramp_black_to_white_at_midpoint_is_gray() {
         )
         .unwrap();
     graph.set_output(Output {
-        color: ramp,
+        color: Some(ramp),
         roughness: ScalarInput::Const(0.5),
         metallic: ScalarInput::Const(0.0),
         normal: None,
@@ -297,7 +297,7 @@ fn ramp_with_layer_ref_stops_reads_from_source_layers() {
     let mut baker = Baker::new(ctx.clone());
     let mut graph = Graph::new();
     let black = graph.output.color;
-    graph.set_kind(black, LayerKind::Color(Color::new(0.0, 0.0, 0.0, 1.0))).unwrap();
+    graph.set_kind(black.unwrap(), LayerKind::Color(Color::new(0.0, 0.0, 0.0, 1.0))).unwrap();
     let white = graph
         .add_layer("white", LayerKind::Color(Color::new(1.0, 0.0, 0.0, 1.0)))
         .unwrap();
@@ -306,7 +306,7 @@ fn ramp_with_layer_ref_stops_reads_from_source_layers() {
             "ramp",
             LayerKind::ColorRamp(ColorRamp {
                 stops: vec![
-                    ColorStop { t: 0.0, color: ColorInput::Layer(black) },
+                    ColorStop { t: 0.0, color: ColorInput::Layer(black.unwrap()) },
                     ColorStop { t: 1.0, color: ColorInput::Layer(white) },
                 ],
                 space: BlendSpace::Oklch,
@@ -314,7 +314,7 @@ fn ramp_with_layer_ref_stops_reads_from_source_layers() {
         )
         .unwrap();
     graph.set_output(Output {
-        color: ramp,
+        color: Some(ramp),
         roughness: ScalarInput::Const(0.5),
         metallic: ScalarInput::Const(0.0),
         normal: None,
@@ -345,12 +345,12 @@ fn ramp_rejects_more_than_eight_unique_layer_stops() {
     let mut layer_ids = vec![graph.output.color];
     for i in 0..8u32 {
         layer_ids.push(
-            graph
+            Some(graph
                 .add_layer(
                     &format!("c{i}"),
                     LayerKind::Color(Color::new(0.1 * i as f32, 0.0, 0.0, 1.0)),
                 )
-                .unwrap(),
+                .unwrap()),
         );
     }
     let stops: Vec<_> = layer_ids
@@ -358,7 +358,7 @@ fn ramp_rejects_more_than_eight_unique_layer_stops() {
         .enumerate()
         .map(|(i, &id)| ColorStop {
             t: i as f32 / 8.0,
-            color: ColorInput::Layer(id),
+            color: ColorInput::Layer(id.unwrap()),
         })
         .collect();
     let ramp = graph
@@ -368,7 +368,7 @@ fn ramp_rejects_more_than_eight_unique_layer_stops() {
         )
         .unwrap();
     graph.set_output(Output {
-        color: ramp,
+        color: Some(ramp),
         roughness: ScalarInput::Const(0.5),
         metallic: ScalarInput::Const(0.0),
         normal: None,
@@ -386,19 +386,20 @@ fn transform_passthrough_of_color_is_identity() {
     let mut baker = Baker::new(ctx.clone());
     let mut graph = Graph::new();
     let c = graph.output.color;
-    graph.set_kind(c, LayerKind::Color(Color::new(0.5, 0.1, 20.0, 1.0))).unwrap();
+    graph.set_kind(c.unwrap(), LayerKind::Color(Color::new(0.5, 0.1, 20.0, 1.0))).unwrap();
     let t = graph.add_layer(
         "t",
         LayerKind::Transform(Transform {
-            source: Some(c),
+            source: Some(c.unwrap()),
             offset: [0.0, 0.0, 0.0],
             rotate_uv: 0.0,
             scale: [1.0, 1.0, 1.0],
             coord_mode: CoordMode::Passthrough,
+                edge_mode: EdgeMode::default(),
         }),
     ).unwrap();
     graph.set_output(Output {
-        color: t,
+        color: Some(t),
         roughness: ScalarInput::Const(0.5),
         metallic: ScalarInput::Const(0.0),
         normal: None,
@@ -419,7 +420,7 @@ fn map_gray_value_through_bw_ramp_matches_ramp_lookup() {
     let mut graph = Graph::new();
     // value layer: uniform L=0.5.
     let value = graph.output.color;
-    graph.set_kind(value, LayerKind::Color(Color::new(0.5, 0.0, 0.0, 1.0))).unwrap();
+    graph.set_kind(value.unwrap(), LayerKind::Color(Color::new(0.5, 0.0, 0.0, 1.0))).unwrap();
     // palette: black-to-white ramp.
     let palette = graph.add_layer(
         "palette",
@@ -433,10 +434,10 @@ fn map_gray_value_through_bw_ramp_matches_ramp_lookup() {
     ).unwrap();
     let map = graph.add_layer(
         "map",
-        LayerKind::Map(Map { value: Some(value), palette: Some(palette) }),
+        LayerKind::Map(Map { value: Some(value.unwrap()), palette: Some(palette) }),
     ).unwrap();
     graph.set_output(Output {
-        color: map,
+        color: Some(map),
         roughness: ScalarInput::Const(0.5),
         metallic: ScalarInput::Const(0.0),
         normal: None,
@@ -468,7 +469,7 @@ fn perf_fractal_stack_1024() {
     let base = graph.output.color;
     graph
         .set_kind(
-            base,
+            base.unwrap(),
             LayerKind::Noise(Noise {
                 dims: NoiseDims::D2,
                 seed_offset: 0,
@@ -494,18 +495,18 @@ fn perf_fractal_stack_1024() {
                 }),
             )
             .unwrap();
-        cur = graph
+        cur = Some(graph
             .add_layer(
                 &format!("sum-{octave}"),
                 LayerKind::Mix(Mix {
-                    a: Some(cur),
+                    a: Some(cur.unwrap()),
                     b: Some(n),
                     mode: BlendMode::Add,
                     factor: ScalarInput::Const(0.5),
                     space: BlendSpace::Oklch,
                 }),
             )
-            .unwrap();
+            .unwrap());
     }
     graph
         .set_output(Output {
@@ -548,7 +549,7 @@ fn min_max_by_luma_picks_brighter_pixel_whole() {
     let mut baker = Baker::new(ctx.clone());
     let mut graph = Graph::new();
     let dark = graph.output.color;
-    graph.set_kind(dark, LayerKind::Color(Color::new(0.2, 0.0, 0.0, 1.0))).unwrap();
+    graph.set_kind(dark.unwrap(), LayerKind::Color(Color::new(0.2, 0.0, 0.0, 1.0))).unwrap();
     let bright = graph
         .add_layer("bright", LayerKind::Color(Color::new(0.8, 0.15, 200.0, 1.0)))
         .unwrap();
@@ -556,7 +557,7 @@ fn min_max_by_luma_picks_brighter_pixel_whole() {
         .add_layer(
             "mm",
             LayerKind::MinMax(MinMax {
-                a: Some(dark),
+                a: Some(dark.unwrap()),
                 b: Some(bright),
                 mode: MinMaxMode::Max,
                 criterion: Criterion::Luma,
@@ -564,7 +565,7 @@ fn min_max_by_luma_picks_brighter_pixel_whole() {
         )
         .unwrap();
     graph.set_output(Output {
-        color: mm,
+        color: Some(mm),
         roughness: ScalarInput::Const(0.5),
         metallic: ScalarInput::Const(0.0),
         normal: None,
@@ -603,16 +604,16 @@ fn min_max_matches_cpu_over_all_criteria() {
         for &mode in &[MinMaxMode::Min, MinMaxMode::Max] {
             let mut graph = Graph::new();
             let a = graph.output.color;
-            graph.set_kind(a, LayerKind::Color(a_col)).unwrap();
+            graph.set_kind(a.unwrap(), LayerKind::Color(a_col)).unwrap();
             let b = graph.add_layer("b", LayerKind::Color(b_col)).unwrap();
             let mm = graph
                 .add_layer(
                     "mm",
-                    LayerKind::MinMax(MinMax { a: Some(a), b: Some(b), mode, criterion: crit }),
+                    LayerKind::MinMax(MinMax { a: Some(a.unwrap()), b: Some(b), mode, criterion: crit }),
                 )
                 .unwrap();
             graph.set_output(Output {
-                color: mm,
+                color: Some(mm),
                 roughness: ScalarInput::Const(0.5),
                 metallic: ScalarInput::Const(0.0),
                 normal: None,
@@ -649,19 +650,19 @@ fn min_max_by_alpha_picks_correct_layer() {
     for (mode, expected_l) in [(MinMaxMode::Max, 0.8), (MinMaxMode::Min, 0.2)] {
         let mut graph = Graph::new();
         let a = graph.output.color;
-        graph.set_kind(a, LayerKind::Color(low)).unwrap();
+        graph.set_kind(a.unwrap(), LayerKind::Color(low)).unwrap();
         let b = graph.add_layer(&format!("b-{mode:?}"), LayerKind::Color(high)).unwrap();
         let mm = graph
             .add_layer(
                 &format!("mm-{mode:?}"),
                 LayerKind::MinMax(MinMax {
-                    a: Some(a), b: Some(b), mode,
+                    a: Some(a.unwrap()), b: Some(b), mode,
                     criterion: Criterion::Alpha,
                 }),
             )
             .unwrap();
         graph.set_output(Output {
-            color: mm,
+            color: Some(mm),
             roughness: ScalarInput::Const(0.5),
             metallic: ScalarInput::Const(0.0),
             normal: None,
@@ -685,7 +686,7 @@ fn alpha_lt_one_shows_gray_checker_backing() {
     let mut baker = Baker::new(ctx.clone());
     let mut graph = Graph::new();
     let base = graph.output.color;
-    graph.set_kind(base, LayerKind::Color(Color::new(0.5, 0.0, 0.0, 0.5))).unwrap();
+    graph.set_kind(base.unwrap(), LayerKind::Color(Color::new(0.5, 0.0, 0.0, 0.5))).unwrap();
     graph.set_output(Output {
         color: base,
         roughness: ScalarInput::Const(0.5),
@@ -736,7 +737,7 @@ fn out_of_range_l_paints_magenta_black_checker() {
     let mut graph = Graph::new();
     let base = graph.output.color;
     graph
-        .set_kind(base, LayerKind::Color(Color::new(-0.5, 0.0, 0.0, 1.0)))
+        .set_kind(base.unwrap(), LayerKind::Color(Color::new(-0.5, 0.0, 0.0, 1.0)))
         .unwrap();
     graph.set_output(Output {
         color: base,
@@ -778,7 +779,7 @@ fn in_range_color_does_not_trigger_checker() {
     let mut graph = Graph::new();
     let base = graph.output.color;
     graph
-        .set_kind(base, LayerKind::Color(Color::new(0.6, 0.15, 40.0, 1.0)))
+        .set_kind(base.unwrap(), LayerKind::Color(Color::new(0.6, 0.15, 40.0, 1.0)))
         .unwrap();
     graph.set_output(Output {
         color: base,
@@ -806,7 +807,7 @@ fn bake_previews_returns_one_texture_per_authored_layer() {
     let mut baker = Baker::new(ctx.clone());
     let mut graph = Graph::new();
     let base = graph.output.color;
-    graph.set_kind(base, LayerKind::Color(Color::new(0.5, 0.0, 0.0, 1.0))).unwrap();
+    graph.set_kind(base.unwrap(), LayerKind::Color(Color::new(0.5, 0.0, 0.0, 1.0))).unwrap();
     let _b = graph.add_layer("b", LayerKind::Color(Color::new(0.3, 0.1, 60.0, 1.0))).unwrap();
     let _unreachable = graph
         .add_layer("dead", LayerKind::Color(Color::new(0.9, 0.05, 200.0, 1.0)))
@@ -828,9 +829,9 @@ fn h2n_on_flat_source_gives_flat_normal() {
     let mut baker = Baker::new(ctx.clone());
     let mut graph = Graph::new();
     let source = graph.output.color;
-    graph.set_kind(source, LayerKind::Color(Color::new(0.5, 0.0, 0.0, 1.0))).unwrap();
+    graph.set_kind(source.unwrap(), LayerKind::Color(Color::new(0.5, 0.0, 0.0, 1.0))).unwrap();
     let n = graph
-        .add_layer("n", LayerKind::HeightToNormal(HeightToNormal { source: Some(source), strength: 1.0 }))
+        .add_layer("n", LayerKind::HeightToNormal(HeightToNormal { source: Some(source.unwrap()), strength: 1.0 }))
         .unwrap();
     graph.set_output(Output {
         color: graph.output.color,
@@ -901,7 +902,7 @@ fn noise_signed_range_lifts_grays_around_50pct() {
     let base = graph.output.color;
     graph
         .set_kind(
-            base,
+            base.unwrap(),
             LayerKind::Noise(Noise {
                 dims: NoiseDims::D2,
                 seed_offset: 7,
@@ -934,7 +935,7 @@ fn null_inputs_render_missing_texture_grid() {
     let mut graph = Graph::new();
     let base = graph.output.color;
     graph
-        .set_kind(base, LayerKind::Map(Map { value: None, palette: None }))
+        .set_kind(base.unwrap(), LayerKind::Map(Map { value: None, palette: None }))
         .expect("null-input Map must not trip the cycle check");
     baker
         .bake_output(&graph, (64, 64), &EvalCtx::default(), false)
@@ -945,13 +946,14 @@ fn null_inputs_render_missing_texture_grid() {
     // magenta or black, and adjacent cells alternate.
     graph
         .set_kind(
-            base,
+            base.unwrap(),
             LayerKind::Transform(Transform {
                 source: None,
                 offset: [0.0; 3],
                 rotate_uv: 0.0,
                 scale: [1.0; 3],
                 coord_mode: CoordMode::Passthrough,
+                edge_mode: EdgeMode::default(),
             }),
         )
         .unwrap();
@@ -976,7 +978,7 @@ fn null_inputs_render_missing_texture_grid() {
     // CPU evaluator agrees pixel-for-pixel on the grid's layout.
     let cpu = texture_graph_core::evaluate(
         &graph,
-        base,
+        base.unwrap(),
         texture_graph_core::Sample::new(1.5 / 64.0, 1.5 / 64.0, 0.5),
         &EvalCtx::default(),
     );
@@ -986,4 +988,272 @@ fn null_inputs_render_missing_texture_grid() {
         cpu_px[0] > 235,
         "CPU and GPU disagree on cell color at (1,1): gpu={a:?} cpu={cpu_px:?}"
     );
+}
+
+#[test]
+fn null_output_color_bakes_missing_grid() {
+    // Disconnecting the Output's color socket is legal; the material's
+    // base color becomes the missing-texture grid instead of an error.
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+
+    let mut graph = Graph::new();
+    graph.output.color = None;
+    let out = baker
+        .bake_output(&graph, (64, 64), &EvalCtx::default(), false)
+        .expect("null output color bakes");
+
+    let px = readback_all_pixels(&ctx, &out.color, (64, 64));
+    let is_magenta = |p: &[u8; 4]| p[0] > 235 && p[1] < 20 && p[3] == 255;
+    let is_black = |p: &[u8; 4]| p[0] < 20 && p[1] < 20 && p[2] < 20 && p[3] == 255;
+    let magenta = px.iter().filter(|p| is_magenta(p)).count();
+    let black = px.iter().filter(|p| is_black(p)).count();
+    assert_eq!(
+        magenta + black,
+        px.len(),
+        "null output color must bake the magenta/black grid (magenta={magenta} black={black})"
+    );
+    assert!(magenta > 0 && black > 0, "grid should contain both colors");
+
+    // CPU material evaluation agrees.
+    let m = texture_graph_core::evaluate_material(
+        &graph,
+        texture_graph_core::Sample::new(1.5 / 64.0, 1.5 / 64.0, 0.5),
+        &EvalCtx::default(),
+    );
+    let cpu_px = texture_graph_core::color::to_srgb8(m.color);
+    assert_eq!(
+        is_magenta(&px[1 * 64 + 1]),
+        cpu_px[0] > 235,
+        "CPU and GPU disagree on the null-output grid at (1,1)"
+    );
+}
+
+/// Extend-mode transform: the source is baked over the transform's real
+/// sampling domain, so out-of-[0,1] samples hit real data and match CPU
+/// eval. The inner radial transform makes the field genuinely different
+/// from what Clamp mode would produce.
+#[test]
+fn extend_transform_matches_cpu_beyond_unit_square() {
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let ramp = graph.output.color.unwrap();
+    graph
+        .set_kind(
+            ramp,
+            LayerKind::ColorRamp(ColorRamp {
+                stops: vec![
+                    ColorStop { t: 0.0, color: ColorInput::Const(Color::new(0.05, 0.0, 0.0, 1.0)) },
+                    ColorStop { t: 1.0, color: ColorInput::Const(Color::new(0.95, 0.0, 0.0, 1.0)) },
+                ],
+                space: BlendSpace::Oklch,
+            }),
+        )
+        .unwrap();
+    let inner = graph
+        .add_layer(
+            "radial",
+            LayerKind::Transform(Transform {
+                source: Some(ramp),
+                offset: [0.0; 3],
+                rotate_uv: 0.0,
+                scale: [0.35, 0.35, 1.0],
+                coord_mode: CoordMode::Radial {
+                    dim: texture_graph_core::RadialDim::D2,
+                    into: texture_graph_core::Axis::U,
+                },
+                edge_mode: EdgeMode::Clamp,
+            }),
+        )
+        .unwrap();
+    let outer = graph
+        .add_layer(
+            "spread",
+            LayerKind::Transform(Transform {
+                source: Some(inner),
+                offset: [0.0; 3],
+                rotate_uv: 0.0,
+                scale: [2.0, 2.0, 1.0],
+                coord_mode: CoordMode::Passthrough,
+                edge_mode: EdgeMode::Extend,
+            }),
+        )
+        .unwrap();
+    graph
+        .set_output(Output {
+            color: Some(outer),
+            roughness: ScalarInput::Const(0.5),
+            metallic: ScalarInput::Const(0.0),
+            normal: None,
+        })
+        .unwrap();
+
+    const RES: u32 = 64;
+    let out = baker
+        .bake_output(&graph, (RES, RES), &EvalCtx::default(), false)
+        .expect("bake extend");
+    let px = readback_all_pixels(&ctx, &out.color, (RES, RES));
+    let ctx_eval = EvalCtx::default();
+    let mut max_delta = 0i32;
+    for y in 0..RES {
+        for x in 0..RES {
+            let u = (x as f32 + 0.5) / RES as f32;
+            let v = (y as f32 + 0.5) / RES as f32;
+            let m = texture_graph_core::evaluate_material(&graph, texture_graph_core::Sample::uv(u, v), &ctx_eval);
+            let expected = to_srgb8(m.color);
+            let got = px[(y * RES + x) as usize];
+            for i in 0..3 {
+                max_delta = max_delta.max((expected[i] as i32 - got[i] as i32).abs());
+            }
+        }
+    }
+    // Nearest-texel resampling across the widened domain quantizes the
+    // smooth field slightly; anything small proves extend samples real
+    // data (clamp-vs-extend differs by ~100+ sRGB steps mid-frame).
+    assert!(max_delta <= 14, "extend parity max delta {max_delta}");
+
+    // Sanity: switching the outer transform to Clamp changes the image.
+    graph
+        .set_kind(
+            outer,
+            LayerKind::Transform(Transform {
+                source: Some(inner),
+                offset: [0.0; 3],
+                rotate_uv: 0.0,
+                scale: [2.0, 2.0, 1.0],
+                coord_mode: CoordMode::Passthrough,
+                edge_mode: EdgeMode::Clamp,
+            }),
+        )
+        .unwrap();
+    let out_clamp = baker
+        .bake_output(&graph, (RES, RES), &EvalCtx::default(), false)
+        .expect("bake clamp");
+    let px_clamp = readback_all_pixels(&ctx, &out_clamp.color, (RES, RES));
+    let mid = ((RES / 2) * RES + RES - 4) as usize;
+    let diff = (px[mid][0] as i32 - px_clamp[mid][0] as i32).abs();
+    assert!(diff > 20, "extend and clamp should differ off the unit square (diff {diff})");
+}
+
+/// An affine extend is unbounded: scale 40 samples far past the old cap
+/// and still matches CPU eval (the ramp holds its end color out there).
+#[test]
+fn affine_extend_is_unbounded_and_matches_cpu() {
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let ramp = graph.output.color.unwrap();
+    graph
+        .set_kind(
+            ramp,
+            LayerKind::ColorRamp(ColorRamp {
+                stops: vec![
+                    ColorStop { t: 0.0, color: ColorInput::Const(Color::new(0.05, 0.0, 0.0, 1.0)) },
+                    ColorStop { t: 1.0, color: ColorInput::Const(Color::new(0.95, 0.0, 0.0, 1.0)) },
+                ],
+                space: BlendSpace::Oklch,
+            }),
+        )
+        .unwrap();
+    let t = graph
+        .add_layer(
+            "wide",
+            LayerKind::Transform(Transform {
+                source: Some(ramp),
+                offset: [0.0; 3],
+                rotate_uv: 0.0,
+                scale: [40.0, 1.0, 1.0],
+                coord_mode: CoordMode::Passthrough,
+                edge_mode: EdgeMode::Extend,
+            }),
+        )
+        .unwrap();
+    graph
+        .set_output(Output {
+            color: Some(t),
+            roughness: ScalarInput::Const(0.5),
+            metallic: ScalarInput::Const(0.0),
+            normal: None,
+        })
+        .unwrap();
+    let out = baker.bake_output(&graph, SIZE, &EvalCtx::default(), false).expect("bake");
+    let px = readback_all_pixels(&ctx, &out.color, SIZE);
+    let ctx_eval = EvalCtx::default();
+    // Skip the leftmost columns where the ramp's [0, 1] span falls between
+    // texels of the 40-wide bake; from u=40*x/W > 1 on it's the held end
+    // color, which must match CPU exactly — and must NOT be the grid.
+    for y in 0..SIZE.1 {
+        for x in 4..SIZE.0 {
+            let u = (x as f32 + 0.5) / SIZE.0 as f32;
+            let v = (y as f32 + 0.5) / SIZE.1 as f32;
+            let m = texture_graph_core::evaluate_material(&graph, texture_graph_core::Sample::uv(u, v), &ctx_eval);
+            let expected = to_srgb8(m.color);
+            let got = px[(y * SIZE.0 + x) as usize];
+            for i in 0..3 {
+                let d = (expected[i] as i32 - got[i] as i32).abs();
+                assert!(
+                    d <= 2,
+                    "affine extend parity at ({x},{y}) ch{i}: expect {} got {}",
+                    expected[i], got[i]
+                );
+            }
+        }
+    }
+}
+
+/// Radial extend past core's EXTEND_LIMIT cap renders the missing grid,
+/// exactly as CPU eval does.
+#[test]
+fn radial_extend_past_limit_shows_missing_grid_like_cpu() {
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let c = graph.output.color.unwrap();
+    let t = graph
+        .add_layer(
+            "wild",
+            LayerKind::Transform(Transform {
+                source: Some(c),
+                offset: [0.0; 3],
+                rotate_uv: 0.0,
+                scale: [40.0, 1.0, 1.0],
+                coord_mode: CoordMode::Radial {
+                    dim: texture_graph_core::RadialDim::D2,
+                    into: texture_graph_core::Axis::U,
+                },
+                edge_mode: EdgeMode::Extend,
+            }),
+        )
+        .unwrap();
+    graph
+        .set_output(Output {
+            color: Some(t),
+            roughness: ScalarInput::Const(0.5),
+            metallic: ScalarInput::Const(0.0),
+            normal: None,
+        })
+        .unwrap();
+    let out = baker.bake_output(&graph, SIZE, &EvalCtx::default(), false).expect("bake");
+    let px = readback_all_pixels(&ctx, &out.color, SIZE);
+    let ctx_eval = EvalCtx::default();
+    // Right half of the frame samples far past the cap on both CPU and
+    // GPU — compare pixels there exactly (same checker formula).
+    for y in 0..SIZE.1 {
+        for x in (SIZE.0 / 2)..SIZE.0 {
+            let u = (x as f32 + 0.5) / SIZE.0 as f32;
+            let v = (y as f32 + 0.5) / SIZE.1 as f32;
+            let m = texture_graph_core::evaluate_material(&graph, texture_graph_core::Sample::uv(u, v), &ctx_eval);
+            let expected = to_srgb8(m.color);
+            let got = px[(y * SIZE.0 + x) as usize];
+            for i in 0..3 {
+                let d = (expected[i] as i32 - got[i] as i32).abs();
+                assert!(
+                    d <= 2,
+                    "missing-grid parity at ({x},{y}) ch{i}: expect {} got {}",
+                    expected[i], got[i]
+                );
+            }
+        }
+    }
 }

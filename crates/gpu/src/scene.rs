@@ -1,5 +1,5 @@
 //! 3D preview renderer. Takes a `BakeOutput` (color / roughness / metallic
-//! / normal textures) and draws a lit mesh — sphere or cube — into a small
+//! / normal textures) and draws a lit mesh — sphere, cube, or quad — into a small
 //! `Rgba8Unorm` texture ready for the UI to hand to egui-wgpu.
 //!
 //! One directional light, Cook-Torrance BRDF, tangent-space normal mapping,
@@ -17,6 +17,9 @@ use crate::device::DeviceCtx;
 pub enum SceneShape {
     Sphere,
     Cube,
+    /// A 1×1 quad lying flat on the ground (XZ plane, normal +Y) — a lit
+    /// 3D view of the flat material, viewed from a raised angle.
+    Quad,
 }
 
 /// What the mesh is textured with.
@@ -106,6 +109,7 @@ pub struct SceneRenderer {
     sampler:  wgpu::Sampler,
     sphere:   Mesh,
     cube:     Mesh,
+    quad:     Mesh,
 }
 
 impl SceneRenderer {
@@ -144,6 +148,7 @@ impl SceneRenderer {
 
         let sphere = build_mesh(device, &sphere_verts_indices(48, 24), "sphere");
         let cube   = build_mesh(device, &cube_verts_indices(),        "cube");
+        let quad   = build_mesh(device, &quad_verts_indices(),        "quad");
 
         Self {
             pipeline_uv,
@@ -154,6 +159,7 @@ impl SceneRenderer {
             sampler,
             sphere,
             cube,
+            quad,
         }
     }
 
@@ -207,12 +213,13 @@ impl SceneRenderer {
         let mesh = match shape {
             SceneShape::Sphere => &self.sphere,
             SceneShape::Cube   => &self.cube,
+            SceneShape::Quad   => &self.quad,
         };
         // Object-space → [0,1]³ texture-space scale for solid sampling.
-        // Sphere spans [-1,1] (radius 1); cube spans [-0.5,0.5].
+        // Sphere spans [-1,1] (radius 1); cube and quad span [-0.5,0.5].
         let obj_scale = match shape {
             SceneShape::Sphere => 0.5f32,
-            SceneShape::Cube   => 1.0f32,
+            SceneShape::Cube | SceneShape::Quad => 1.0f32,
         };
 
         let aspect  = size.0 as f32 / size.1 as f32;
@@ -496,6 +503,26 @@ fn cube_verts_indices() -> (Vec<Vertex>, Vec<u32>) {
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
     (verts, indices)
+}
+
+/// A 1×1 quad lying flat on the ground: XZ plane at Y = 0, spanning
+/// [-0.5, 0.5] on both axes, normal +Y, tangent +X. Corners and winding
+/// mirror the cube's +Y (top) face, so it's CCW as viewed from above and
+/// its normal-map handedness matches the cube's top.
+fn quad_verts_indices() -> (Vec<Vertex>, Vec<u32>) {
+    let normal = [0.0, 1.0, 0.0];
+    let tangent = [1.0, 0.0, 0.0, 1.0];
+    let corners: [([f32; 3], [f32; 2]); 4] = [
+        ([-0.5, 0.0,  0.5], [0.0, 1.0]),
+        ([ 0.5, 0.0,  0.5], [1.0, 1.0]),
+        ([ 0.5, 0.0, -0.5], [1.0, 0.0]),
+        ([-0.5, 0.0, -0.5], [0.0, 0.0]),
+    ];
+    let verts = corners
+        .iter()
+        .map(|(pos, uv)| Vertex { pos: *pos, normal, tangent, uv: *uv })
+        .collect();
+    (verts, vec![0, 1, 2, 0, 2, 3])
 }
 
 fn filterable_texture(

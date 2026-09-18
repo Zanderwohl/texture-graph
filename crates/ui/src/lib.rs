@@ -7,6 +7,7 @@ pub mod file_io;
 pub mod panels;
 pub mod previews;
 pub mod state;
+pub mod util;
 pub mod widgets;
 
 pub use app::TextureGraphApp;

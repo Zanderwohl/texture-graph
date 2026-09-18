@@ -4,12 +4,12 @@
 // recenter → rotate in UV → per-axis scale → coord_mode (Passthrough,
 // Permute, or Radial).
 //
-// GPU limitation: the source texture only holds data for [0, 1]² of the
-// input domain (the resolution of the current bake). Sampling at
-// out-of-range coords clamps to the texture edge — CPU eval would recurse
-// into the source with the actual out-of-range sample, giving different
-// results for e.g. Noise at coords > 1. Tileable inputs are unaffected by
-// the clamp. Documented deviation from CPU.
+// Edge modes (mirroring `eval_transform` in `core::eval`):
+// - Clamp: transformed U/V pin to the [0, 1] square.
+// - Extend: the scheduler bakes the source over the UV rectangle this
+//   transform actually samples (capped at core's EXTEND_LIMIT box), so
+//   out-of-[0,1] samples land on real data; anything outside the source's
+//   baked domain shows the missing-texture grid.
 
 struct TransformParams {
     size: vec2<u32>,
@@ -21,12 +21,40 @@ struct TransformParams {
     radial_dim: u32,     // 0=D2, 1=D3
     radial_into: u32,    // 0=U, 1=V, 2=W
     w_coord: f32,        // third texture coordinate; 0.5 for flat bakes
-    _pad: u32,
+    edge_mode: u32,      // 0=Clamp, 1=Extend
+    dom: vec4<f32>,      // own bake domain (min_u, min_v, ext_u, ext_v)
+    src_dom: vec4<f32>,  // source's bake domain
 }
 
 @group(0) @binding(0) var<uniform> params: TransformParams;
 @group(0) @binding(1) var out_tex: texture_storage_2d<rgba32float, write>;
 @group(0) @binding(2) var src: texture_2d<f32>;
+
+// Nearest texel of `uv` in the source baked over `dom`, edge-clamped.
+fn dom_texel(dom: vec4<f32>, uv: vec2<f32>, size: vec2<u32>) -> vec2<i32> {
+    let tx = (uv.x - dom.x) / dom.z * f32(size.x);
+    let ty = (uv.y - dom.y) / dom.w * f32(size.y);
+    return vec2<i32>(
+        i32(clamp(tx, 0.0, f32(size.x) - 1.0)),
+        i32(clamp(ty, 0.0, f32(size.y) - 1.0)),
+    );
+}
+
+// The missing-texture grid at a sample point — mirrors `missing_texture`
+// in core::eval and missing.wgsl (16 cells/unit, magenta/black, 3D).
+const MISSING_CELLS: f32 = 16.0;
+
+fn missing_color(p: vec3<f32>) -> vec4<f32> {
+    let cell = vec3<i32>(
+        i32(floor(p.x * MISSING_CELLS)),
+        i32(floor(p.y * MISSING_CELLS)),
+        i32(floor(p.z * MISSING_CELLS)),
+    );
+    if (((cell.x + cell.y + cell.z) % 2 + 2) % 2 == 0) {
+        return vec4<f32>(0.7017, 0.3223, 328.36, 1.0);
+    }
+    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+}
 
 fn pick_axis(a: u32, uvw: vec3<f32>) -> f32 {
     switch a {
@@ -84,13 +112,22 @@ fn apply_transform(u_in: f32, v_in: f32, w_in: f32) -> vec3<f32> {
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.size.x || gid.y >= params.size.y) { return; }
     let coord = vec2<i32>(i32(gid.x), i32(gid.y));
-    let u = (f32(gid.x) + 0.5) / f32(params.size.x);
-    let v = (f32(gid.y) + 0.5) / f32(params.size.y);
+    let u = params.dom.x + (f32(gid.x) + 0.5) / f32(params.size.x) * params.dom.z;
+    let v = params.dom.y + (f32(gid.y) + 0.5) / f32(params.size.y) * params.dom.w;
     let w = params.w_coord;
     let t = apply_transform(u, v, w);
-    // Sample source at t.uv; clamped to [0, size).
-    let sx = clamp(t.x * f32(params.size.x), 0.0, f32(params.size.x) - 1.0);
-    let sy = clamp(t.y * f32(params.size.y), 0.0, f32(params.size.y) - 1.0);
-    let src_px = textureLoad(src, vec2<i32>(i32(sx), i32(sy)), 0);
+    var src_px: vec4<f32>;
+    if (params.edge_mode == 0u) {
+        // Clamp: pin to the unit square, then sample the source there.
+        let cuv = vec2<f32>(clamp(t.x, 0.0, 1.0), clamp(t.y, 0.0, 1.0));
+        src_px = textureLoad(src, dom_texel(params.src_dom, cuv, params.size), 0);
+    } else if (t.x < params.src_dom.x || t.x > params.src_dom.x + params.src_dom.z ||
+               t.y < params.src_dom.y || t.y > params.src_dom.y + params.src_dom.w) {
+        // Extend, but past what the source's bake covers (the request was
+        // capped): the missing grid, at the transformed sample point.
+        src_px = missing_color(t);
+    } else {
+        src_px = textureLoad(src, dom_texel(params.src_dom, t.xy, params.size), 0);
+    }
     textureStore(out_tex, coord, src_px);
 }

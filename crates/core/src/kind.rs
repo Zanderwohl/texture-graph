@@ -32,6 +32,10 @@ impl LayerKind {
 
     /// Every layer this node depends on, for cycle detection and
     /// invalidation.
+    ///
+    /// Keep in sync with [`LayerKind::input_sockets`] in socket.rs — a
+    /// fully-connected node must report the same ids in the same order
+    /// from both.
     pub fn inputs(&self) -> Vec<LayerId> {
         let mut out = Vec::new();
         let push_color = |out: &mut Vec<LayerId>, ci: ColorInput| {
@@ -150,7 +154,34 @@ pub struct Transform {
     pub rotate_uv: f32,
     pub scale: [f32; 3],
     pub coord_mode: CoordMode,
+    /// What happens when the transformed sample leaves the [0, 1] UV
+    /// square. Absent in older files, defaulting to `Clamp`.
+    #[serde(default)]
+    pub edge_mode: EdgeMode,
 }
+
+/// Out-of-[0,1] sampling policy for [`Transform`], on the U/V axes.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum EdgeMode {
+    /// Transformed U/V clamp to the [0, 1] edge.
+    #[default]
+    Clamp,
+    /// Sample beyond [0, 1]: procedural sources (noise etc.) extend
+    /// naturally. Affine mappings (passthrough/permute) extend without
+    /// limit — the sampled region is known exactly, so sources are baked
+    /// over it. Radial mappings are bounded by
+    /// [`EXTEND_LIMIT`](crate::EXTEND_LIMIT); beyond that — or where a
+    /// baked source can't cover the request — the missing-texture grid
+    /// shows.
+    Extend,
+}
+
+/// How far a *radial* [`EdgeMode::Extend`] transform may sample from the
+/// unit square's center (0.5) on each of U and V: coordinates within
+/// `[0.5 - EXTEND_LIMIT, 0.5 + EXTEND_LIMIT]` are valid, anything outside
+/// renders as the missing-texture grid. Affine (passthrough/permute)
+/// extends are exact and unbounded.
+pub const EXTEND_LIMIT: f32 = 8.0;
 
 /// Final axis remapping applied after affine transform.
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]

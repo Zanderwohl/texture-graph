@@ -18,6 +18,7 @@ struct NoiseParams {
     seed_base: u32,       // ctx.seed + seed_offset
     frequency: f32,
     w_coord: f32,         // third texture coordinate; 0.5 for flat bakes
+    dom: vec4<f32>,       // bake domain (min_u, min_v, ext_u, ext_v)
 }
 
 @group(0) @binding(0) var<uniform> params: NoiseParams;
@@ -198,9 +199,9 @@ const CHROMA_SCALE: f32 = 0.15;
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.size.x || gid.y >= params.size.y) { return; }
-    // Pixel-center sample coordinates in [0, 1].
-    let u = (f32(gid.x) + 0.5) / f32(params.size.x);
-    let v = (f32(gid.y) + 0.5) / f32(params.size.y);
+    // Pixel-center sample coordinates within the bake domain.
+    let u = params.dom.x + (f32(gid.x) + 0.5) / f32(params.size.x) * params.dom.z;
+    let v = params.dom.y + (f32(gid.y) + 0.5) / f32(params.size.y) * params.dom.w;
     let w = params.w_coord;
 
     if (params.output_mode == 0u) {

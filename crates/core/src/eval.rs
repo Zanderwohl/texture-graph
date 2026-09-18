@@ -6,9 +6,9 @@ use crate::color::{Color, blend, normal_to_color, scalar_of};
 use crate::graph::{Graph, Layer};
 use crate::id::LayerId;
 use crate::kind::{
-    Axis, BlendMode, ColorInput, ColorRamp, CoordMode, Criterion, HeightToNormal, LayerKind,
-    Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims, NoiseOutput, NoiseRange, RadialDim,
-    ScalarInput, Transform,
+    Axis, BlendMode, ColorInput, ColorRamp, CoordMode, Criterion, EXTEND_LIMIT, EdgeMode,
+    HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims, NoiseOutput,
+    NoiseRange, RadialDim, ScalarInput, Transform,
 };
 
 /// A sample point in the graph's canonical unit cube. Consumers of the
@@ -57,7 +57,7 @@ pub struct Material {
 pub fn evaluate_material(g: &Graph, s: Sample, ctx: &EvalCtx) -> Material {
     let by_id: HashMap<LayerId, &Layer> = g.layers.iter().map(|l| (l.id, l)).collect();
     let out = &g.output;
-    let color = eval_layer(out.color, s, &by_id, ctx);
+    let color = eval_opt(out.color, s, &by_id, ctx);
     let roughness = eval_scalar(&out.roughness, s, &by_id, ctx);
     let metallic = eval_scalar(&out.metallic, s, &by_id, ctx);
     let normal = match out.normal {
@@ -83,7 +83,7 @@ fn eval_layer(id: LayerId, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &Ev
         LayerKind::Color(c) => *c,
         LayerKind::Noise(n) => eval_noise(n, s, ctx),
         LayerKind::ColorRamp(r) => eval_ramp(r, s, by_id, ctx),
-        LayerKind::Transform(t) => eval_opt(t.source, apply_transform(t, s), by_id, ctx),
+        LayerKind::Transform(t) => eval_transform(t, s, by_id, ctx),
         LayerKind::Mix(m) => eval_mix(m, s, by_id, ctx),
         LayerKind::Map(m) => eval_map(m, s, by_id, ctx),
         LayerKind::MinMax(mm) => eval_min_max(mm, s, by_id, ctx),
@@ -174,9 +174,9 @@ fn eval_noise(n: &Noise, s: Sample, ctx: &EvalCtx) -> Color {
 }
 
 fn eval_ramp(r: &ColorRamp, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &EvalCtx) -> Color {
-    // Domain: `s.u`, unclamped. Extrapolation off either end uses the
-    // outermost segment's slope (equivalent to using the first/last stop as
-    // the neighbor).
+    // Domain: `s.u`. Off either end the ramp holds the outermost stop's
+    // color (t clamped to [0, 1]) — a first stop at 0.3 paints [0, 0.3]
+    // with its own color, and likewise past the last stop.
     debug_assert!(r.stops.len() >= 2, "ramp validation should reject <2 stops");
     // Find the segment containing s.u.
     let mut lo_idx = 0usize;
@@ -203,10 +203,45 @@ fn eval_ramp(r: &ColorRamp, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &E
     let a = &r.stops[lo_idx];
     let b = &r.stops[hi_idx];
     let span = b.t - a.t;
-    let t = if span.abs() < f32::EPSILON { 0.0 } else { (s.u - a.t) / span };
+    let t = if span.abs() < f32::EPSILON {
+        0.0
+    } else {
+        ((s.u - a.t) / span).clamp(0.0, 1.0)
+    };
     let ca = eval_color_input(&a.color, s, by_id, ctx);
     let cb = eval_color_input(&b.color, s, by_id, ctx);
     blend(ca, cb, t, r.space)
+}
+
+/// Transform, then apply the edge policy to the resulting U/V:
+/// `Clamp` pins them to the [0, 1] square (matching a baked texture's
+/// edge clamp); `Extend` samples the source at the true coordinates.
+/// Affine mappings extend without limit (the GPU bakes sources over the
+/// exact requested region); radial mappings render the missing grid
+/// beyond the [`EXTEND_LIMIT`] box, matching the GPU's conservative cap.
+fn eval_transform(
+    t: &Transform,
+    s: Sample,
+    by_id: &HashMap<LayerId, &Layer>,
+    ctx: &EvalCtx,
+) -> Color {
+    let ts = apply_transform(t, s);
+    match t.edge_mode {
+        EdgeMode::Clamp => {
+            let clamped = Sample::new(ts.u.clamp(0.0, 1.0), ts.v.clamp(0.0, 1.0), ts.w);
+            eval_opt(t.source, clamped, by_id, ctx)
+        }
+        EdgeMode::Extend => {
+            let lo = 0.5 - EXTEND_LIMIT;
+            let hi = 0.5 + EXTEND_LIMIT;
+            let capped = matches!(t.coord_mode, CoordMode::Radial { .. });
+            if capped && (ts.u < lo || ts.u > hi || ts.v < lo || ts.v > hi) {
+                missing_texture(ts)
+            } else {
+                eval_opt(t.source, ts, by_id, ctx)
+            }
+        }
+    }
 }
 
 fn apply_transform(t: &Transform, s: Sample) -> Sample {
@@ -415,5 +450,93 @@ mod tests {
             }),
         );
         assert!(matches!(err, Err(crate::graph::GraphError::Cycle(_))));
+    }
+
+    /// A u-gradient ramp under a scaling Transform, for edge-mode tests.
+    fn ramp_under_transform(edge_mode: EdgeMode, scale_u: f32) -> (Graph, LayerId) {
+        let mut g = Graph::new();
+        let ramp = g
+            .add_layer(
+                "ramp",
+                LayerKind::ColorRamp(ColorRamp {
+                    stops: vec![
+                        ColorStop { t: 0.0, color: ColorInput::Const(oklcha(0.0, 0.0, 0.0, 1.0)) },
+                        ColorStop { t: 1.0, color: ColorInput::Const(oklcha(1.0, 0.0, 0.0, 1.0)) },
+                    ],
+                    space: BlendSpace::Oklch,
+                }),
+            )
+            .unwrap();
+        let t = g
+            .add_layer(
+                "xform",
+                LayerKind::Transform(Transform {
+                    source: Some(ramp),
+                    offset: [0.0; 3],
+                    rotate_uv: 0.0,
+                    scale: [scale_u, 1.0, 1.0],
+                    coord_mode: CoordMode::Passthrough,
+                    edge_mode,
+                }),
+            )
+            .unwrap();
+        (g, t)
+    }
+
+    #[test]
+    fn transform_clamp_pins_uv_to_unit_square() {
+        let (g, t) = ramp_under_transform(EdgeMode::Clamp, 4.0);
+        let by_id: HashMap<LayerId, &Layer> = g.layers.iter().map(|l| (l.id, l)).collect();
+        let ctx = EvalCtx::default();
+        // u=0.5 transforms to 2.0 -> clamps to 1.0 -> ramp's white end.
+        let c = eval_layer(t, Sample::uv(0.5, 0.5), &by_id, &ctx);
+        assert!((c.l - 1.0).abs() < 1e-4, "expected clamped end color, got L={}", c.l);
+    }
+
+    #[test]
+    fn transform_extend_samples_beyond_unit_square() {
+        let (g, t) = ramp_under_transform(EdgeMode::Extend, 4.0);
+        let by_id: HashMap<LayerId, &Layer> = g.layers.iter().map(|l| (l.id, l)).collect();
+        let ctx = EvalCtx::default();
+        // u=0.5 -> 2.0: the ramp holds its end color past t=1, and extend
+        // actually reaches it (not the missing grid).
+        let c = eval_layer(t, Sample::uv(0.5, 0.5), &by_id, &ctx);
+        assert!((c.l - 1.0).abs() < 1e-4);
+        assert!(c.chroma.abs() < 1e-4, "should be the ramp color, not the magenta grid");
+    }
+
+    #[test]
+    fn transform_extend_affine_is_unbounded() {
+        let (g, t) = ramp_under_transform(EdgeMode::Extend, 40.0);
+        let by_id: HashMap<LayerId, &Layer> = g.layers.iter().map(|l| (l.id, l)).collect();
+        let ctx = EvalCtx::default();
+        // u=0.9 -> 36.0, far past EXTEND_LIMIT — an affine extend still
+        // samples the source (which holds its end color), never the grid.
+        let c = eval_layer(t, Sample::uv(0.9, 0.5), &by_id, &ctx);
+        assert!((c.l - 1.0).abs() < 1e-4, "expected held end color, got L={}", c.l);
+        assert!(c.chroma.abs() < 1e-4, "should be the ramp color, not the magenta grid");
+    }
+
+    #[test]
+    fn transform_extend_radial_caps_at_limit() {
+        let (mut g, t) = ramp_under_transform(EdgeMode::Extend, 40.0);
+        let radial = Transform {
+            source: g.layers.iter().find(|l| l.name == "ramp").map(|l| l.id),
+            offset: [0.0; 3],
+            rotate_uv: 0.0,
+            scale: [40.0, 1.0, 1.0],
+            coord_mode: CoordMode::Radial { dim: crate::RadialDim::D2, into: Axis::U },
+            edge_mode: EdgeMode::Extend,
+        };
+        g.set_kind(t, LayerKind::Transform(radial)).unwrap();
+        let by_id: HashMap<LayerId, &Layer> = g.layers.iter().map(|l| (l.id, l)).collect();
+        let ctx = EvalCtx::default();
+        // u=0.9 -> radius ~36, past EXTEND_LIMIT: radial extends cap, so
+        // the missing checker shows.
+        let ts = apply_transform(&radial, Sample::uv(0.9, 0.5));
+        assert!(ts.u > 0.5 + EXTEND_LIMIT);
+        let expected = missing_texture(ts);
+        let c = eval_layer(t, Sample::uv(0.9, 0.5), &by_id, &ctx);
+        assert!((c.l - expected.l).abs() < 1e-5 && (c.chroma - expected.chroma).abs() < 1e-5);
     }
 }

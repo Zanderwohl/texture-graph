@@ -16,6 +16,7 @@ pub mod file;
 pub mod graph;
 pub mod id;
 pub mod kind;
+pub mod socket;
 
 pub use color::{BlendSpace, Color};
 pub use eval::{EvalCtx, Material, Sample, evaluate, evaluate_material};
@@ -26,7 +27,8 @@ pub use file::{
 pub use graph::{Canvas, Graph, GraphError, Layer, Output};
 pub use id::LayerId;
 pub use kind::{
-    Axis, BlendMode, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion, HeightToNormal,
-    LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims, NoiseOutput, NoiseRange,
-    RadialDim, ScalarInput, Transform,
+    Axis, BlendMode, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion, EXTEND_LIMIT,
+    EdgeMode, HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims,
+    NoiseOutput, NoiseRange, RadialDim, ScalarInput, Transform,
 };
+pub use socket::{ConstValue, InputKey, InputSocket, SocketError, SocketValue};

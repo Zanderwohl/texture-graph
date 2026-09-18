@@ -3,12 +3,13 @@
 
 use texture_graph_core::color::oklcha;
 use texture_graph_core::{
-    Axis, BlendMode, BlendSpace, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion, Graph,
+    Axis, BlendMode, BlendSpace, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion, EdgeMode, Graph,
     HeightToNormal, LayerId, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims,
     NoiseOutput, NoiseRange, RadialDim, ScalarInput, Transform,
 };
 
 use crate::state::{EditCmd, UiState};
+use crate::widgets::enum_combo::enum_combo;
 use crate::widgets::{color_edit, layer_ref};
 
 const VARIANTS: &[VariantSpec] = &[
@@ -121,6 +122,7 @@ pub fn default_kind(variant: &str, _graph: &Graph) -> LayerKind {
             rotate_uv: 0.0,
             scale: [1.0; 3],
             coord_mode: CoordMode::Passthrough,
+                edge_mode: EdgeMode::default(),
         }),
         "Mix" => LayerKind::Mix(Mix {
             a: None,
@@ -512,34 +514,3 @@ fn vec3_drag(ui: &mut egui::Ui, label: &str, v: &mut [f32; 3], speed: f32) -> bo
     changed
 }
 
-/// Labelled enum combo. `id_salt` must uniquely identify this widget's slot
-/// (typically `(layer_id.0, "field")`) so egui's per-widget memory doesn't
-/// bleed between two combos with the same visible label.
-fn enum_combo<T: Copy + PartialEq>(
-    ui: &mut egui::Ui,
-    id_salt: impl std::hash::Hash + std::fmt::Debug,
-    label: &str,
-    current: &mut T,
-    options: &[T],
-    to_label: impl Fn(T) -> &'static str,
-) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.label(label);
-        egui::ComboBox::from_id_salt(id_salt)
-            .selected_text(to_label(*current))
-            .show_ui(ui, |ui| {
-                for &opt in options {
-                    if ui
-                        .selectable_label(*current == opt, to_label(opt))
-                        .clicked()
-                        && *current != opt
-                    {
-                        *current = opt;
-                        changed = true;
-                    }
-                }
-            });
-    });
-    changed
-}

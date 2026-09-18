@@ -1,10 +1,11 @@
 //! Right panel: preview of the graph's `Output`.
 //!
-//! Three display modes selected by dropdown:
+//! Display modes selected by dropdown:
 //! - **Flat** — the four PBR channels shown as flat textures, channel
 //!   selected by a second dropdown (existing behavior).
-//! - **Sphere** / **Cube** — a lit 3D preview via the `SceneRenderer`
-//!   (Cook-Torrance BRDF, tangent-space normal mapping, auto-spin).
+//! - **Quad** / **Sphere** / **Cube** — a lit 3D preview via the
+//!   `SceneRenderer` (Cook-Torrance BRDF, tangent-space normal mapping,
+//!   auto-spin). Quad is a 1×1 ground plane — the flat material in 3D.
 //!
 //! Under the hood: the Baker always produces the four material textures.
 //! In Flat mode they're registered directly with egui-wgpu; in 3D modes
@@ -15,15 +16,19 @@
 
 use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
 use texture_graph_core::color::to_srgb8;
-use texture_graph_core::{EvalCtx, Graph, Sample, evaluate_material};
+use texture_graph_core::{
+    EvalCtx, Graph, LayerId, Output, Sample, ScalarInput, evaluate_material,
+};
 use texture_graph_gpu::{SceneCamera, SceneMaterial, SceneShape, VolumeOutput};
 
 use crate::app::GpuBits;
 use crate::state::UiState;
 
-/// Resolution (per axis) of the solid-texture volume bake. 64³ Rgba8 is
-/// 1 MiB per channel — cheap enough to rebake on every graph edit.
-const VOLUME_RES: u32 = 64;
+/// Cap (per axis) on the solid-texture volume bake, which follows the
+/// preview size buttons. Volume memory is cubic — 256³ Rgba8 is 64 MiB
+/// per channel, where a hypothetical 1024³ would be 4 GiB — so past the
+/// cap the buttons only sharpen the viewport render target.
+const VOLUME_RES_CAP: u32 = 256;
 
 pub struct PreviewPanelState {
     pub texture: Option<TextureHandle>,
@@ -50,6 +55,9 @@ pub struct PreviewPanelState {
     /// product now and the other lazily when the user switches to it.
     channels_stale: bool,
     volume_stale: bool,
+    /// Preview target rendered last frame; a change invalidates both bake
+    /// products so switching what a node previews rebakes immediately.
+    last_preview_target: Option<LayerId>,
 }
 
 pub struct GpuChannels {
@@ -88,8 +96,18 @@ pub enum PreviewChannel {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum PreviewShape {
     Flat,
+    /// 1×1 ground quad — the flat material shown lit in 3D.
+    Quad,
     Sphere,
     Cube,
+}
+
+impl PreviewShape {
+    /// Whether this shape is drawn by the 3D scene renderer (everything
+    /// except `Flat`, which blits the baked channel textures directly).
+    fn is_3d(self) -> bool {
+        !matches!(self, PreviewShape::Flat)
+    }
 }
 
 impl PreviewPanelState {
@@ -108,8 +126,24 @@ impl PreviewPanelState {
             auto_spin: true,
             channels_stale: false,
             volume_stale: false,
+            last_preview_target: None,
         }
     }
+}
+
+/// Build the graph the preview renders for a single-node "Preview": the
+/// node's color as albedo, with default roughness/metallic/normal (a plain
+/// lit look, not the graph's real PBR channels). The Output-node preview
+/// uses the real graph unchanged.
+fn preview_graph(graph: &Graph, id: LayerId) -> Graph {
+    let mut g = graph.clone();
+    g.output = Output {
+        color: Some(id),
+        roughness: ScalarInput::Const(0.5),
+        metallic: ScalarInput::Const(0.0),
+        normal: None,
+    };
+    g
 }
 
 pub fn show(
@@ -120,6 +154,25 @@ pub fn show(
     eval_ctx: &EvalCtx,
     mut gpu: Option<&mut GpuBits>,
 ) {
+    // Resolve the preview target. A layer target shows just that node's
+    // color; the Output node (`None`) shows the full material. A deleted
+    // target (its layer removed) falls back to the full material.
+    let preview_target = state.preview_target.filter(|id| graph.contains(*id));
+    state.preview_target = preview_target;
+    if preview.last_preview_target != preview_target {
+        preview.last_preview_target = preview_target;
+        preview.channels_stale = true;
+        preview.volume_stale = true;
+    }
+    let effective_graph;
+    let graph: &Graph = match preview_target {
+        Some(id) => {
+            effective_graph = preview_graph(graph, id);
+            &effective_graph
+        }
+        None => graph,
+    };
+
     ui.horizontal(|ui| {
         ui.heading("Preview");
         ui.add_space(8.0);
@@ -130,6 +183,7 @@ pub fn show(
             .show_ui(ui, |ui| {
                 for sh in [
                     PreviewShape::Flat,
+                    PreviewShape::Quad,
                     PreviewShape::Sphere,
                     PreviewShape::Cube,
                 ] {
@@ -204,14 +258,19 @@ pub fn show(
     // varies along w (`Graph::output_is_3d`), bake the graph as a volume
     // and sample it by object-space position instead of UV-wrapping a
     // flat slice. Falls back to the UV path if the volume bake fails.
-    let want_solid = matches!(preview.shape, PreviewShape::Sphere | PreviewShape::Cube)
-        && graph.output_is_3d();
+    let want_solid = preview.shape.is_3d() && graph.output_is_3d();
     let mut solid_active = false;
     if want_solid {
         if let Some(gpu) = gpu.as_deref_mut() {
+            let vol_res = preview.size.min(VOLUME_RES_CAP);
+            // A size-button change invalidates the volume like it does the
+            // flat channels: rebake when the resolution no longer matches.
+            if preview.volume.as_ref().is_some_and(|v| v.size.0 != vol_res) {
+                preview.volume = None;
+            }
             if preview.volume_stale || preview.volume.is_none() {
                 preview.gpu_error = None;
-                match gpu.baker.bake_volume(graph, VOLUME_RES, VOLUME_RES, eval_ctx) {
+                match gpu.baker.bake_volume(graph, vol_res, vol_res, eval_ctx) {
                     Ok(v) => {
                         preview.volume = Some(v);
                         preview.volume_stale = false;
@@ -232,8 +291,7 @@ pub fn show(
     //    sampling covers the 3D view — it has its own product above.
     //    3D shapes want real alpha (the object blends); Flat wants the
     //    gray backing checker composited in.
-    let want_object_alpha =
-        matches!(preview.shape, PreviewShape::Sphere | PreviewShape::Cube);
+    let want_object_alpha = preview.shape.is_3d();
     let needs_bake = !solid_active
         && (preview.channels_stale
             || (preview.gpu_channels.is_none() && preview.texture.is_none())
@@ -279,7 +337,7 @@ pub fn show(
     }
 
     // 2. In 3D mode, keep a persistent scene target + rerender each frame.
-    if matches!(preview.shape, PreviewShape::Sphere | PreviewShape::Cube)
+    if preview.shape.is_3d()
         && gpu.is_some()
         && (solid_active || preview.gpu_channels.is_some())
     {
@@ -297,13 +355,20 @@ pub fn show(
                 dt * preview.yaw_rate_deg_per_sec.to_radians(),
             ) * preview.orientation;
         }
-        let camera = SceneCamera {
+        let mut camera = SceneCamera {
             orientation: preview.orientation,
             ..SceneCamera::default()
         };
         let shape = match preview.shape {
             PreviewShape::Sphere => SceneShape::Sphere,
             PreviewShape::Cube => SceneShape::Cube,
+            PreviewShape::Quad => {
+                // Look down at the ground plane from a raised 3/4 angle so
+                // the whole face is visible; auto-spin turntables it in place.
+                camera.pitch = 0.95;
+                camera.distance = 2.6;
+                SceneShape::Quad
+            }
             PreviewShape::Flat => unreachable!(),
         };
         // Keep the UV material's texture clones alive past the match.
@@ -360,7 +425,7 @@ pub fn show(
                 );
             }
         }
-        PreviewShape::Sphere | PreviewShape::Cube => {
+        PreviewShape::Quad | PreviewShape::Sphere | PreviewShape::Cube => {
             if let Some(scene) = &preview.scene {
                 let resp = ui.add(
                     egui::Image::new((scene.id, egui::vec2(side, side)))
@@ -439,6 +504,7 @@ fn ensure_scene_target(preview: &mut PreviewPanelState, gpu: &mut GpuBits) {
 fn shape_label(sh: PreviewShape) -> &'static str {
     match sh {
         PreviewShape::Flat => "flat",
+        PreviewShape::Quad => "quad",
         PreviewShape::Sphere => "sphere",
         PreviewShape::Cube => "cube",
     }

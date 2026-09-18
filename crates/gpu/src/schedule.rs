@@ -22,7 +22,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use texture_graph_core::{Graph, LayerId, ScalarInput};
+use texture_graph_core::{
+    Axis, CoordMode, EXTEND_LIMIT, EdgeMode, Graph, LayerId, LayerKind, RadialDim, ScalarInput,
+    Transform,
+};
 
 /// Fully-resolved dispatch plan for one bake.
 #[derive(Debug, Clone)]
@@ -35,12 +38,176 @@ pub struct Schedule {
     pub peak_slots: u32,
     /// Where the four PBR channels come from after all dispatches.
     pub output_slots: OutputSlots,
+    /// UV rectangle each layer is baked over. `Domain::UNIT` for everything
+    /// unless an `EdgeMode::Extend` transform pulls a source wider.
+    pub domain_of: HashMap<LayerId, Domain>,
+}
+
+/// Axis-aligned UV rectangle a layer's bake covers. Always contains the
+/// unit square, so a layer's own [0, 1] view (thumbnails, direct output)
+/// stays renderable; extend-transform consumers grow it — exactly for
+/// affine requests, capped at the [`EXTEND_LIMIT`] box for radial ones.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct Domain {
+    pub min: [f32; 2],
+    pub max: [f32; 2],
+}
+
+impl Domain {
+    pub const UNIT: Domain = Domain { min: [0.0, 0.0], max: [1.0, 1.0] };
+
+    fn union(&mut self, o: Domain) {
+        self.min[0] = self.min[0].min(o.min[0]);
+        self.min[1] = self.min[1].min(o.min[1]);
+        self.max[0] = self.max[0].max(o.max[0]);
+        self.max[1] = self.max[1].max(o.max[1]);
+    }
+
+    /// `(min_u, min_v, ext_u, ext_v)` — the uniform layout the shaders use
+    /// to map UV to texels.
+    pub fn packed(&self) -> [f32; 4] {
+        [
+            self.min[0],
+            self.min[1],
+            self.max[0] - self.min[0],
+            self.max[1] - self.min[1],
+        ]
+    }
+}
+
+/// Per-layer bake domains: start every reachable layer at the unit square,
+/// then walk consumers-first (reverse topo) and union in what each
+/// consumer actually samples. Only `EdgeMode::Extend` transforms request
+/// beyond the unit square; everything else samples its inputs at its own
+/// coordinates (so a widened consumer transitively widens its inputs).
+/// A `Map`'s palette is excluded — it's indexed by luminance, always
+/// within the unit range.
+fn compute_domains(graph: &Graph, order: &[LayerId]) -> HashMap<LayerId, Domain> {
+    let mut dom: HashMap<LayerId, Domain> =
+        order.iter().map(|&id| (id, Domain::UNIT)).collect();
+    for &id in order.iter().rev() {
+        let d = dom[&id];
+        let Some(layer) = graph.get(id) else { continue };
+        match &layer.kind {
+            LayerKind::Transform(t) => {
+                // Clamp mode samples only within [0, 1] — the baseline
+                // unit domain already covers it.
+                if t.edge_mode == EdgeMode::Extend {
+                    if let (Some(src), Some(req)) = (t.source, transform_request(t, d)) {
+                        if let Some(e) = dom.get_mut(&src) {
+                            e.union(req);
+                        }
+                    }
+                }
+            }
+            LayerKind::Map(m) => {
+                if let Some(e) = m.value.and_then(|v| dom.get_mut(&v)) {
+                    e.union(d);
+                }
+                // palette: luminance-indexed, unit domain suffices.
+            }
+            _ => {
+                for input in layer.kind.inputs() {
+                    if let Some(e) = dom.get_mut(&input) {
+                        e.union(d);
+                    }
+                }
+            }
+        }
+    }
+    dom
+}
+
+/// The UV rectangle an extend-transform samples its source over, given the
+/// transform's own bake domain `d`: the AABB of the transformed corners.
+/// Affine (passthrough/permute) requests are exact and unbounded — the
+/// bake still spends the same pixel count, just spread over the wider
+/// rectangle, matching 1:1 what the consumer samples. Radial requests are
+/// conservative, so they intersect with the [`EXTEND_LIMIT`] box; `None`
+/// when that leaves nothing (those samples all show the missing grid, so
+/// the source needn't grow). Non-finite requests (degenerate scales) also
+/// return `None`.
+fn transform_request(t: &Transform, d: Domain) -> Option<Domain> {
+    let corners = [
+        (d.min[0], d.min[1]),
+        (d.max[0], d.min[1]),
+        (d.min[0], d.max[1]),
+        (d.max[0], d.max[1]),
+    ];
+    let (mut u_min, mut u_max) = (f32::INFINITY, f32::NEG_INFINITY);
+    let (mut v_min, mut v_max) = (f32::INFINITY, f32::NEG_INFINITY);
+    for (cu, cv) in corners {
+        let mut u = cu - t.offset[0];
+        let mut v = cv - t.offset[1];
+        if t.rotate_uv != 0.0 {
+            let (sin, cos) = t.rotate_uv.sin_cos();
+            let (ru, rv) = (u * cos - v * sin, u * sin + v * cos);
+            u = ru;
+            v = rv;
+        }
+        let u = u * t.scale[0];
+        let v = v * t.scale[1];
+        u_min = u_min.min(u);
+        u_max = u_max.max(u);
+        v_min = v_min.min(v);
+        v_max = v_max.max(v);
+    }
+    // w spans [0, 1] across a volume bake (0.5 flat) — conservative range
+    // for the permute/radial cases that read it.
+    let sw_max = {
+        let a = (0.0 - t.offset[2]) * t.scale[2];
+        let b = (1.0 - t.offset[2]) * t.scale[2];
+        a.abs().max(b.abs())
+    };
+
+    let radial = matches!(t.coord_mode, CoordMode::Radial { .. });
+    let ((ru0, ru1), (rv0, rv1)) = match t.coord_mode {
+        CoordMode::Passthrough => ((u_min, u_max), (v_min, v_max)),
+        CoordMode::Permute(axes) => {
+            let range = |a: Axis| match a {
+                Axis::U => (u_min, u_max),
+                Axis::V => (v_min, v_max),
+                Axis::W => (-sw_max, sw_max),
+            };
+            (range(axes[0]), range(axes[1]))
+        }
+        CoordMode::Radial { dim, into } => {
+            let mut r_max: f32 = 0.0;
+            for &u in &[u_min, u_max] {
+                for &v in &[v_min, v_max] {
+                    let mut r2 = u * u + v * v;
+                    if matches!(dim, RadialDim::D3) {
+                        r2 += sw_max * sw_max;
+                    }
+                    r_max = r_max.max(r2.sqrt());
+                }
+            }
+            match into {
+                Axis::U => ((0.0, r_max), (0.0, 0.0)),
+                Axis::V => ((0.0, 0.0), (0.0, r_max)),
+                Axis::W => ((0.0, 0.0), (0.0, 0.0)),
+            }
+        }
+    };
+
+    let (u0, u1, v0, v1) = if radial {
+        let lo = 0.5 - EXTEND_LIMIT;
+        let hi = 0.5 + EXTEND_LIMIT;
+        (ru0.max(lo), ru1.min(hi), rv0.max(lo), rv1.min(hi))
+    } else {
+        (ru0, ru1, rv0, rv1)
+    };
+    if !(u0 <= u1 && v0 <= v1 && u0.is_finite() && u1.is_finite() && v0.is_finite() && v1.is_finite()) {
+        return None;
+    }
+    Some(Domain { min: [u0, v0], max: [u1, v1] })
 }
 
 /// Post-schedule descriptor for the `pack_srgb8` stage.
 #[derive(Debug, Copy, Clone)]
 pub struct OutputSlots {
-    pub color: u32,
+    /// `None` = unconnected — pack from the missing-texture grid.
+    pub color: Option<u32>,
     pub roughness: ScalarSlot,
     pub metallic: ScalarSlot,
     pub normal: Option<u32>,
@@ -151,9 +318,10 @@ pub fn schedule(graph: &Graph) -> Result<Schedule, ScheduleError> {
 
     // Resolve the four output channels against the final slot_of.
     let output_slots = OutputSlots {
-        color: *slot_of
-            .get(&graph.output.color)
-            .ok_or(ScheduleError::UnknownLayer(graph.output.color))?,
+        color: match graph.output.color {
+            Some(id) => Some(*slot_of.get(&id).ok_or(ScheduleError::UnknownLayer(id))?),
+            None => None,
+        },
         roughness: scalar_to_slot(&graph.output.roughness, &slot_of)?,
         metallic: scalar_to_slot(&graph.output.metallic, &slot_of)?,
         normal: match graph.output.normal {
@@ -164,7 +332,8 @@ pub fn schedule(graph: &Graph) -> Result<Schedule, ScheduleError> {
         },
     };
 
-    Ok(Schedule { order, slot_of, peak_slots, output_slots })
+    let domain_of = compute_domains(graph, &order);
+    Ok(Schedule { order, slot_of, peak_slots, output_slots, domain_of })
 }
 
 /// One texture per layer, no reuse — used for the per-layer preview pass
@@ -200,16 +369,18 @@ pub fn schedule_no_reuse(graph: &Graph) -> Result<Schedule, ScheduleError> {
     }
     let peak_slots = order.len() as u32;
     let output_slots = OutputSlots {
-        color: *slot_of.get(&graph.output.color).unwrap_or(&0),
+        color: graph.output.color.and_then(|id| slot_of.get(&id).copied()),
         roughness: scalar_to_slot(&graph.output.roughness, &slot_of)?,
         metallic: scalar_to_slot(&graph.output.metallic, &slot_of)?,
         normal: graph.output.normal.and_then(|id| slot_of.get(&id).copied()),
     };
-    Ok(Schedule { order, slot_of, peak_slots, output_slots })
+    let domain_of = compute_domains(graph, &order);
+    Ok(Schedule { order, slot_of, peak_slots, output_slots, domain_of })
 }
 
 fn output_referenced(graph: &Graph) -> Vec<LayerId> {
-    let mut out = vec![graph.output.color];
+    let mut out = Vec::new();
+    out.extend(graph.output.color);
     if let ScalarInput::Layer(id) = graph.output.roughness {
         out.push(id);
     }
@@ -348,10 +519,10 @@ mod tests {
         let mut g = base_graph();
         let a = g.output.color; // the "base color" seeded by Graph::new
         let b = add_color(&mut g, "b");
-        let ab = add_mix(&mut g, "ab", a, b);
+        let ab = add_mix(&mut g, "ab", a.unwrap(), b);
         // Overwrite output to point at the terminal.
         g.set_output(Output {
-            color: ab,
+            color: Some(ab),
             roughness: ScalarInput::Const(0.5),
             metallic: ScalarInput::Const(0.0),
             normal: None,
@@ -370,14 +541,14 @@ mod tests {
     fn diamond_needs_three_slots() {
         // a -> b, a -> c, mix(b, c). While mix dispatches, b, c, mix all live.
         let mut g = base_graph();
-        let a = g.output.color;
+        let a = g.output.color.unwrap();
         // Wrap `a` in trivial transforms so we have distinct b, c layers
         // that both consume a.
         let b = add_mix(&mut g, "b", a, a);
         let c = add_mix(&mut g, "c", a, a);
         let bc = add_mix(&mut g, "bc", b, c);
         g.set_output(Output {
-            color: bc,
+            color: Some(bc),
             roughness: ScalarInput::Const(0.5),
             metallic: ScalarInput::Const(0.0),
             normal: None,
@@ -398,10 +569,10 @@ mod tests {
         let mut cur = add_color(&mut g, "seed");
         for i in 0..5 {
             let name = format!("step-{i}");
-            cur = add_mix(&mut g, &name, cur, leaf);
+            cur = add_mix(&mut g, &name, cur, leaf.unwrap());
         }
         g.set_output(Output {
-            color: cur,
+            color: Some(cur),
             roughness: ScalarInput::Const(0.5),
             metallic: ScalarInput::Const(0.0),
             normal: None,
@@ -416,9 +587,9 @@ mod tests {
         let mut g = base_graph();
         let a = g.output.color;
         let b = add_color(&mut g, "b");
-        let ab = add_mix(&mut g, "ab", a, b);
+        let ab = add_mix(&mut g, "ab", a.unwrap(), b);
         g.set_output(Output {
-            color: ab,
+            color: Some(ab),
             roughness: ScalarInput::Const(0.5),
             metallic: ScalarInput::Const(0.0),
             normal: None,
@@ -430,6 +601,127 @@ mod tests {
         slots.dedup();
         assert_eq!(slots.len(), s.slot_of.len(), "slots must be unique in no-reuse mode");
         assert_eq!(s.peak_slots as usize, s.order.len());
+    }
+
+    fn add_transform(
+        g: &mut Graph,
+        name: &str,
+        src: LayerId,
+        scale: [f32; 3],
+        edge_mode: texture_graph_core::EdgeMode,
+    ) -> LayerId {
+        g.add_layer(
+            name,
+            LayerKind::Transform(texture_graph_core::Transform {
+                source: Some(src),
+                offset: [0.0; 3],
+                rotate_uv: 0.0,
+                scale,
+                coord_mode: CoordMode::Passthrough,
+                edge_mode,
+            }),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn extend_transform_widens_source_domain() {
+        use texture_graph_core::EdgeMode;
+        let mut g = base_graph();
+        let src = g.output.color.unwrap();
+        let t = add_transform(&mut g, "t", src, [3.0, 1.0, 1.0], EdgeMode::Extend);
+        g.set_output(Output {
+            color: Some(t),
+            roughness: ScalarInput::Const(0.5),
+            metallic: ScalarInput::Const(0.0),
+            normal: None,
+        })
+        .unwrap();
+        let s = schedule(&g).unwrap();
+        let d = s.domain_of[&src];
+        // Transform samples u in [0, 3]; unit baseline keeps v at [0, 1].
+        assert_eq!(d.min, [0.0, 0.0]);
+        assert!((d.max[0] - 3.0).abs() < 1e-6, "u max {}", d.max[0]);
+        assert!((d.max[1] - 1.0).abs() < 1e-6);
+        // The transform itself stays at unit.
+        assert_eq!(s.domain_of[&t], Domain::UNIT);
+    }
+
+    #[test]
+    fn clamp_transform_keeps_source_at_unit() {
+        use texture_graph_core::EdgeMode;
+        let mut g = base_graph();
+        let src = g.output.color.unwrap();
+        let t = add_transform(&mut g, "t", src, [3.0, 1.0, 1.0], EdgeMode::Clamp);
+        g.set_output(Output {
+            color: Some(t),
+            roughness: ScalarInput::Const(0.5),
+            metallic: ScalarInput::Const(0.0),
+            normal: None,
+        })
+        .unwrap();
+        let s = schedule(&g).unwrap();
+        assert_eq!(s.domain_of[&src], Domain::UNIT);
+    }
+
+    #[test]
+    fn extend_requests_are_exact_and_chains_compose() {
+        use texture_graph_core::EdgeMode;
+        let mut g = base_graph();
+        let src = g.output.color.unwrap();
+        // Two chained x2 extends: inner source needs u up to 4, chained
+        // through the middle transform's own widened domain.
+        let t1 = add_transform(&mut g, "t1", src, [2.0, 1.0, 1.0], EdgeMode::Extend);
+        let t2 = add_transform(&mut g, "t2", t1, [2.0, 1.0, 1.0], EdgeMode::Extend);
+        // And a huge affine scale — exact and unbounded, no cap.
+        let big = add_transform(&mut g, "big", src, [100.0, 1.0, 1.0], EdgeMode::Extend);
+        let both = add_mix(&mut g, "both", t2, big);
+        g.set_output(Output {
+            color: Some(both),
+            roughness: ScalarInput::Const(0.5),
+            metallic: ScalarInput::Const(0.0),
+            normal: None,
+        })
+        .unwrap();
+        let s = schedule(&g).unwrap();
+        // t1's domain: widened by t2 to u in [0, 2].
+        assert!((s.domain_of[&t1].max[0] - 2.0).abs() < 1e-6);
+        // src: union of t1's request over its widened domain ([0, 4]) and
+        // big's exact request ([0, 100]).
+        let d = s.domain_of[&src];
+        assert!((d.max[0] - 100.0).abs() < 1e-3, "u max {}", d.max[0]);
+        assert_eq!(d.min[1], 0.0);
+    }
+
+    #[test]
+    fn radial_extend_request_caps_at_limit() {
+        use texture_graph_core::EdgeMode;
+        let mut g = base_graph();
+        let src = g.output.color.unwrap();
+        let t = g
+            .add_layer(
+                "radial",
+                LayerKind::Transform(texture_graph_core::Transform {
+                    source: Some(src),
+                    offset: [0.0; 3],
+                    rotate_uv: 0.0,
+                    scale: [40.0, 1.0, 1.0],
+                    coord_mode: CoordMode::Radial { dim: RadialDim::D2, into: Axis::U },
+                    edge_mode: EdgeMode::Extend,
+                }),
+            )
+            .unwrap();
+        g.set_output(Output {
+            color: Some(t),
+            roughness: ScalarInput::Const(0.5),
+            metallic: ScalarInput::Const(0.0),
+            normal: None,
+        })
+        .unwrap();
+        let s = schedule(&g).unwrap();
+        // r_max ~ 40 but the radial request is conservative, so it caps.
+        let d = s.domain_of[&src];
+        assert!((d.max[0] - (0.5 + EXTEND_LIMIT)).abs() < 1e-4, "u max {}", d.max[0]);
     }
 
     #[test]

@@ -23,10 +23,12 @@ struct PackParams {
     // out-of-range checker a true 3D checkerboard across slices.
     z_px: u32,
     // Three scalar pads, NOT vec3<u32> — vec3 aligns to 16 which would
-    // grow the struct to 64 bytes and desync from the 48-byte Rust side.
+    // desync the struct layout from the Rust side.
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
+    // Source layer's bake domain (min_u, min_v, ext_u, ext_v).
+    src_dom: vec4<f32>,
 }
 
 // common.wgsl (inlined by the pipeline creation code below at build time)
@@ -159,7 +161,15 @@ fn scalar_out_of_range(l: f32) -> bool {
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.size.x || gid.y >= params.size.y) { return; }
     let coord = vec2<i32>(i32(gid.x), i32(gid.y));
-    let src_px = textureLoad(src, coord, 0);
+    // Display [0, 1] UV mapped into the source's bake domain (identity
+    // when the source was baked over the unit square).
+    let uv = vec2<f32>(
+        (f32(gid.x) + 0.5) / f32(params.size.x),
+        (f32(gid.y) + 0.5) / f32(params.size.y),
+    );
+    let tx = clamp((uv.x - params.src_dom.x) / params.src_dom.z * f32(params.size.x), 0.0, f32(params.size.x) - 1.0);
+    let ty = clamp((uv.y - params.src_dom.y) / params.src_dom.w * f32(params.size.y), 0.0, f32(params.size.y) - 1.0);
+    let src_px = textureLoad(src, vec2<i32>(i32(tx), i32(ty)), 0);
     var packed: vec4<f32>;
     if (params.mode == 0u) {
         if (oklcha_out_of_range(src_px)) {

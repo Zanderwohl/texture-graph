@@ -77,20 +77,6 @@ impl eframe::App for TextureGraphApp {
             panels::menu_bar::show(ui, &self.graph, &mut self.ui);
         });
 
-        egui::Panel::left("layer_list")
-            .resizable(true)
-            .default_size(280.0)
-            .show(ui, |ui| {
-                panels::layer_list::show(
-                    ui,
-                    &self.graph,
-                    &mut self.ui,
-                    &mut self.previews,
-                    &self.eval_ctx,
-                    self.gpu.as_mut(),
-                );
-            });
-
         egui::Panel::right("preview")
             .resizable(true)
             .default_size(360.0)
@@ -109,14 +95,22 @@ impl eframe::App for TextureGraphApp {
             if let Some(err) = &self.ui.last_error {
                 ui.colored_label(egui::Color32::LIGHT_RED, err);
             }
-            panels::graph_canvas::show(ui, &self.graph, &mut self.ui);
+            panels::graph_canvas::show(
+                ui,
+                &self.graph,
+                &mut self.ui,
+                &mut self.previews,
+                &self.eval_ctx,
+                self.gpu.as_mut(),
+            );
         });
 
-        // File dialogs. Native blocks on the dialog synchronously; wasm
-        // spawns onto the browser event loop and hands the bytes back via
-        // `poll_pending` on a later frame.
-        file_io::handle_wants_save(&self.graph, &mut self.ui);
-        file_io::handle_wants_open(&mut self.ui);
+        // File dialogs. Both platforms run the dialog off the UI thread
+        // (native: background thread; wasm: browser event loop) and hand
+        // the outcome back via `poll_pending` on a later frame — blocking
+        // the UI thread on the dialog deadlocks on macOS.
+        file_io::handle_wants_save(&self.graph, &mut self.ui, ui.ctx());
+        file_io::handle_wants_open(&mut self.ui, ui.ctx());
         file_io::poll_pending(&mut self.ui);
 
         // Apply queued mutations; invalidate the per-layer preview cache

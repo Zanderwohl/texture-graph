@@ -379,7 +379,7 @@ fn noise_graph(dims: NoiseDims) -> Graph {
     let base = graph.output.color;
     graph
         .set_kind(
-            base,
+            base.unwrap(),
             LayerKind::Noise(Noise {
                 dims,
                 seed_offset: 0,
@@ -464,7 +464,7 @@ fn object_alpha_switch_keeps_real_alpha_in_volume_bakes() {
     let mut graph = Graph::new();
     let base = graph.output.color;
     graph
-        .set_kind(base, LayerKind::Color(Color::new(0.6, 0.1, 40.0, 0.5)))
+        .set_kind(base.unwrap(), LayerKind::Color(Color::new(0.6, 0.1, 40.0, 0.5)))
         .unwrap();
 
     let flat = baker
@@ -505,7 +505,7 @@ fn out_of_range_checker_alternates_along_w() {
     let base = graph.output.color;
     graph
         .set_kind(
-            base,
+            base.unwrap(),
             LayerKind::Noise(Noise {
                 dims: NoiseDims::D2,
                 seed_offset: 0,

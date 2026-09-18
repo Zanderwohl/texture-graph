@@ -20,8 +20,9 @@ pub struct Layer {
 /// The graph's root, producing PBR-material channels for the renderer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Output {
-    /// Layer whose color is the material's base color.
-    pub color: LayerId,
+    /// Layer whose color is the material's base color. `None` renders as
+    /// the missing-texture grid.
+    pub color: Option<LayerId>,
     /// 0 = smooth, 1 = rough.
     pub roughness: ScalarInput,
     /// 0 = dielectric, 1 = metal.
@@ -33,7 +34,8 @@ pub struct Output {
 
 impl Output {
     fn referenced(&self) -> Vec<LayerId> {
-        let mut out = vec![self.color];
+        let mut out = Vec::new();
+        out.extend(self.color);
         if let ScalarInput::Layer(id) = self.roughness {
             out.push(id);
         }
@@ -55,6 +57,11 @@ pub struct Canvas {
     /// Position of each layer within this canvas. Layers absent from the
     /// map should be treated as unplaced (UI decides where to drop them).
     pub positions: BTreeMap<LayerId, [f32; 2]>,
+    /// Position of the material Output pseudo-node on this canvas.
+    /// `None` = unplaced (UI picks a spot). `serde(default)` keeps files
+    /// from before this field loading unchanged.
+    #[serde(default)]
+    pub output_pos: Option<[f32; 2]>,
 }
 
 /// The full graph. Three orthogonal shapes travel with the data:
@@ -88,8 +95,6 @@ pub enum GraphError {
     Cycle(LayerId),
     #[error("color ramp must have at least two stops")]
     RampTooFewStops,
-    #[error("layer {0} is still referenced by another layer or the output")]
-    StillReferenced(LayerId),
     #[error("canvas {0:?} does not exist")]
     UnknownCanvas(String),
     #[error("canvas {0:?} already exists")]
@@ -104,7 +109,7 @@ impl Graph {
             list_order: Vec::new(),
             canvases: BTreeMap::new(),
             output: Output {
-                color: LayerId(0),
+                color: None,
                 roughness: ScalarInput::Const(0.5),
                 metallic: ScalarInput::Const(0.0),
                 normal: None,
@@ -114,7 +119,7 @@ impl Graph {
         let id = g
             .add_layer("base color", LayerKind::Color(Color::new(0.5, 0.0, 0.0, 1.0)))
             .expect("first add cannot fail");
-        g.output.color = id;
+        g.output.color = Some(id);
         g
     }
 
@@ -224,19 +229,35 @@ impl Graph {
         Ok(id)
     }
 
-    /// Remove `id`. Fails if it is referenced by any other layer or by
-    /// `output`. Cleans up list order and every canvas's position map.
+    /// Remove `id`. Every input that referenced it — in other layers or in
+    /// the output — is disconnected first (falling back to `None` / const
+    /// defaults, which render as the missing-texture grid). Cleans up list
+    /// order and every canvas's position map.
     pub fn remove(&mut self, id: LayerId) -> Result<(), GraphError> {
         if !self.contains(id) {
             return Err(GraphError::UnknownId(id));
         }
-        if self.output.referenced().contains(&id) {
-            return Err(GraphError::StillReferenced(id));
-        }
-        for l in &self.layers {
-            if l.kind.inputs().contains(&id) {
-                return Err(GraphError::StillReferenced(id));
+        for l in &mut self.layers {
+            let referencing: Vec<_> = l
+                .kind
+                .input_sockets()
+                .iter()
+                .filter(|s| s.value.connected_to() == Some(id))
+                .map(|s| s.key)
+                .collect();
+            for key in referencing {
+                let _ = l.kind.set_input(key, None);
             }
+        }
+        let referencing: Vec<_> = self
+            .output
+            .input_sockets()
+            .iter()
+            .filter(|s| s.value.connected_to() == Some(id))
+            .map(|s| s.key)
+            .collect();
+        for key in referencing {
+            let _ = self.output.set_input(key, None);
         }
         self.layers.retain(|l| l.id != id);
         self.list_order.retain(|x| *x != id);
@@ -346,7 +367,48 @@ impl Graph {
         Ok(())
     }
 
+    /// Store the Output pseudo-node's position on a canvas.
+    pub fn set_output_position(
+        &mut self,
+        canvas: &str,
+        pos: [f32; 2],
+    ) -> Result<(), GraphError> {
+        let c = self
+            .canvases
+            .get_mut(canvas)
+            .ok_or_else(|| GraphError::UnknownCanvas(canvas.to_string()))?;
+        c.output_pos = Some(pos);
+        Ok(())
+    }
+
     // ---- Cycle detection ------------------------------------------------
+
+    /// True if wiring `candidate_input` into an input of `node` would
+    /// create a cycle — i.e. `candidate_input` is `node` itself or
+    /// (transitively) depends on it. Exact even when the new wire replaces
+    /// an existing input: any offending path runs `candidate → … → node`
+    /// through input edges and cannot pass through the edge being
+    /// replaced. Intended for live drop-eligibility feedback; `set_kind`
+    /// remains the authoritative validator.
+    pub fn would_cycle(&self, node: LayerId, candidate_input: LayerId) -> bool {
+        if candidate_input == node {
+            return true;
+        }
+        let mut stack = vec![candidate_input];
+        let mut seen: HashSet<LayerId> = HashSet::new();
+        while let Some(cur) = stack.pop() {
+            if cur == node {
+                return true;
+            }
+            if !seen.insert(cur) {
+                continue;
+            }
+            if let Some(l) = self.get(cur) {
+                stack.extend(l.kind.inputs());
+            }
+        }
+        false
+    }
 
     /// DFS from `start` — returns true if any path revisits a node currently
     /// on the recursion stack.
@@ -393,4 +455,137 @@ fn validate_ramp(r: &ColorRamp) -> Result<(), GraphError> {
         return Err(GraphError::RampTooFewStops);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kind::{Map, Mix, BlendMode};
+    use crate::color::BlendSpace;
+
+    /// a depends on b, b depends on c: a → b → c.
+    fn chain() -> (Graph, LayerId, LayerId, LayerId) {
+        let mut g = Graph::new();
+        let c = g.layers[0].id;
+        let b = g
+            .add_layer("b", LayerKind::Map(Map { value: Some(c), palette: None }))
+            .unwrap();
+        let a = g
+            .add_layer("a", LayerKind::Map(Map { value: Some(b), palette: None }))
+            .unwrap();
+        (g, a, b, c)
+    }
+
+    #[test]
+    fn would_cycle_matches_dependency_direction() {
+        let (g, a, b, c) = chain();
+        // c's inputs may not include anything that depends on c.
+        assert!(g.would_cycle(c, a));
+        assert!(g.would_cycle(c, b));
+        assert!(g.would_cycle(b, a));
+        // Downstream nodes can take upstream ones as inputs.
+        assert!(!g.would_cycle(a, c));
+        assert!(!g.would_cycle(a, b));
+        // Self-connection is a cycle.
+        assert!(g.would_cycle(a, a));
+    }
+
+    #[test]
+    fn would_cycle_is_exact_under_replacement() {
+        let (mut g, a, _b, c) = chain();
+        // An independent layer is fine as a's replacement input even
+        // though a already has one.
+        let x = g
+            .add_layer("x", LayerKind::Map(Map { value: Some(c), palette: None }))
+            .unwrap();
+        assert!(!g.would_cycle(a, x));
+    }
+
+    #[test]
+    fn would_cycle_agrees_with_set_kind() {
+        let (mut g, a, b, c) = chain();
+        for (node, input) in [(c, a), (b, a), (a, a), (a, c)] {
+            let predicted = g.would_cycle(node, input);
+            let result = g.set_kind(
+                node,
+                LayerKind::Mix(Mix {
+                    a: Some(input),
+                    b: None,
+                    mode: BlendMode::Add,
+                    factor: ScalarInput::Const(0.5),
+                    space: BlendSpace::Oklch,
+                }),
+            );
+            assert_eq!(
+                predicted,
+                matches!(result, Err(GraphError::Cycle(_))),
+                "disagreement wiring {input:?} into {node:?}"
+            );
+            // Restore the chain for the next case.
+            g = chain().0;
+            // chain() rebuilds ids deterministically, so a/b/c stay valid.
+        }
+    }
+
+    #[test]
+    fn remove_disconnects_every_consumer() {
+        let mut g = Graph::new();
+        let victim = g.output.color.unwrap();
+        let consumer = g
+            .add_layer(
+                "mix",
+                LayerKind::Mix(Mix {
+                    a: Some(victim),
+                    b: None,
+                    mode: BlendMode::Blend,
+                    factor: ScalarInput::Layer(victim),
+                    space: BlendSpace::Oklch,
+                }),
+            )
+            .unwrap();
+        g.output.normal = Some(victim);
+        g.output.roughness = ScalarInput::Layer(victim);
+
+        g.remove(victim).expect("referenced layers are removable");
+
+        assert!(!g.contains(victim));
+        let LayerKind::Mix(m) = &g.get(consumer).unwrap().kind else { panic!() };
+        assert_eq!(m.a, None);
+        assert!(matches!(m.factor, ScalarInput::Const(_)));
+        assert_eq!(g.output.color, None);
+        assert_eq!(g.output.normal, None);
+        assert!(matches!(g.output.roughness, ScalarInput::Const(_)));
+    }
+
+    #[test]
+    fn output_position_round_trip_and_unknown_canvas() {
+        let mut g = Graph::new();
+        assert!(matches!(
+            g.set_output_position("main", [1.0, 2.0]),
+            Err(GraphError::UnknownCanvas(_))
+        ));
+        g.add_canvas("main").unwrap();
+        g.set_output_position("main", [1.0, 2.0]).unwrap();
+        assert_eq!(g.canvases["main"].output_pos, Some([1.0, 2.0]));
+    }
+
+    #[test]
+    fn canvas_without_output_pos_deserializes() {
+        // A canvas serialized before `output_pos` existed.
+        let old: Canvas = ron::from_str("(positions: {})").unwrap();
+        assert_eq!(old.output_pos, None);
+    }
+
+    #[test]
+    fn output_with_bare_color_id_deserializes() {
+        // Files from before `Output::color` became optional store a bare
+        // id; `implicit_some` (as used by file::load_from_str) wraps it.
+        let options = ron::Options::default()
+            .with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME);
+        let old: Output = options
+            .from_str("(color: 3, roughness: Const(0.5), metallic: Const(0.0), normal: None)")
+            .unwrap();
+        assert_eq!(old.color, Some(LayerId(3)));
+        assert_eq!(old.normal, None);
+    }
 }

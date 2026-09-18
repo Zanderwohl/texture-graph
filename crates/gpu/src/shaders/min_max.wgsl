@@ -7,11 +7,33 @@ struct MinMaxParams {
     size: vec2<u32>,
     mode: u32,       // 0 = Min, 1 = Max
     criterion: u32,  // 0=R 1=G 2=B 3=Saturation 4=Value 5=Luma 6=Alpha 7=Chroma
+    dom: vec4<f32>,  // own bake domain (min_u, min_v, ext_u, ext_v)
+    dom_a: vec4<f32>,
+    dom_b: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> params: MinMaxParams;
 @group(0) @binding(1) var out_tex: texture_storage_2d<rgba32float, write>;
 @group(0) @binding(2) var tex_a: texture_2d<f32>;
+
+// Map this dispatch's texel to its UV within the layer's bake domain
+// (dom = (min_u, min_v, ext_u, ext_v)).
+fn dom_uv(dom: vec4<f32>, gid: vec2<u32>, size: vec2<u32>) -> vec2<f32> {
+    return vec2<f32>(
+        dom.x + (f32(gid.x) + 0.5) / f32(size.x) * dom.z,
+        dom.y + (f32(gid.y) + 0.5) / f32(size.y) * dom.w,
+    );
+}
+
+// Nearest texel of `uv` in an input baked over `dom`, clamped to its edge.
+fn dom_texel(dom: vec4<f32>, uv: vec2<f32>, size: vec2<u32>) -> vec2<i32> {
+    let tx = (uv.x - dom.x) / dom.z * f32(size.x);
+    let ty = (uv.y - dom.y) / dom.w * f32(size.y);
+    return vec2<i32>(
+        i32(clamp(tx, 0.0, f32(size.x) - 1.0)),
+        i32(clamp(ty, 0.0, f32(size.y) - 1.0)),
+    );
+}
 @group(0) @binding(3) var tex_b: texture_2d<f32>;
 
 const PI: f32 = 3.14159265358979323846;
@@ -88,8 +110,9 @@ fn criterion_of(px: vec4<f32>) -> f32 {
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.size.x || gid.y >= params.size.y) { return; }
     let coord = vec2<i32>(i32(gid.x), i32(gid.y));
-    let a = textureLoad(tex_a, coord, 0);
-    let b = textureLoad(tex_b, coord, 0);
+    let uv = dom_uv(params.dom, gid.xy, params.size);
+    let a = textureLoad(tex_a, dom_texel(params.dom_a, uv, params.size), 0);
+    let b = textureLoad(tex_b, dom_texel(params.dom_b, uv, params.size), 0);
     let va = criterion_of(a);
     let vb = criterion_of(b);
     var a_wins: bool;

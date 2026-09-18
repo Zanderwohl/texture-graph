@@ -20,8 +20,10 @@ use texture_graph_core::{
     NoiseRange, RadialDim, ScalarInput, Transform,
 };
 
+use texture_graph_core::EdgeMode;
+
 use crate::device::DeviceCtx;
-use crate::schedule::{OutputSlots, ScalarSlot, Schedule, schedule, schedule_no_reuse};
+use crate::schedule::{Domain, OutputSlots, ScalarSlot, Schedule, schedule, schedule_no_reuse};
 
 /// Max stops per ColorRamp supported by the GPU baker.
 const MAX_RAMP_STOPS: usize = 16;
@@ -258,7 +260,8 @@ impl Baker {
             )?;
         }
 
-        // 2. Pack every intermediate to its sRGB output.
+        // 2. Pack every intermediate to its sRGB output. Thumbnails show
+        // the layer's own [0, 1] view even when its bake domain is wider.
         for &id in &sched.order {
             let slot = *sched.slot_of.get(&id).unwrap() as usize;
             let dst_view = output_views.get(&id).unwrap();
@@ -274,6 +277,7 @@ impl Baker {
                 [0.0; 4],
                 false,
                 0,
+                domain_of(&sched, id),
             );
         }
 
@@ -305,6 +309,15 @@ impl Baker {
                 None => missing_view,
             }
         };
+        // Bake domain of this layer and of each input (the missing grid is
+        // always baked over the unit square).
+        let own_dom = domain_of(sched, layer.id);
+        let dom_opt = |opt: Option<texture_graph_core::LayerId>| -> [f32; 4] {
+            match opt {
+                Some(id) => domain_of(sched, id),
+                None => Domain::UNIT.packed(),
+            }
+        };
         match &layer.kind {
             LayerKind::Color(c) => {
                 dispatch_color(
@@ -328,6 +341,7 @@ impl Baker {
                     eval_ctx.seed,
                     size,
                     w,
+                    own_dom,
                 );
             }
             LayerKind::Transform(t) => {
@@ -341,15 +355,17 @@ impl Baker {
                     t,
                     size,
                     w,
+                    own_dom,
+                    dom_opt(t.source),
                 );
             }
             LayerKind::Mix(m) => {
                 let a_view = resolve(m.a);
-                let factor_view = match m.factor {
-                    ScalarInput::Layer(id) => resolve(Some(id)),
+                let (factor_view, dom_factor) = match m.factor {
+                    ScalarInput::Layer(id) => (resolve(Some(id)), dom_opt(Some(id))),
                     // Bind `a` as a placeholder for the factor texture; the
                     // shader only samples it when factor_is_layer == 1.
-                    ScalarInput::Const(_) => a_view,
+                    ScalarInput::Const(_) => (a_view, dom_opt(m.a)),
                 };
                 dispatch_mix(
                     &self.ctx,
@@ -362,6 +378,10 @@ impl Baker {
                     factor_view,
                     m,
                     size,
+                    own_dom,
+                    dom_opt(m.a),
+                    dom_opt(m.b),
+                    dom_factor,
                 );
             }
             LayerKind::Map(m) => {
@@ -374,6 +394,9 @@ impl Baker {
                     resolve(m.value),
                     resolve(m.palette),
                     size,
+                    own_dom,
+                    dom_opt(m.value),
+                    dom_opt(m.palette),
                 );
             }
             LayerKind::MinMax(mm) => {
@@ -387,6 +410,9 @@ impl Baker {
                     resolve(mm.b),
                     mm,
                     size,
+                    own_dom,
+                    dom_opt(mm.a),
+                    dom_opt(mm.b),
                 );
             }
             LayerKind::HeightToNormal(h) => {
@@ -399,6 +425,8 @@ impl Baker {
                     resolve(h.source),
                     h,
                     size,
+                    own_dom,
+                    dom_opt(h.source),
                 );
             }
             LayerKind::ColorRamp(r) => {
@@ -416,6 +444,7 @@ impl Baker {
                     pool_views,
                     &self.dummy_input_view,
                     size,
+                    own_dom,
                 )?;
             }
         }
@@ -507,7 +536,24 @@ impl Baker {
             )?;
         }
 
-        // Pack the four output channels.
+        // Pack the four output channels. Each pack maps display [0, 1] UV
+        // into its source layer's bake domain.
+        let chan_dom = |id: Option<LayerId>| -> [f32; 4] {
+            match id {
+                Some(id) => domain_of(&sched, id),
+                None => Domain::UNIT.packed(),
+            }
+        };
+        let color_dom = chan_dom(graph.output.color);
+        let rough_dom = match graph.output.roughness {
+            ScalarInput::Layer(id) => chan_dom(Some(id)),
+            ScalarInput::Const(_) => Domain::UNIT.packed(),
+        };
+        let metal_dom = match graph.output.metallic {
+            ScalarInput::Layer(id) => chan_dom(Some(id)),
+            ScalarInput::Const(_) => Domain::UNIT.packed(),
+        };
+        let normal_dom = chan_dom(graph.output.normal);
         let color = make_output_texture(&self.ctx.device, size, "tg-color");
         let roughness = make_output_texture(&self.ctx.device, size, "tg-rough");
         let metallic = make_output_texture(&self.ctx.device, size, "tg-metal");
@@ -521,12 +567,14 @@ impl Baker {
             &self.solid_pipeline,
             &self.solid_bgl,
             &self.pool_views,
+            missing_view,
             &color.create_view(&wgpu::TextureViewDescriptor::default()),
             size,
             OutputChannel::Color,
             &sched.output_slots,
             object_alpha,
             0,
+            color_dom,
         );
         pack_channel(
             &self.ctx,
@@ -536,12 +584,14 @@ impl Baker {
             &self.solid_pipeline,
             &self.solid_bgl,
             &self.pool_views,
+            missing_view,
             &roughness.create_view(&wgpu::TextureViewDescriptor::default()),
             size,
             OutputChannel::Roughness,
             &sched.output_slots,
             object_alpha,
             0,
+            rough_dom,
         );
         pack_channel(
             &self.ctx,
@@ -551,12 +601,14 @@ impl Baker {
             &self.solid_pipeline,
             &self.solid_bgl,
             &self.pool_views,
+            missing_view,
             &metallic.create_view(&wgpu::TextureViewDescriptor::default()),
             size,
             OutputChannel::Metallic,
             &sched.output_slots,
             object_alpha,
             0,
+            metal_dom,
         );
         pack_channel(
             &self.ctx,
@@ -566,12 +618,14 @@ impl Baker {
             &self.solid_pipeline,
             &self.solid_bgl,
             &self.pool_views,
+            missing_view,
             &normal.create_view(&wgpu::TextureViewDescriptor::default()),
             size,
             OutputChannel::Normal,
             &sched.output_slots,
             object_alpha,
             0,
+            normal_dom,
         );
 
         self.ctx.queue.submit([encoder.finish()]);
@@ -626,21 +680,46 @@ impl Baker {
             .map(|n| make_volume_texture(&self.ctx.device, res, depth, &format!("tg-vol-{n}")))
             .collect();
 
-        let mut encoder = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("tg-bake-volume"),
-            });
-
         const CHANNELS: [OutputChannel; 4] = [
             OutputChannel::Color,
             OutputChannel::Roughness,
             OutputChannel::Metallic,
             OutputChannel::Normal,
         ];
+        let chan_dom = |id: Option<LayerId>| -> [f32; 4] {
+            match id {
+                Some(id) => domain_of(&sched, id),
+                None => Domain::UNIT.packed(),
+            }
+        };
+        let chan_doms: [[f32; 4]; 4] = [
+            chan_dom(graph.output.color),
+            match graph.output.roughness {
+                ScalarInput::Layer(id) => chan_dom(Some(id)),
+                ScalarInput::Const(_) => Domain::UNIT.packed(),
+            },
+            match graph.output.metallic {
+                ScalarInput::Layer(id) => chan_dom(Some(id)),
+                ScalarInput::Const(_) => Domain::UNIT.packed(),
+            },
+            chan_dom(graph.output.normal),
+        ];
         let missing_view = self.missing_view.as_ref().unwrap();
         for z in 0..depth {
+            // One encoder + submit PER SLICE. On Metal every compute pass
+            // becomes its own command buffer that stays "outstanding" until
+            // its encoder is submitted; recording all slices into one
+            // encoder puts depth × layers passes in flight at once, which
+            // blows wgpu-metal's 4096 outstanding-command-buffer cap on
+            // real graphs (observed: ~30-layer graph × 64 slices → device
+            // lost). Per-slice submits keep it bounded by one slice's
+            // passes.
+            let mut encoder = self
+                .ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("tg-bake-volume"),
+                });
             let w = (z as f32 + 0.5) / depth as f32;
             // Refill per slice — the grid alternates along w too.
             dispatch_missing(
@@ -671,12 +750,14 @@ impl Baker {
                     &self.solid_pipeline,
                     &self.solid_bgl,
                     &self.pool_views,
+                    missing_view,
                     &slice_views[i],
                     size,
                     *channel,
                     &sched.output_slots,
                     true,
                     z,
+                    chan_doms[i],
                 );
                 encoder.copy_texture_to_texture(
                     wgpu::TexelCopyTextureInfo {
@@ -698,9 +779,9 @@ impl Baker {
                     },
                 );
             }
+            self.ctx.queue.submit([encoder.finish()]);
         }
 
-        self.ctx.queue.submit([encoder.finish()]);
         log::debug!(
             "bake_volume {res}³ (depth={depth}): layers/slice={} record+submit={:?}",
             sched.order.len(),
@@ -737,6 +818,8 @@ struct NoiseParams {
     seed_base: u32,
     frequency: f32,
     w_coord: f32,
+    /// Bake domain as (min_u, min_v, ext_u, ext_v).
+    dom: [f32; 4],
 }
 
 #[repr(C)]
@@ -752,6 +835,8 @@ struct PackParams {
     /// the out-of-range 3D checkerboard.
     z_px: u32,
     _pad: [u32; 3],
+    /// Source layer's bake domain (min_u, min_v, ext_u, ext_v).
+    src_dom: [f32; 4],
 }
 
 #[repr(C)]
@@ -782,7 +867,11 @@ struct TransformParams {
     radial_dim: u32,   // 0=D2, 1=D3
     radial_into: u32,  // 0=U 1=V 2=W
     w_coord: f32,      // third texture coordinate; 0.5 for flat bakes
-    _pad: u32,
+    edge_mode: u32,    // 0=Clamp, 1=Extend
+    /// Own bake domain (min_u, min_v, ext_u, ext_v).
+    dom: [f32; 4],
+    /// Source layer's bake domain.
+    src_dom: [f32; 4],
 }
 
 #[repr(C)]
@@ -794,6 +883,11 @@ struct MixParams {
     factor_const: f32,
     factor_is_layer: u32,  // 0=Const, 1=Layer
     _pad: [u32; 2],
+    /// Own bake domain, then each input's (min_u, min_v, ext_u, ext_v).
+    dom: [f32; 4],
+    dom_a: [f32; 4],
+    dom_b: [f32; 4],
+    dom_factor: [f32; 4],
 }
 
 #[repr(C)]
@@ -801,6 +895,10 @@ struct MixParams {
 struct MapParams {
     size: [u32; 2],
     _pad: [u32; 2],
+    /// Own bake domain, the value input's, and the palette's.
+    dom: [f32; 4],
+    dom_value: [f32; 4],
+    dom_palette: [f32; 4],
 }
 
 #[repr(C)]
@@ -809,6 +907,10 @@ struct MinMaxParams {
     size: [u32; 2],
     mode: u32,       // 0 = Min, 1 = Max
     criterion: u32,  // 0=R 1=G 2=B 3=Sat 4=Val 5=Luma 6=Alpha 7=Chroma
+    /// Own bake domain, then each input's.
+    dom: [f32; 4],
+    dom_a: [f32; 4],
+    dom_b: [f32; 4],
 }
 
 #[repr(C)]
@@ -817,6 +919,10 @@ struct RampParams {
     size: [u32; 2],
     stop_count: u32,
     space: u32,
+    /// Own bake domain.
+    dom: [f32; 4],
+    /// Bake domain of each of the 8 possible layer-stop inputs.
+    input_doms: [[f32; 4]; 8],
 }
 
 #[repr(C)]
@@ -825,6 +931,9 @@ struct H2NParams {
     size: [u32; 2],
     strength: f32,
     _pad: u32,
+    /// Own bake domain, then the source's.
+    dom: [f32; 4],
+    dom_src: [f32; 4],
 }
 
 #[repr(C)]
@@ -835,6 +944,15 @@ struct RampStopPacked {
     kind: u32,         // 0 = const, 1 = layer
     input_index: u32,  // 0..7 into the ramp shader's input array
     _p0: f32,
+}
+
+fn domain_of(sched: &Schedule, id: LayerId) -> [f32; 4] {
+    sched
+        .domain_of
+        .get(&id)
+        .copied()
+        .unwrap_or(Domain::UNIT)
+        .packed()
 }
 
 fn slot_of(sched: &Schedule, id: LayerId) -> u32 {
@@ -869,11 +987,15 @@ fn dispatch_h2n(
     src_view: &wgpu::TextureView,
     h: &HeightToNormal,
     size: (u32, u32),
+    dom: [f32; 4],
+    dom_src: [f32; 4],
 ) {
     let params = H2NParams {
         size: [size.0, size.1],
         strength: h.strength,
         _pad: 0,
+        dom,
+        dom_src,
     };
     let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "h2n-params");
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -911,6 +1033,8 @@ fn dispatch_transform(
     t: &Transform,
     size: (u32, u32),
     w: f32,
+    dom: [f32; 4],
+    src_dom: [f32; 4],
 ) {
     let (coord_mode, permute, radial_dim, radial_into) = match t.coord_mode {
         CoordMode::Passthrough => (0u32, [0u32; 4], 0u32, 0u32),
@@ -940,7 +1064,12 @@ fn dispatch_transform(
         radial_dim,
         radial_into,
         w_coord: w,
-        _pad: 0,
+        edge_mode: match t.edge_mode {
+            EdgeMode::Clamp => 0,
+            EdgeMode::Extend => 1,
+        },
+        dom,
+        src_dom,
     };
     let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "transform-params");
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -979,6 +1108,10 @@ fn dispatch_mix(
     factor_view: &wgpu::TextureView,
     m: &Mix,
     size: (u32, u32),
+    dom: [f32; 4],
+    dom_a: [f32; 4],
+    dom_b: [f32; 4],
+    dom_factor: [f32; 4],
 ) {
     let mode = match m.mode {
         BlendMode::Add => 0u32,
@@ -997,6 +1130,10 @@ fn dispatch_mix(
         factor_const,
         factor_is_layer,
         _pad: [0, 0],
+        dom,
+        dom_a,
+        dom_b,
+        dom_factor,
     };
     let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "mix-params");
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1042,6 +1179,9 @@ fn dispatch_min_max(
     b_view: &wgpu::TextureView,
     mm: &MinMax,
     size: (u32, u32),
+    dom: [f32; 4],
+    dom_a: [f32; 4],
+    dom_b: [f32; 4],
 ) {
     let mode = match mm.mode {
         MinMaxMode::Min => 0u32,
@@ -1057,7 +1197,7 @@ fn dispatch_min_max(
         Criterion::Alpha => 6,
         Criterion::Chroma => 7,
     };
-    let params = MinMaxParams { size: [size.0, size.1], mode, criterion };
+    let params = MinMaxParams { size: [size.0, size.1], mode, criterion, dom, dom_a, dom_b };
     let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "min-max-params");
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("min-max-bg"),
@@ -1097,8 +1237,11 @@ fn dispatch_map(
     value_view: &wgpu::TextureView,
     palette_view: &wgpu::TextureView,
     size: (u32, u32),
+    dom: [f32; 4],
+    dom_value: [f32; 4],
+    dom_palette: [f32; 4],
 ) {
-    let params = MapParams { size: [size.0, size.1], _pad: [0, 0] };
+    let params = MapParams { size: [size.0, size.1], _pad: [0, 0], dom, dom_value, dom_palette };
     let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "map-params");
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("map-bg"),
@@ -1140,6 +1283,7 @@ fn dispatch_ramp(
     pool_views: &[wgpu::TextureView],
     dummy_input_view: &wgpu::TextureView,
     size: (u32, u32),
+    dom: [f32; 4],
 ) -> Result<(), BakeError> {
     use wgpu::util::DeviceExt;
 
@@ -1147,6 +1291,7 @@ fn dispatch_ramp(
     // stops pointing at the same layer share one slot.
     let mut layer_to_input: HashMap<LayerId, u32> = HashMap::new();
     let mut input_pool_slots: Vec<u32> = Vec::new();
+    let mut input_doms = [Domain::UNIT.packed(); MAX_RAMP_INPUTS];
     for s in &r.stops {
         if let ColorInput::Layer(id) = s.color {
             if !layer_to_input.contains_key(&id) {
@@ -1155,6 +1300,7 @@ fn dispatch_ramp(
                         "ColorRamp (>8 unique layer-referenced stops)",
                     ));
                 }
+                input_doms[input_pool_slots.len()] = domain_of(sched, id);
                 layer_to_input.insert(id, input_pool_slots.len() as u32);
                 input_pool_slots.push(slot_of(sched, id));
             }
@@ -1165,6 +1311,8 @@ fn dispatch_ramp(
         size: [size.0, size.1],
         stop_count: r.stops.len() as u32,
         space: blend_space_code(r.space),
+        dom,
+        input_doms,
     };
     let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "ramp-params");
 
@@ -1249,6 +1397,7 @@ fn dispatch_noise(
     ctx_seed: u32,
     size: (u32, u32),
     w: f32,
+    dom: [f32; 4],
 ) {
     let dims = match n.dims {
         NoiseDims::D1 => 0u32,
@@ -1271,6 +1420,7 @@ fn dispatch_noise(
         seed_base: ctx_seed.wrapping_add(n.seed_offset),
         frequency: n.frequency,
         w_coord: w,
+        dom,
     };
     let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "noise-params");
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1342,18 +1492,25 @@ fn pack_channel(
     solid_pipeline: &wgpu::ComputePipeline,
     solid_bgl: &wgpu::BindGroupLayout,
     pool_views: &[wgpu::TextureView],
+    missing_view: &wgpu::TextureView,
     dst_view: &wgpu::TextureView,
     size: (u32, u32),
     channel: OutputChannel,
     out: &OutputSlots,
     alpha_object: bool,
     z_px: u32,
+    src_dom: [f32; 4],
 ) {
     match channel {
         OutputChannel::Color => dispatch_pack(
             ctx, encoder, pack_pipeline, pack_bgl,
-            &pool_views[out.color as usize], dst_view, size, 0, [0.0; 4],
-            alpha_object, z_px,
+            match out.color {
+                Some(slot) => &pool_views[slot as usize],
+                // Unconnected output color — pack the missing-texture grid.
+                None => missing_view,
+            },
+            dst_view, size, 0, [0.0; 4],
+            alpha_object, z_px, src_dom,
         ),
         OutputChannel::Roughness => match out.roughness {
             ScalarSlot::Const(v) => dispatch_solid(
@@ -1364,7 +1521,7 @@ fn pack_channel(
             ScalarSlot::Slot(s) => dispatch_pack(
                 ctx, encoder, pack_pipeline, pack_bgl,
                 &pool_views[s as usize], dst_view, size, 2, [0.0; 4],
-                alpha_object, z_px,
+                alpha_object, z_px, src_dom,
             ),
         },
         OutputChannel::Metallic => match out.metallic {
@@ -1376,7 +1533,7 @@ fn pack_channel(
             ScalarSlot::Slot(s) => dispatch_pack(
                 ctx, encoder, pack_pipeline, pack_bgl,
                 &pool_views[s as usize], dst_view, size, 2, [0.0; 4],
-                alpha_object, z_px,
+                alpha_object, z_px, src_dom,
             ),
         },
         OutputChannel::Normal => match out.normal {
@@ -1387,7 +1544,7 @@ fn pack_channel(
             Some(s) => dispatch_pack(
                 ctx, encoder, pack_pipeline, pack_bgl,
                 &pool_views[s as usize], dst_view, size, 3, [0.0; 4],
-                alpha_object, z_px,
+                alpha_object, z_px, src_dom,
             ),
         },
     }
@@ -1405,6 +1562,7 @@ fn dispatch_pack(
     const_value: [f32; 4],
     alpha_object: bool,
     z_px: u32,
+    src_dom: [f32; 4],
 ) {
     let params = PackParams {
         size: [size.0, size.1],
@@ -1413,6 +1571,7 @@ fn dispatch_pack(
         const_value,
         z_px,
         _pad: [0; 3],
+        src_dom,
     };
     let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "pack-params");
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {

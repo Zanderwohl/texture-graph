@@ -11,6 +11,8 @@ struct RampParams {
     size: vec2<u32>,
     stop_count: u32,
     space: u32,      // 0=Oklch, 1=LinearSrgb, 2=Hsv
+    dom: vec4<f32>,  // own bake domain (min_u, min_v, ext_u, ext_v)
+    input_doms: array<vec4<f32>, 8>,
 }
 
 struct Stop {
@@ -32,6 +34,25 @@ struct Stop {
 @group(0) @binding(8) var in5: texture_2d<f32>;
 @group(0) @binding(9) var in6: texture_2d<f32>;
 @group(0) @binding(10) var in7: texture_2d<f32>;
+
+// Map this dispatch's texel to its UV within the layer's bake domain
+// (dom = (min_u, min_v, ext_u, ext_v)).
+fn dom_uv(dom: vec4<f32>, gid: vec2<u32>, size: vec2<u32>) -> vec2<f32> {
+    return vec2<f32>(
+        dom.x + (f32(gid.x) + 0.5) / f32(size.x) * dom.z,
+        dom.y + (f32(gid.y) + 0.5) / f32(size.y) * dom.w,
+    );
+}
+
+// Nearest texel of `uv` in an input baked over `dom`, clamped to its edge.
+fn dom_texel(dom: vec4<f32>, uv: vec2<f32>, size: vec2<u32>) -> vec2<i32> {
+    let tx = (uv.x - dom.x) / dom.z * f32(size.x);
+    let ty = (uv.y - dom.y) / dom.w * f32(size.y);
+    return vec2<i32>(
+        i32(clamp(tx, 0.0, f32(size.x) - 1.0)),
+        i32(clamp(ty, 0.0, f32(size.y) - 1.0)),
+    );
+}
 
 const PI: f32 = 3.14159265358979323846;
 const DEG_TO_RAD: f32 = PI / 180.0;
@@ -175,11 +196,12 @@ fn sample_input(idx: u32, coord: vec2<i32>) -> vec4<f32> {
     }
 }
 
-fn stop_color(idx: u32, coord: vec2<i32>) -> vec4<f32> {
+fn stop_color(idx: u32, uv: vec2<f32>) -> vec4<f32> {
     let s = stops[idx];
     if (s.kind == 0u) {
         return s.color;
     }
+    let coord = dom_texel(params.input_doms[s.input_index], uv, params.size);
     return sample_input(s.input_index, coord);
 }
 
@@ -187,7 +209,8 @@ fn stop_color(idx: u32, coord: vec2<i32>) -> vec4<f32> {
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.size.x || gid.y >= params.size.y) { return; }
     let coord = vec2<i32>(i32(gid.x), i32(gid.y));
-    let u = (f32(gid.x) + 0.5) / f32(params.size.x);
+    let uv = dom_uv(params.dom, gid.xy, params.size);
+    let u = uv.x;
     // Find the segment containing u. Matches the CPU loop in `eval_ramp`.
     var lo: u32 = 0u;
     var hi: u32 = params.stop_count - 1u;
@@ -211,10 +234,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let span = tb - ta;
     var t: f32 = 0.0;
     if (abs(span) >= 1.1754944e-38) {
-        t = (u - ta) / span;
+        // Clamp so the ramp holds the outermost stop's color past either
+        // end instead of extrapolating. Matches CPU `eval_ramp`.
+        t = clamp((u - ta) / span, 0.0, 1.0);
     }
-    let a_color = stop_color(lo, coord);
-    let b_color = stop_color(hi, coord);
+    let a_color = stop_color(lo, uv);
+    let b_color = stop_color(hi, uv);
     let out_px = blend_stops(a_color, b_color, t);
     textureStore(out_tex, coord, out_px);
 }
