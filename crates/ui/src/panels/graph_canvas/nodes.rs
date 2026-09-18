@@ -272,12 +272,22 @@ fn title(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, layout: &NodeLay
     let rect = title_rect(layout.rect, z);
     let editing = state.renaming.as_ref().is_some_and(|r| r.node == id);
 
+    // Both branches go through the same child Ui, at the same rect, with the
+    // same explicit id — so each registers exactly one widget, at one rect,
+    // under one auto-id, whether the title is a label you can click or a
+    // field you can type in. Swapping the *shape* of what is registered
+    // here is what egui's `warn_if_rect_changes_id` is watching for: the
+    // widget at this rect would have one id on the frame before a rename
+    // and another on the frame after, which paints a red outline and, worse,
+    // hands any in-flight interaction to the wrong widget.
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .id(egui::Id::new(("graph-title", id.0)))
+            .max_rect(rect),
+    );
+
     if !editing {
-        let resp = ui.interact(
-            rect,
-            egui::Id::new(("graph-title", id.0)),
-            egui::Sense::click(),
-        );
+        let resp = child.allocate_rect(rect, egui::Sense::click());
         if resp.clicked() {
             state.renaming = Some(Renaming {
                 node: id,
@@ -295,11 +305,6 @@ fn title(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, layout: &NodeLay
         .map(|r| r.text.clone())
         .unwrap_or_default();
     let focused = state.renaming.as_ref().is_some_and(|r| r.focused);
-    let mut child = ui.new_child(
-        egui::UiBuilder::new()
-            .id_salt(("graph-title-edit", id.0))
-            .max_rect(rect),
-    );
     let resp = child.add_sized(
         rect.size(),
         egui::TextEdit::singleline(&mut text)
@@ -374,8 +379,19 @@ fn draw_thumbnail(
 // ---- Inline widget rows -------------------------------------------------
 
 /// Child Ui spanning one row, with the app style scaled to the canvas zoom
-/// so fonts, spacing, and interact sizes track the node visually. The salt
-/// keeps auto widget ids stable when nodes are added or removed.
+/// so fonts, spacing, and interact sizes track the node visually.
+///
+/// The id is set with [`egui::UiBuilder::id`] — *explicit*, not a salt.
+/// A salted child derives its `unique_id`, and with it the auto-ids of
+/// every widget inside, from the parent's running `next_auto_id_salt`.
+/// That makes each inline slider and drag-value depend on how many child
+/// Uis happened to be created before it this frame — which changes when
+/// the rename field appears or disappears, and when a node scrolls out of
+/// view and stops registering. The widgets then swap ids under each other
+/// for a frame: egui paints its `warn_if_rect_changes_id` outlines across
+/// the whole canvas, and an in-progress drag lands on the wrong widget. An
+/// explicit id is independent of the parent, so a row's widgets keep their
+/// ids no matter what else is on screen.
 fn row_ui(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -387,7 +403,7 @@ fn row_ui(
     let inner = rect.shrink2(egui::vec2(10.0 * zoom, 0.0));
     let mut child = ui.new_child(
         egui::UiBuilder::new()
-            .id_salt(("node-row", salt))
+            .id(egui::Id::new(("node-row", salt)))
             .max_rect(inner)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );

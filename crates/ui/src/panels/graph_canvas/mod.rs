@@ -311,3 +311,247 @@ fn canvas_context_menu(
         }
     });
 }
+
+#[cfg(test)]
+mod canvas_tests {
+    use super::*;
+    use crate::catalog::{self, Kind};
+    use crate::previews::PreviewCache;
+    use texture_graph_core::{BlendMode, EvalCtx, LayerKind};
+
+    const SCREEN: egui::Vec2 = egui::vec2(900.0, 600.0);
+
+    /// Title of the layer at world (0, 0). Screen = canvas.min + pan +
+    /// world, `title_rect` insets by (8, 2), and pan defaults to (40, 40).
+    const BASE_TITLE: egui::Pos2 = egui::pos2(100.0, 50.0);
+    /// Empty canvas, well clear of every node.
+    const EMPTY: egui::Pos2 = egui::pos2(840.0, 560.0);
+
+    /// Drives the real canvas through a real `egui::Context`, headlessly.
+    struct Harness {
+        ctx: egui::Context,
+        graph: Graph,
+        state: UiState,
+        previews: PreviewCache,
+        eval: EvalCtx,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let mut graph = Graph::new();
+            let noise = graph.add_layer("alpha", catalog::default_kind(Kind::Noise)).unwrap();
+            let mix = graph.add_layer("beta", catalog::default_kind(Kind::Mix)).unwrap();
+            let base = graph.layers[0].id;
+            graph.add_canvas("main").unwrap();
+            graph.set_position("main", base, [0.0, 0.0]).unwrap();
+            graph.set_position("main", noise, [0.0, 320.0]).unwrap();
+            graph.set_position("main", mix, [260.0, 0.0]).unwrap();
+            graph.set_output_position("main", [520.0, 0.0]).unwrap();
+            Self {
+                ctx: egui::Context::default(),
+                graph,
+                state: UiState::default(),
+                previews: PreviewCache::default(),
+                eval: EvalCtx::default(),
+            }
+        }
+
+        /// Run one frame, returning how many shapes egui painted in its
+        /// error colour. Those are its debug overlays — `warn_on_id_clash`
+        /// and `warn_if_rect_changes_id`, both on in debug builds — and any
+        /// of them means the canvas moved a widget id around.
+        ///
+        /// The canvas paints nothing red of its own except an ineligible
+        /// socket mid-wire-drag, which no test here performs.
+        fn frame(&mut self, events: Vec<egui::Event>) -> usize {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN)),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let red = self.ctx.global_style().visuals.error_fg_color;
+            let graph = &self.graph;
+            let state = &mut self.state;
+            let previews = &mut self.previews;
+            let eval = &self.eval;
+            let out = self.ctx.run_ui(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        super::show(ui, graph, state, previews, eval, None);
+                    });
+            });
+            self.state.drain_into(&mut self.graph);
+            let mut n = 0;
+            for clipped in &out.shapes {
+                count_red(&clipped.shape, red, &mut n);
+            }
+            n
+        }
+
+        /// Run `count` frames with no input, returning the total red count.
+        fn settle(&mut self, count: usize) -> usize {
+            (0..count).map(|_| self.frame(vec![])).sum()
+        }
+
+        fn click(&mut self, pos: egui::Pos2) -> usize {
+            let down = vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ];
+            let up = vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }];
+            self.frame(down) + self.frame(up)
+        }
+
+        fn name_of(&self, i: usize) -> &str {
+            &self.graph.layers[i].name
+        }
+    }
+
+    fn count_red(shape: &egui::Shape, red: egui::Color32, n: &mut usize) {
+        match shape {
+            egui::Shape::Rect(r) if r.stroke.color == red || r.fill == red => *n += 1,
+            egui::Shape::Text(t) if t.galley.text().contains('🔥') => *n += 1,
+            egui::Shape::Vec(v) => {
+                for s in v {
+                    count_red(s, red, n);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Every inline widget in the canvas lives in a child `Ui`, and a child
+    /// keyed by *salt* takes its auto-id seed from the parent's running
+    /// counter. Showing the rename field adds one child before all the
+    /// rows, so every slider and drag-value after it used to shift one slot
+    /// along: egui flagged the whole canvas for a frame, and any in-flight
+    /// interaction would have been handed to its neighbour. The ids are
+    /// explicit now, and this is what holds them that way.
+    #[test]
+    fn starting_and_ending_a_rename_does_not_shuffle_widget_ids() {
+        let mut h = Harness::new();
+        assert_eq!(h.settle(3), 0, "the idle canvas already paints warnings");
+
+        assert_eq!(h.click(BASE_TITLE), 0, "arming the rename shuffled ids");
+        assert!(h.state.renaming.is_some(), "clicking the title did not start a rename");
+        assert_eq!(h.settle(3), 0, "showing the rename field shuffled ids");
+
+        // Clicking away blurs the field, which commits and removes it.
+        assert_eq!(h.click(EMPTY), 0, "blurring the rename field shuffled ids");
+        assert!(h.state.renaming.is_none(), "clicking away did not end the rename");
+        assert_eq!(h.settle(3), 0, "removing the rename field shuffled ids");
+    }
+
+    /// The same hazard from the other direction, and the one that reaches
+    /// the *rows*: a node's row count depends on its parameters, so
+    /// switching a Mix off Blend removes two rows — and two child `Ui`s —
+    /// from the middle of the canvas. Every widget laid out after it then
+    /// shifts a slot along while staying exactly where it was, which is
+    /// precisely the case egui's `warn_if_rect_changes_id` catches.
+    ///
+    /// The Output node is downstream of the Mix here and keeps two sliders,
+    /// so there is something left to shift onto.
+    #[test]
+    fn changing_a_nodes_row_count_does_not_shuffle_later_widget_ids() {
+        let mut h = Harness::new();
+        assert_eq!(h.settle(3), 0, "the idle canvas already paints warnings");
+
+        let mix = h.graph.layers[2].id;
+        let LayerKind::Mix(mut m) = h.graph.get(mix).unwrap().kind.clone() else {
+            panic!("layer 2 is the Mix")
+        };
+        assert_eq!(
+            rows_before_and_after(&h.graph, mix, BlendMode::Add),
+            (5, 3),
+            "this test needs the row count to actually change"
+        );
+        m.mode = BlendMode::Add;
+        h.graph.set_kind(mix, LayerKind::Mix(m)).unwrap();
+
+        assert_eq!(h.settle(3), 0, "dropping two rows shuffled later ids");
+    }
+
+    /// How many rows the Mix has now, and how many it would have in `mode`.
+    fn rows_before_and_after(graph: &Graph, id: LayerId, mode: BlendMode) -> (usize, usize) {
+        let kind = graph.get(id).unwrap().kind.clone();
+        let before = layout::rows_for(&kind).len();
+        let LayerKind::Mix(mut m) = kind else { panic!() };
+        m.mode = mode;
+        (before, layout::rows_for(&LayerKind::Mix(m)).len())
+    }
+
+    /// Panning is the other way child `Ui` counts change, because
+    /// off-screen nodes are skipped whole. This does not exercise the id
+    /// hazard the way the row-count test does — every rect moves with the
+    /// pan, so egui has no same-rect pair to compare — but it does prove
+    /// the cull path itself paints nothing and does not panic.
+    #[test]
+    fn panning_nodes_out_of_view_is_quiet() {
+        let mut h = Harness::new();
+        assert_eq!(h.settle(3), 0);
+        for pan in [-200.0, -400.0, -800.0, -1200.0] {
+            h.state.canvas_pan = egui::vec2(pan, pan);
+            assert_eq!(h.settle(2), 0, "panning to {pan} painted a warning");
+        }
+    }
+
+    /// The rename itself, end to end through the real widget: click the
+    /// title, type, press Enter, and the layer is renamed.
+    #[test]
+    fn clicking_a_title_renames_the_layer() {
+        let mut h = Harness::new();
+        h.settle(3);
+        assert_eq!(h.name_of(0), "base color");
+
+        h.click(BASE_TITLE);
+        h.frame(vec![]);
+        h.frame(vec![egui::Event::Text("!".to_string())]);
+        h.frame(vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }]);
+        h.settle(2);
+
+        assert_eq!(h.name_of(0), "base color!", "Enter did not commit the rename");
+        assert!(h.state.renaming.is_none(), "the field outlived the commit");
+    }
+
+    /// Escape throws the edit away. Committing on blur is the other path,
+    /// and the two must not be confused: Escape also surrenders focus, so
+    /// an implementation that checked for a blur first would read a cancel
+    /// as a commit.
+    #[test]
+    fn escape_abandons_a_rename() {
+        let mut h = Harness::new();
+        h.settle(3);
+        h.click(BASE_TITLE);
+        h.frame(vec![]);
+        h.frame(vec![egui::Event::Text("zzz".to_string())]);
+        h.frame(vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }]);
+        h.settle(2);
+
+        assert_eq!(h.name_of(0), "base color", "Escape committed the edit anyway");
+        assert!(h.state.renaming.is_none());
+    }
+}

@@ -179,6 +179,68 @@ the panel default.
 
 ---
 
+# Fixes found after the fact
+
+## Widget ids shuffling for a frame (egui auto-id hazard)
+
+**Symptom:** a red outline flashed over most of the canvas for one frame
+whenever the inline rename field appeared or disappeared — including when
+clicking the Material Output's title, which merely blurs a rename elsewhere.
+
+**What it was:** egui's `warn_if_rect_changes_id` debug overlay (on in every
+debug build, alongside `warn_on_id_clash`). It fires when the widget at a given
+rect has a different `Id` than it did last frame. It paints a red stroke and no
+text, which is how it is told apart from the id-clash warning.
+
+**Root cause**, in `egui::Ui::new_child`:
+
+```rust
+IdSource::Child(id_salt) => {
+    let stable_id = self.id.with(id_salt);
+    let unique_id = stable_id.with(self.next_auto_id_salt); // parent's counter!
+    (stable_id, unique_id)
+}
+...
+self.next_auto_id_salt = self.next_auto_id_salt.wrapping_add(1);
+```
+
+A child `Ui` built with `id_salt` still derives its `unique_id` — and so the
+auto-id seed of every widget *inside* it — from the parent's running counter.
+`row_ui` built one salted child per node row, so every inline slider and
+drag-value depended on how many child `Ui`s happened to exist before it that
+frame. Showing the rename field added one, and 51 widgets shifted a slot along
+while staying exactly where they were.
+
+**Fix:** `UiBuilder::id` instead of `id_salt` for the row children (an explicit
+id is independent of the parent), and one shared child `Ui` for the title so
+both branches register the same widget footprint whether it is a click target
+or a text field.
+
+This also mattered for the Tier 1 off-screen culling, which changes child counts
+by a different route, and for anything that changes a node's row count
+mid-canvas (switching a Mix off Blend drops two rows).
+
+**Lesson for this codebase:** in the canvas, never let a child `Ui`'s identity
+come from a salt. Positions, visibility and row counts all vary per frame, so
+the parent's auto-id counter is not stable and nothing may depend on it.
+
+**Tests:** `canvas_tests` in `graph_canvas/mod.rs` drives the real canvas
+through a real `egui::Context` headlessly and counts shapes painted in
+`error_fg_color`. Both halves of the fix were verified by reverting them and
+watching the right test fail:
+
+- `starting_and_ending_a_rename_does_not_shuffle_widget_ids` — the title half
+- `changing_a_nodes_row_count_does_not_shuffle_later_widget_ids` — the row half
+  (a Mix switched off Blend, with the Output node's sliders downstream of it)
+- `panning_nodes_out_of_view_is_quiet` — proves the cull path is quiet, but
+  does *not* exercise the id hazard: panning moves every rect, so egui has no
+  same-rect pair to compare. The comment on the test says so.
+- `clicking_a_title_renames_the_layer` / `escape_abandons_a_rename` — the
+  feature itself, end to end through the real widget.
+
+This harness is the tool to reach for the next time the canvas misbehaves
+visually; it is much faster than driving the app by hand.
+
 # Tier 2 — real wins, need adaptation (DONE)
 
 - [x] **8. Per-layer preview staleness** (done; no bake budget — see below)
