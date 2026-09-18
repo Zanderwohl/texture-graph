@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use texture_graph_core::{EvalCtx, Graph, LayerId};
 
 use crate::app::GpuBits;
-use crate::panels::inspector;
+use crate::catalog;
 use crate::previews::PreviewCache;
 use crate::state::{EditCmd, NodeRef, UiState};
 
@@ -281,17 +281,6 @@ fn release_stale_ramp_drag(ui: &egui::Ui, graph: &Graph, state: &mut UiState) {
 
 // ---- Context menu -------------------------------------------------------
 
-const VARIANTS: &[&str] = &[
-    "Color",
-    "Noise",
-    "ColorRamp",
-    "Transform",
-    "Mix",
-    "Map",
-    "MinMax",
-    "HeightToNormal",
-];
-
 /// Right-click on empty canvas: add a node of any type at the pointer.
 /// (Right-clicks on nodes are claimed by the node's own interact, so this
 /// only fires on the background.)
@@ -308,14 +297,13 @@ fn canvas_context_menu(
         }
     }
     canvas_resp.context_menu(|ui| {
-        for &variant in VARIANTS {
-            if ui.button(variant).clicked() {
-                let name = crate::util::unique_name(graph, &variant.to_ascii_lowercase());
-                let kind = inspector::default_kind(variant, graph);
+        for variant in catalog::VARIANTS {
+            if ui.button(variant.label).clicked() {
+                let name = catalog::unique_name(graph, &variant.label.to_ascii_lowercase());
                 let pos = state.ctx_menu_world.take().unwrap_or([0.0, 0.0]);
                 state.push(EditCmd::AddLayer {
                     name,
-                    kind,
+                    kind: catalog::default_kind(variant.kind),
                     pos: Some((state.active_canvas.clone(), pos)),
                 });
                 ui.close();

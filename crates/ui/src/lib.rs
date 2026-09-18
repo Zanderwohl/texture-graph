@@ -2,12 +2,12 @@
 //! binary and the wasm build driven by Trunk (see `index.html`).
 
 pub mod app;
+pub mod catalog;
 pub mod color_convert;
 pub mod file_io;
 pub mod panels;
 pub mod previews;
 pub mod state;
-pub mod util;
 pub mod widgets;
 
 pub use app::TextureGraphApp;

@@ -182,7 +182,7 @@ the panel default.
 # Tier 2 — real wins, need adaptation
 
 - [x] **8. Per-layer preview staleness** (done; no bake budget — see below)
-- [ ] **9. A `catalog` module**
+- [x] **9. A `catalog` module**
 - [ ] **10. `refusal()` pre-flight with a message**
 
 ### 8. Per-layer preview staleness — DONE
@@ -257,14 +257,35 @@ intermediates for every layer, so the win should still be large. And
 reorders (MBG's comment explicitly notes this obligation does not apply to *its*
 stop lists).
 
-### 9. A `catalog` module — NOT STARTED
+### 9. A `catalog` module — DONE
 
-The node list is written down **twice**: `VARIANTS: &[&str]` in
-`graph_canvas/mod.rs` and `VARIANTS: &[VariantSpec]` in `panels/inspector.rs`,
-and `default_kind` is keyed by `&str`. Port `src/common/generator/catalog.rs`:
-one `VARIANTS` list carrying a `Kind` enum (matched instead of the label, so
-editing menu text cannot quietly produce a different node), a `Group` for
-submenus, `default_kind(&Variant)`, and `unique_name` (move `crate::util`'s in).
+`crates/ui/src/catalog.rs` now owns the node list: `Variant { label, kind }`,
+a `Kind` enum with `Kind::of(&LayerKind)`, `default_kind(Kind)` and
+`unique_name`. `graph_canvas/mod.rs` and `panels/inspector.rs` both read it;
+`crates/ui/src/util.rs` is gone (it held only `unique_name`).
+
+What this removed: two copies of the eight-entry list, a `&str` key
+(`"ColorRamp"`) that the label duplicated exactly, and a `_ =>` fallback arm in
+`default_kind` that silently produced a Color for anything unrecognized — so a
+typo in one copy added the wrong node instead of failing to compile.
+`default_kind` also took a `&Graph` it never used.
+
+**Deviation: no `Group`, no submenus.** MBG has 28 node kinds and needs them;
+we have eight, and four submenus of two would cost a hover and a pointer trip
+to reach any entry. `VARIANTS` is flat and ordered. Add grouping when the
+catalog outgrows one list — it is a field on `Variant` and a nested loop in the
+context menu.
+
+Four tests hold it: every default is the variant it was asked for
+(`Kind::of(default_kind(k)) == k`), every `Kind` appears in `VARIANTS`, every
+default is actually addable through `Graph::add_layer`, and `unique_name` walks
+past what is taken. `Kind::of` is exhaustive over `LayerKind`, so a new node
+kind in core does not compile until it has a `Kind`, and the menu test then
+forces it into `VARIANTS`.
+
+Note there is a third copy of these strings, deliberately left alone:
+`LayerKind::category_label()` in core, which the node header paints as its
+subtitle. That one is the model describing itself and is fine where it is.
 
 ### 10. `refusal()` pre-flight with a message — NOT STARTED
 

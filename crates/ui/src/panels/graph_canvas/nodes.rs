@@ -152,7 +152,7 @@ fn body_interact(
                 // node placed down-and-right of this one.
                 if ui.button("Duplicate").clicked() {
                     if let Some(layer) = graph.get(id) {
-                        let name = crate::util::unique_name(graph, &layer.name);
+                        let name = crate::catalog::unique_name(graph, &layer.name);
                         let pos = [world.x + DUPLICATE_OFFSET, world.y + DUPLICATE_OFFSET];
                         state.push(EditCmd::AddLayer {
                             name,
