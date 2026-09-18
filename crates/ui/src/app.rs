@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use eframe::CreationContext;
@@ -73,6 +74,17 @@ impl eframe::App for TextureGraphApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Retire the thumbnails last frame's edits invalidated, before
+        // anything asks for one. `None` means "all of them"; a set means
+        // exactly those layers and the consumers `state` already folded in.
+        let dirty = self.ui.dirty_previews.replace(HashSet::new());
+        self.previews.begin_frame(
+            &self.graph,
+            self.ui.revision,
+            dirty.as_ref(),
+            self.gpu.as_ref(),
+        );
+
         egui::Panel::top("menu_bar").show(ui, |ui| {
             panels::menu_bar::show(ui, &self.graph, &mut self.ui);
         });
@@ -113,19 +125,10 @@ impl eframe::App for TextureGraphApp {
         file_io::handle_wants_open(&mut self.ui, ui.ctx());
         file_io::poll_pending(&mut self.ui);
 
-        // Apply queued mutations; invalidate the per-layer preview cache
-        // if any changes actually landed so the next frame rebuilds only
-        // what's visible. The flat-preview panel consumes `state.dirty`
-        // for its own bake, so leave it set here.
-        let was_clean = !self.ui.dirty;
+        // Apply queued mutations. What this dirties for the thumbnail
+        // cache is recorded in `ui.dirty_previews` and consumed at the top
+        // of the next frame; the big preview panel consumes `state.dirty`
+        // for its own bake, so leave that set here.
         self.ui.drain_into(&mut self.graph);
-        if was_clean && self.ui.dirty {
-            // Mark the per-layer thumbnail cache stale — it will keep
-            // showing current textures until the next frame's rebake
-            // swaps in the new ones. The big-preview panel already
-            // handles this pattern via `state.dirty` + register/free
-            // ordering inside `bake_output` itself.
-            self.previews.mark_stale();
-        }
     }
 }

@@ -179,9 +179,59 @@ the panel default.
 
 ---
 
-# Tier 2 — real wins, need adaptation (NOT STARTED)
+# Tier 2 — real wins, need adaptation
 
-### 8. Per-node preview staleness + bake budget
+- [x] **8. Per-layer preview staleness** (done; no bake budget — see below)
+- [ ] **9. A `catalog` module**
+- [ ] **10. `refusal()` pre-flight with a message**
+
+### 8. Per-layer preview staleness — DONE
+
+Landed across `crates/ui/src/{previews,state,app}.rs` and
+`crates/gpu/src/{schedule,baker}.rs`. 78 tests pass, clippy clean in every file
+touched.
+
+What it does now:
+
+- `UiState` carries `revision: u64` and `dirty_previews: Option<HashSet<LayerId>>`
+  (`None` = all). `drain_into` computes the set per landed command from
+  `dirty_roots(&cmd)` plus a `downstream()` consumer walk, taking the union of
+  the pre- and post-apply graph so a `Remove` still finds its readers.
+- `PreviewCache` keeps a `(revision, forced)` stamp per entry and a
+  `stale_at: HashMap<LayerId, u64>`. `begin_frame(graph, revision, dirty, gpu)`
+  runs at the top of the app's frame, retires what `dirty` names, and drops
+  entries for layers that no longer exist.
+- The first request for a stale layer triggers one bulk `rebuild` for the whole
+  stale set (`rebuilt_this_frame` guards the rest of the frame). Clean layers
+  are not baked, not registered, and keep the texture they already had.
+- `Baker::bake_previews` gained a `wanted: Option<&HashSet<LayerId>>`.
+  `schedule_previews` schedules only `wanted` and their upstream closure, and
+  only `wanted` get an output texture and a pack pass.
+
+**Deviations from the plan as written above:**
+
+- **No `BAKES_PER_FRAME` budget.** MBG needs one because it bakes per node; here
+  one `bake_previews` call covers the whole stale set in a single submit, so a
+  budget would add staleness and save nothing. Revisit only if a cold cache on a
+  very large graph turns out to hitch.
+- **Domains are still computed over the whole graph** inside `schedule_previews`,
+  deliberately. A layer's bake domain is decided by its *consumers* (an
+  `EdgeMode::Extend` transform pulls its source wider), so a subset walk would
+  give a layer a narrower domain whenever the consumer that widened it was clean
+  — and its thumbnail would come back at a different effective resolution
+  depending on what else was stale. `a_subset_bake_gives_the_same_picture_as_a_full_one`
+  in `bake_test.rs` is what holds that.
+- **The `RampStop(i)` caveat was over-cautious.** `SetKind` dirties the whole
+  layer, so a reordered ramp needs no positional bookkeeping for previews. The
+  obligation is real only for `saved_consts` (`remap_ramp_consts`), which is
+  unchanged.
+- **A failed bake now retries next frame** instead of silently clearing the stale
+  flag. The common failure is transient (device lost on resume) and a thumbnail
+  that never comes back is worse than one attempt per frame.
+- `PreviewCache::mark_stale` is gone; `app.rs` no longer needs the `was_clean`
+  dance around `state.dirty`, which belongs to the big preview panel alone.
+
+### 8-original. Per-node preview staleness + bake budget (plan as written)
 
 The biggest win. `crates/ui/src/previews.rs` is all-or-nothing: any
 eval-affecting edit sets `stale`, and the next `get_or_build` re-bakes **every**
@@ -207,7 +257,7 @@ intermediates for every layer, so the win should still be large. And
 reorders (MBG's comment explicitly notes this obligation does not apply to *its*
 stop lists).
 
-### 9. A `catalog` module
+### 9. A `catalog` module — NOT STARTED
 
 The node list is written down **twice**: `VARIANTS: &[&str]` in
 `graph_canvas/mod.rs` and `VARIANTS: &[VariantSpec]` in `panels/inspector.rs`,
@@ -216,7 +266,7 @@ one `VARIANTS` list carrying a `Kind` enum (matched instead of the label, so
 editing menu text cannot quietly produce a different node), a `Group` for
 submenus, `default_kind(&Variant)`, and `unique_name` (move `crate::util`'s in).
 
-### 10. `refusal()` pre-flight with a message
+### 10. `refusal()` pre-flight with a message — NOT STARTED
 
 `wires::refusal(graph, node, key, src) -> Option<String>` runs while the wire is
 still in the air, turns the target socket red, and supplies the drop-time error

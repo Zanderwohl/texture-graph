@@ -1,15 +1,52 @@
 //! End-to-end bake tests. Each variant that lands should add one here
 //! comparing the GPU output to `core`'s CPU evaluator.
 
+use std::collections::HashSet;
+
 use texture_graph_core::{
     BlendMode, BlendSpace, Color, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion,
-    EdgeMode, EvalCtx, Graph, HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims,
-    NoiseOutput, NoiseRange, Output, ScalarInput, Transform, color::to_srgb8,
+    EdgeMode, EvalCtx, Graph, HeightToNormal, LayerId, LayerKind, Map, MinMax, MinMaxMode, Mix,
+    Noise, NoiseDims, NoiseOutput, NoiseRange, Output, ScalarInput, Transform, color::to_srgb8,
 };
 
 use crate::{Baker, DeviceCtx};
 
 const SIZE: (u32, u32) = (8, 8);
+
+fn add_mix(g: &mut Graph, name: &str, a: LayerId, b: LayerId) -> LayerId {
+    g.add_layer(
+        name,
+        LayerKind::Mix(Mix {
+            a: Some(a),
+            b: Some(b),
+            mode: BlendMode::Add,
+            factor: ScalarInput::Const(0.5),
+            space: BlendSpace::Oklch,
+        }),
+    )
+    .unwrap()
+}
+
+fn add_transform(
+    g: &mut Graph,
+    name: &str,
+    src: LayerId,
+    scale: [f32; 3],
+    edge_mode: EdgeMode,
+) -> LayerId {
+    g.add_layer(
+        name,
+        LayerKind::Transform(Transform {
+            source: Some(src),
+            offset: [0.0; 3],
+            rotate_uv: 0.0,
+            scale,
+            coord_mode: CoordMode::Passthrough,
+            edge_mode,
+        }),
+    )
+    .unwrap()
+}
 
 /// Read every pixel of an Rgba8Unorm texture into a flat Vec<[u8; 4]>.
 fn readback_all_pixels(ctx: &DeviceCtx, tex: &wgpu::Texture, size: (u32, u32)) -> Vec<[u8; 4]> {
@@ -812,7 +849,8 @@ fn bake_previews_returns_one_texture_per_authored_layer() {
     let _unreachable = graph
         .add_layer("dead", LayerKind::Color(Color::new(0.9, 0.05, 200.0, 1.0)))
         .unwrap();
-    let previews = baker.bake_previews(&graph, &EvalCtx::default()).expect("bake previews");
+    let previews =
+        baker.bake_previews(&graph, &EvalCtx::default(), None).expect("bake previews");
     assert_eq!(previews.len(), 3, "expected one preview per authored layer");
     // Sanity: each output is 128² Rgba8Unorm.
     for (_, tex) in &previews {
@@ -820,6 +858,74 @@ fn bake_previews_returns_one_texture_per_authored_layer() {
         assert_eq!(tex.height(), 128);
         assert_eq!(tex.format(), wgpu::TextureFormat::Rgba8Unorm);
     }
+}
+
+/// Asking for a subset must hand back exactly that subset. A layer that
+/// came along only because something wanted reads it is dispatched, but it
+/// is not packed and not returned — the caller is still showing the texture
+/// it already had for that one, and handing it a second would leak the
+/// first.
+#[test]
+fn bake_previews_returns_only_the_layers_that_were_asked_for() {
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let base = graph.output.color.unwrap();
+    graph.set_kind(base, LayerKind::Color(Color::new(0.5, 0.0, 0.0, 1.0))).unwrap();
+    let b = graph.add_layer("b", LayerKind::Color(Color::new(0.3, 0.1, 60.0, 1.0))).unwrap();
+    // `mixed` reads both, so asking for it schedules them without packing
+    // them.
+    let mixed = add_mix(&mut graph, "mixed", base, b);
+    let untouched = graph
+        .add_layer("untouched", LayerKind::Color(Color::new(0.9, 0.05, 200.0, 1.0)))
+        .unwrap();
+
+    let wanted: HashSet<LayerId> = [mixed].into_iter().collect();
+    let previews = baker
+        .bake_previews(&graph, &EvalCtx::default(), Some(&wanted))
+        .expect("bake previews");
+    assert_eq!(previews.keys().copied().collect::<Vec<_>>(), vec![mixed]);
+    assert!(!previews.contains_key(&untouched), "an unrelated layer was baked");
+}
+
+/// A thumbnail must be the same picture whichever way it was baked. The
+/// trap is bake domains: they are decided by a layer's *consumers*, so a
+/// subset schedule that only walked the subset would give a layer a
+/// narrower domain whenever the consumer that widened it was clean, and
+/// its thumbnail would come back at a different effective resolution
+/// depending on what else happened to be stale.
+#[test]
+fn a_subset_bake_gives_the_same_picture_as_a_full_one() {
+    use texture_graph_core::EdgeMode;
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let src = graph.output.color.unwrap();
+    graph
+        .set_kind(
+            src,
+            LayerKind::Noise(Noise {
+                dims: NoiseDims::D2,
+                seed_offset: 7,
+                frequency: 8.0,
+                range: NoiseRange::Unsigned,
+                output: NoiseOutput::Grayscale,
+            }),
+        )
+        .unwrap();
+    // The extend transform is what widens `src`'s bake domain past the
+    // unit square. It is not in `wanted` below.
+    let _zoom = add_transform(&mut graph, "zoom", src, [0.25, 0.25, 1.0], EdgeMode::Extend);
+
+    let full = baker.bake_previews(&graph, &EvalCtx::default(), None).expect("full");
+    let wanted: HashSet<LayerId> = [src].into_iter().collect();
+    let subset = baker
+        .bake_previews(&graph, &EvalCtx::default(), Some(&wanted))
+        .expect("subset");
+
+    let a = readback_all_pixels(&ctx, &full[&src], (128, 128));
+    let b = readback_all_pixels(&ctx, &subset[&src], (128, 128));
+    assert_eq!(a, b, "the same layer baked two ways gave two different pictures");
 }
 
 #[test]

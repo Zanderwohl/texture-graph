@@ -11,7 +11,7 @@
 //! values. `pack_srgb8.wgsl` applies the gamma manually to match
 //! `core::color::to_srgb8`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bytemuck::{Pod, Zeroable};
 use texture_graph_core::{
@@ -23,7 +23,7 @@ use texture_graph_core::{
 use texture_graph_core::EdgeMode;
 
 use crate::device::DeviceCtx;
-use crate::schedule::{Domain, OutputSlots, ScalarSlot, Schedule, schedule, schedule_no_reuse};
+use crate::schedule::{Domain, OutputSlots, ScalarSlot, Schedule, schedule, schedule_previews};
 
 /// Max stops per ColorRamp supported by the GPU baker.
 const MAX_RAMP_STOPS: usize = 16;
@@ -181,13 +181,22 @@ impl Baker {
     /// intermediate slot (no pebble reuse), then a `pack_srgb8` pass packs
     /// each to an `Rgba8Unorm` texture. Returns one texture per layer for
     /// the UI to register with egui-wgpu.
+    /// Bake 128² thumbnails for `wanted` — or for every layer when it is
+    /// `None`.
+    ///
+    /// Asking for a subset costs a subset: only `wanted` and the layers
+    /// they transitively read are dispatched, and only `wanted` get an
+    /// output texture and a pack pass. The returned map has exactly the
+    /// layers that were asked for, so a caller holding textures for the
+    /// rest keeps showing them.
     pub fn bake_previews(
         &mut self,
         graph: &Graph,
         eval_ctx: &EvalCtx,
+        wanted: Option<&HashSet<LayerId>>,
     ) -> Result<HashMap<LayerId, wgpu::Texture>, BakeError> {
         const PREVIEW_SIZE: (u32, u32) = (128, 128);
-        let sched = schedule_no_reuse(graph)?;
+        let sched = schedule_previews(graph, wanted)?;
         let size = PREVIEW_SIZE;
         let device = self.ctx.device.clone();
 
@@ -220,10 +229,16 @@ impl Baker {
             inter_views.push(view);
         }
 
-        // One packed Rgba8Unorm output per layer, kept and handed back.
+        // One packed Rgba8Unorm output per *wanted* layer, kept and handed
+        // back. The rest of `sched.order` is scheduled only because
+        // something wanted reads it, and is never packed or returned.
+        let packed: Vec<LayerId> = match wanted {
+            Some(w) => sched.order.iter().copied().filter(|id| w.contains(id)).collect(),
+            None => sched.order.clone(),
+        };
         let mut outputs: HashMap<LayerId, wgpu::Texture> = HashMap::new();
         let mut output_views: HashMap<LayerId, wgpu::TextureView> = HashMap::new();
-        for &id in &sched.order {
+        for &id in &packed {
             let tex = make_output_texture(&device, size, "tg-preview-out");
             let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
             output_views.insert(id, view);
@@ -260,9 +275,10 @@ impl Baker {
             )?;
         }
 
-        // 2. Pack every intermediate to its sRGB output. Thumbnails show
-        // the layer's own [0, 1] view even when its bake domain is wider.
-        for &id in &sched.order {
+        // 2. Pack every wanted intermediate to its sRGB output. Thumbnails
+        // show the layer's own [0, 1] view even when its bake domain is
+        // wider.
+        for &id in &packed {
             let slot = *sched.slot_of.get(&id).unwrap() as usize;
             let dst_view = output_views.get(&id).unwrap();
             dispatch_pack(
