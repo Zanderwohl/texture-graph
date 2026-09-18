@@ -9,14 +9,19 @@
 //!
 //! This crate stays independent of eframe/egui — the UI crate re-registers
 //! the returned `wgpu::Texture`s via `egui_wgpu::Renderer::register_native_texture`.
+//! `examples/bake.rs` is the headless path end to end, and is what keeps that
+//! independence honest: it compiles under `cargo test`, so a stray editor
+//! dependency would break the build rather than go unnoticed.
 
 pub mod baker;
 pub mod device;
+pub mod readback;
 pub mod scene;
 pub mod schedule;
 
 pub use baker::{BakeError, BakeOutput, Baker, VolumeOutput};
 pub use device::DeviceCtx;
+pub use readback::{Image, read_rgba8};
 pub use scene::{SceneCamera, SceneMaterial, SceneRenderer, SceneShape};
 pub use schedule::{OutputSlots, ScalarSlot, Schedule, ScheduleError, schedule, schedule_no_reuse};
 

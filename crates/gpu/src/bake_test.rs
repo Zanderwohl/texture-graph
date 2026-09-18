@@ -48,55 +48,19 @@ fn add_transform(
     .unwrap()
 }
 
-/// Read every pixel of an Rgba8Unorm texture into a flat Vec<[u8; 4]>.
+/// Every pixel of an Rgba8Unorm texture, as `[r, g, b, a]`.
+///
+/// Thin wrapper over the crate's public [`crate::readback::read_rgba8`], so
+/// the path a headless caller uses is the same one 45 tests exercise —
+/// there is no second copy of the row-padding arithmetic to get wrong.
 fn readback_all_pixels(ctx: &DeviceCtx, tex: &wgpu::Texture, size: (u32, u32)) -> Vec<[u8; 4]> {
-    // 256-byte-aligned row stride.
-    let raw_bpr = size.0 * 4;
-    let bytes_per_row = (raw_bpr + 255) & !255;
-    let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("readback-all"),
-        size: (bytes_per_row * size.1) as u64,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("readback-all-enc"),
-    });
-    enc.copy_texture_to_buffer(
-        wgpu::TexelCopyTextureInfo {
-            texture: tex,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::TexelCopyBufferInfo {
-            buffer: &readback,
-            layout: wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(bytes_per_row),
-                rows_per_image: Some(size.1),
-            },
-        },
-        wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
-    );
-    ctx.queue.submit([enc.finish()]);
-    let slice = readback.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-    ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
-    rx.recv().expect("chan").expect("map");
-    let data = slice.get_mapped_range();
-    let mut out = Vec::with_capacity((size.0 * size.1) as usize);
-    for y in 0..size.1 {
-        let row = &data[(y * bytes_per_row) as usize..][..raw_bpr as usize];
-        for x in 0..size.0 {
-            let px = &row[(x * 4) as usize..][..4];
-            out.push([px[0], px[1], px[2], px[3]]);
-        }
-    }
-    drop(data);
-    readback.unmap();
-    out
+    crate::readback::read_rgba8(ctx, tex, size)
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| [p[0], p[1], p[2], p[3]])
+        .collect()
 }
 
 fn readback_first_pixel(ctx: &DeviceCtx, tex: &wgpu::Texture) -> [u8; 4] {
