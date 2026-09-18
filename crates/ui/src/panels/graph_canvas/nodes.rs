@@ -5,6 +5,8 @@
 //! the right precedence automatically: body interact first, then inline
 //! widgets, then sockets — so sockets beat widgets beat node-drag.
 
+use std::sync::Arc;
+
 use texture_graph_core::{
     Axis, BlendMode, BlendSpace, Color, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion,
     EvalCtx, Graph, InputKey, LayerId, LayerKind, MinMaxMode, NoiseDims, NoiseOutput,
@@ -14,7 +16,7 @@ use texture_graph_core::{
 use crate::app::GpuBits;
 use crate::color_convert::{oklcha_to_srgba, srgba_to_oklcha};
 use crate::previews::PreviewCache;
-use crate::state::{EditCmd, NodeDrag, NodeRef, RampDrag, UiState, WireDrag};
+use crate::state::{EditCmd, NodeDrag, NodeRef, RampDrag, Renaming, UiState, WireDrag};
 use crate::widgets::enum_combo::enum_combo;
 
 use super::layout::{socket_label, NodeLayout, ParamRow, Row};
@@ -35,21 +37,50 @@ pub fn draw_and_interact_nodes(
     mut gpu: Option<&mut GpuBits>,
 ) -> bool {
     let mut hit = false;
+    let style = row_style(ui.style(), state.canvas_zoom);
     for layout in layouts {
+        // Off-screen nodes are skipped whole: no interaction, no painting,
+        // and no `get_or_build`, so the frame's bake budget goes to
+        // thumbnails somebody can see. The margin covers the sockets, which
+        // sit on the node's edge and so reach slightly past its rect.
+        let margin = socket_hit_radius(state.canvas_zoom);
+        if !layout.rect.expand(margin).intersects(canvas_rect) && !held(state, layout.node) {
+            continue;
+        }
         hit |= body_interact(ui, graph, state, layout, canvas_rect);
-        draw_chrome(painter, graph, state, layout);
+        let renaming = matches!(layout.node, NodeRef::Layer(id)
+            if state.renaming.as_ref().is_some_and(|r| r.node == id));
+        draw_chrome(painter, graph, state, layout, renaming);
+        // After the body, so the field wins the pointer over the node drag.
+        hit |= title(ui, graph, state, layout);
         if let (NodeRef::Layer(id), Some(thumb)) = (layout.node, layout.thumb_rect) {
             draw_thumbnail(ui, painter, graph, thumb, id, previews, eval_ctx, gpu.as_deref_mut());
         }
         match layout.node {
             NodeRef::Layer(id) => {
-                layer_rows(ui, painter, graph, state, layout, canvas_rect, id, eval_ctx)
+                layer_rows(ui, painter, graph, state, layout, canvas_rect, &style, id, eval_ctx)
             }
-            NodeRef::Output => output_rows(ui, painter, graph, state, layout, canvas_rect),
+            NodeRef::Output => {
+                output_rows(ui, painter, graph, state, layout, canvas_rect, &style)
+            }
         }
         hit |= sockets(ui, painter, graph, state, layout);
     }
     hit
+}
+
+/// Whether this node has to be drawn and interacted with wherever it is,
+/// off screen or not.
+///
+/// Two do: the one the pointer is holding, because the drag is resolved
+/// against the pointer and a node that stopped interacting on leaving the
+/// view would be dropped there; and the one being renamed, because a text
+/// field that stops existing takes the keyboard focus the rename is
+/// committed by with it.
+fn held(state: &UiState, node: NodeRef) -> bool {
+    state.drag.is_some_and(|d| d.node == node)
+        || matches!(node, NodeRef::Layer(id)
+            if state.renaming.as_ref().is_some_and(|r| r.node == id))
 }
 
 // ---- Body ---------------------------------------------------------------
@@ -99,6 +130,18 @@ fn body_interact(
             // World position for a duplicate — offset from this node.
             let world = super::screen_to_world(layout.rect.min, canvas_rect.min, state);
             resp.context_menu(|ui| {
+                // The menu entry only arms the header field; the typing
+                // happens up there, where the name is. Kept alongside the
+                // click-the-title path because a context menu is where
+                // people look for "rename".
+                if ui.button("Rename").clicked() {
+                    state.renaming = Some(Renaming {
+                        node: id,
+                        text: graph.get(id).map(|l| l.name.clone()).unwrap_or_default(),
+                        focused: false,
+                    });
+                    ui.close();
+                }
                 // Preview this node's color alone (default roughness/
                 // metallic/normal) in the preview panel.
                 if ui.button("Preview").clicked() {
@@ -138,7 +181,13 @@ fn body_interact(
     hit
 }
 
-fn draw_chrome(painter: &egui::Painter, graph: &Graph, state: &UiState, layout: &NodeLayout) {
+fn draw_chrome(
+    painter: &egui::Painter,
+    graph: &Graph,
+    state: &UiState,
+    layout: &NodeLayout,
+    renaming: bool,
+) {
     let z = state.canvas_zoom;
     let selected = matches!(layout.node, NodeRef::Layer(id) if state.selected == Some(id));
     let bg = if selected {
@@ -171,13 +220,16 @@ fn draw_chrome(painter: &egui::Painter, graph: &Graph, state: &UiState, layout: 
         },
         NodeRef::Output => ("Material Output".to_string(), "Output"),
     };
-    painter.text(
-        layout.rect.min + egui::vec2(10.0, 4.0) * z,
-        egui::Align2::LEFT_TOP,
-        name,
-        egui::FontId::proportional(13.0 * z),
-        egui::Color32::WHITE,
-    );
+    // While the title is being typed over, the text field *is* the title.
+    if !renaming {
+        painter.text(
+            layout.rect.min + egui::vec2(10.0, 4.0) * z,
+            egui::Align2::LEFT_TOP,
+            name,
+            egui::FontId::proportional(13.0 * z),
+            egui::Color32::WHITE,
+        );
+    }
     painter.text(
         layout.rect.min + egui::vec2(10.0, 19.0) * z,
         egui::Align2::LEFT_TOP,
@@ -185,6 +237,107 @@ fn draw_chrome(painter: &egui::Painter, graph: &Graph, state: &UiState, layout: 
         egui::FontId::proportional(10.0 * z),
         egui::Color32::from_gray(190),
     );
+}
+
+// ---- Title --------------------------------------------------------------
+
+/// The name's line in the header — what you click to rename, and where the
+/// field appears when you do.
+fn title_rect(node: egui::Rect, z: f32) -> egui::Rect {
+    egui::Rect::from_min_size(
+        node.min + egui::vec2(8.0, 2.0) * z,
+        egui::vec2(node.width() - 16.0 * z, 18.0 * z),
+    )
+}
+
+/// Click the title to edit it; **Enter** or clicking away commits,
+/// **Escape** discards. Both paths put the painted label back.
+///
+/// The text lives in `UiState` rather than in the graph because names must
+/// be unique: a rename is refused like any other edit, and half-typed text
+/// needs somewhere to sit while it is briefly a duplicate of something.
+/// Committing queues a `Rename` command like everything else, so a refusal
+/// lands in the status row and the title simply stays what it was.
+///
+/// Returns whether the field claimed the pointer, which suppresses the node
+/// drag underneath it.
+fn title(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, layout: &NodeLayout) -> bool {
+    let NodeRef::Layer(id) = layout.node else { return false };
+    let z = state.canvas_zoom;
+    // Zoomed out far enough that the header is a smudge, there is nothing
+    // worth typing into; the label is painted and that is all.
+    if z < ZOOM_WIDGETS_MIN {
+        return false;
+    }
+    let rect = title_rect(layout.rect, z);
+    let editing = state.renaming.as_ref().is_some_and(|r| r.node == id);
+
+    if !editing {
+        let resp = ui.interact(
+            rect,
+            egui::Id::new(("graph-title", id.0)),
+            egui::Sense::click(),
+        );
+        if resp.clicked() {
+            state.renaming = Some(Renaming {
+                node: id,
+                text: graph.get(id).map(|l| l.name.clone()).unwrap_or_default(),
+                focused: false,
+            });
+            return true;
+        }
+        return false;
+    }
+
+    let mut text = state
+        .renaming
+        .as_ref()
+        .map(|r| r.text.clone())
+        .unwrap_or_default();
+    let focused = state.renaming.as_ref().is_some_and(|r| r.focused);
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(("graph-title-edit", id.0))
+            .max_rect(rect),
+    );
+    let resp = child.add_sized(
+        rect.size(),
+        egui::TextEdit::singleline(&mut text)
+            .font(egui::FontId::proportional(13.0 * z))
+            .margin(egui::Margin::symmetric((2.0 * z) as i8, 0)),
+    );
+    if !focused {
+        // Only on the first frame. Asking every frame would make the field
+        // impossible to blur, and blurring is one of the two ways to commit.
+        resp.request_focus();
+    }
+
+    // Escape is checked before the field's own handling matters: it also
+    // surrenders focus, so checking the discard case first is what keeps a
+    // cancelled rename from being read as a blur and committed.
+    if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+        state.renaming = None;
+    } else if resp.lost_focus() {
+        state.renaming = None;
+        if let Some(cmd) = rename_command(graph, id, &text) {
+            state.push(cmd);
+        }
+    } else {
+        state.renaming = Some(Renaming { node: id, text, focused: true });
+    }
+    true
+}
+
+/// The edit a committed title amounts to, or `None` when it amounts to
+/// nothing. Clicking a title, reading it and clicking away is not a change,
+/// and queueing a no-op rename would mark the file unsaved for having been
+/// read. An emptied field is the same case: a nameless layer isn't what the
+/// user meant, and the model would refuse it anyway.
+fn rename_command(graph: &Graph, id: LayerId, text: &str) -> Option<EditCmd> {
+    let trimmed = text.trim();
+    let current = &graph.get(id)?.name;
+    (!trimmed.is_empty() && current != trimmed)
+        .then(|| EditCmd::Rename(id, trimmed.to_string()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -228,6 +381,7 @@ fn row_ui(
     rect: egui::Rect,
     zoom: f32,
     canvas_rect: egui::Rect,
+    style: &Arc<egui::Style>,
     salt: (NodeRef, usize),
 ) -> egui::Ui {
     let inner = rect.shrink2(egui::vec2(10.0 * zoom, 0.0));
@@ -238,7 +392,16 @@ fn row_ui(
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     child.set_clip_rect(canvas_rect.intersect(rect));
-    let mut style = ui.style().as_ref().clone();
+    child.set_style(style.clone());
+    child
+}
+
+/// The row style, which depends on the canvas zoom and on nothing else.
+/// Built once per frame and shared by every row of every node: it was a
+/// full `Style` clone per row per node per frame, which on a twenty-node
+/// graph is hundreds of them.
+fn row_style(base: &egui::Style, zoom: f32) -> Arc<egui::Style> {
+    let mut style = base.clone();
     for font in style.text_styles.values_mut() {
         font.size *= zoom;
     }
@@ -249,8 +412,7 @@ fn row_ui(
     style.spacing.button_padding = egui::vec2(3.0, 1.0) * zoom;
     style.spacing.icon_width *= zoom;
     style.spacing.icon_width_inner *= zoom;
-    child.set_style(style);
-    child
+    Arc::new(style)
 }
 
 /// Compact color swatch (no LCh popover — nodes are tight; the inspector
@@ -284,6 +446,7 @@ fn layer_rows(
     state: &mut UiState,
     layout: &NodeLayout,
     canvas_rect: egui::Rect,
+    style: &Arc<egui::Style>,
     id: LayerId,
     eval_ctx: &EvalCtx,
 ) {
@@ -319,11 +482,11 @@ fn layer_rows(
                 }
             }
             Row::Socket(key) => {
-                let mut r = row_ui(ui, *rect, z, canvas_rect, (layout.node, i));
+                let mut r = row_ui(ui, *rect, z, canvas_rect, style, (layout.node, i));
                 changed |= socket_row(&mut r, &mut kind, key, state, layout.node);
             }
             Row::Param(p) => {
-                let mut r = row_ui(ui, *rect, z, canvas_rect, (layout.node, i));
+                let mut r = row_ui(ui, *rect, z, canvas_rect, style, (layout.node, i));
                 changed |= param_row(&mut r, id, &mut kind, p);
             }
         }
@@ -834,6 +997,7 @@ fn axis_label(a: Axis) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn output_rows(
     ui: &mut egui::Ui,
     painter: &egui::Painter,
@@ -841,6 +1005,7 @@ fn output_rows(
     state: &mut UiState,
     layout: &NodeLayout,
     canvas_rect: egui::Rect,
+    style: &Arc<egui::Style>,
 ) {
     let z = state.canvas_zoom;
     if z < ZOOM_WIDGETS_MIN {
@@ -858,7 +1023,7 @@ fn output_rows(
     let mut changed = false;
     for (i, (row, rect)) in layout.rows.iter().zip(&layout.row_rects).enumerate() {
         let Row::Socket(key) = *row else { continue };
-        let mut r = row_ui(ui, *rect, z, canvas_rect, (layout.node, i));
+        let mut r = row_ui(ui, *rect, z, canvas_rect, style, (layout.node, i));
         r.label(socket_label(key));
         match key {
             InputKey::OutRoughness => {
@@ -907,14 +1072,16 @@ fn sockets(
             egui::Sense::click_and_drag(),
         );
         if resp.drag_started() {
-            // Pulling a wire off a connected input detaches it; pressing an
-            // unconnected input does nothing.
-            if let Some(src) = sock.value.connected_to() {
-                state.wire_drag = Some(WireDrag {
+            // A connected input hands its wire over — the far end stays put
+            // and the loose end is looking for a new home. An unconnected
+            // one starts a wire of its own, going the other way.
+            state.wire_drag = Some(match sock.value.connected_to() {
+                Some(src) => WireDrag::FromOutput {
                     src,
                     detached_from: Some((layout.node, sock.key)),
-                });
-            }
+                },
+                None => WireDrag::FromInput { node: layout.node, key: sock.key },
+            });
             hit = true;
         }
         if resp.dragged() || resp.clicked() {
@@ -940,26 +1107,44 @@ fn sockets(
             egui::Sense::click_and_drag(),
         );
         if resp.drag_started() {
-            state.wire_drag = Some(WireDrag { src: id, detached_from: None });
+            state.wire_drag = Some(WireDrag::FromOutput { src: id, detached_from: None });
             hit = true;
         }
         if resp.dragged() || resp.clicked() {
             hit = true;
         }
         let hovered = ptr.is_some_and(|p| center.distance(p) <= hit_r);
-        let radius = if hovered { SOCKET_R * z * 1.35 } else { SOCKET_R * z }.max(2.0);
+        let (radius, stroke_color) = output_socket_style(graph, state, id, hovered, z);
         painter.circle(
             center,
             radius,
             egui::Color32::WHITE,
-            egui::Stroke::new((1.2 * z).max(1.0), egui::Color32::BLACK),
+            egui::Stroke::new((1.2 * z).max(1.0), stroke_color),
         );
     }
     hit
 }
 
-/// Radius and outline for an input socket, factoring in live wire-drag
-/// eligibility: hovering an ineligible (would-cycle) target flags red.
+/// How much a hovered socket, or one a live wire could land on, grows by.
+const SOCKET_HOVER: f32 = 1.35;
+/// Smallest a socket ever draws, so it stays visible when zoomed far out —
+/// larger for one a wire could land on, which has an answer to give.
+const SOCKET_DRAW_MIN: f32 = 2.0;
+const SOCKET_CANDIDATE_MIN: f32 = 3.0;
+
+fn plain(hovered: bool, z: f32) -> (f32, egui::Color32) {
+    let radius = if hovered { SOCKET_R * z * SOCKET_HOVER } else { SOCKET_R * z };
+    (radius.max(SOCKET_DRAW_MIN), egui::Color32::BLACK)
+}
+
+fn eligibility(eligible: bool, z: f32) -> (f32, egui::Color32) {
+    let big = (SOCKET_R * z * SOCKET_HOVER).max(SOCKET_CANDIDATE_MIN);
+    (big, if eligible { egui::Color32::BLACK } else { egui::Color32::RED })
+}
+
+/// Radius and outline for an input socket. A socket that would refuse the
+/// wire currently in the air rings red — the answer arrives while the wire
+/// is still cancellable, rather than as a message after the drop.
 fn socket_style(
     graph: &Graph,
     state: &UiState,
@@ -967,21 +1152,56 @@ fn socket_style(
     hovered: bool,
     z: f32,
 ) -> (f32, egui::Color32) {
-    let base = (SOCKET_R * z).max(2.0);
-    let big = (SOCKET_R * z * 1.35).max(3.0);
     match state.wire_drag {
-        Some(wire) if hovered => {
-            let eligible = match node {
-                NodeRef::Output => true,
-                NodeRef::Layer(dst) => !graph.would_cycle(dst, wire.src),
-            };
-            if eligible {
-                (big, egui::Color32::BLACK)
-            } else {
-                (big, egui::Color32::RED)
-            }
+        // A wire pulled out of an input is hunting for an *output*; no
+        // input socket is a candidate for it, so none of them react.
+        Some(WireDrag::FromOutput { src, .. }) if hovered => {
+            eligibility(super::wires::eligible(graph, node, src), z)
         }
-        None if hovered => (big, egui::Color32::BLACK),
-        _ => (base, egui::Color32::BLACK),
+        _ => plain(hovered, z),
+    }
+}
+
+/// The same, for an output socket while a wire is being pulled backwards
+/// out of an input.
+fn output_socket_style(
+    graph: &Graph,
+    state: &UiState,
+    src: LayerId,
+    hovered: bool,
+    z: f32,
+) -> (f32, egui::Color32) {
+    match state.wire_drag {
+        Some(WireDrag::FromInput { node, .. }) if hovered => {
+            eligibility(super::wires::eligible(graph, node, src), z)
+        }
+        _ => plain(hovered, z),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use texture_graph_core::color::oklcha;
+
+    /// Committing a title that was not actually changed must not queue an
+    /// edit. Otherwise clicking a name to read it and clicking away marks
+    /// the graph unsaved, and the user is asked to save a file they did not
+    /// touch.
+    #[test]
+    fn committing_an_unchanged_title_is_not_an_edit() {
+        let mut graph = Graph::new();
+        let id = graph
+            .add_layer("continents", LayerKind::Color(oklcha(0.5, 0.0, 0.0, 1.0)))
+            .unwrap();
+
+        assert!(rename_command(&graph, id, "continents").is_none());
+        assert!(rename_command(&graph, id, "  continents  ").is_none(), "trimmed first");
+        assert!(rename_command(&graph, id, "").is_none());
+        assert!(rename_command(&graph, id, "   ").is_none());
+        assert!(matches!(
+            rename_command(&graph, id, " oceans "),
+            Some(EditCmd::Rename(_, name)) if name == "oceans"
+        ));
     }
 }

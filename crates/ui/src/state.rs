@@ -15,6 +15,8 @@ use texture_graph_core::{ConstValue, Graph, InputKey, LayerId, LayerKind, Output
 pub struct UiState {
     /// Layer selected in the list / inspector.
     pub selected: Option<LayerId>,
+    /// The node whose title is being typed over, if any.
+    pub renaming: Option<Renaming>,
     /// Path or filename of the last file we loaded from — used to prefill
     /// the Save dialog. On wasm this is just the filename.
     pub last_loaded_name: Option<String>,
@@ -85,20 +87,57 @@ pub struct RampDrag {
     pub stop: usize,
 }
 
-/// In-progress wire drag. The payload is always "the output of `src`".
+/// An in-progress wire drag, in whichever direction it was started.
+///
+/// A wire connects one node's output to another's input, and which end the
+/// pointer grabbed decides only what the drag is hunting for — the
+/// connection it makes is the same either way.
 #[derive(Copy, Clone, Debug)]
-pub struct WireDrag {
-    pub src: LayerId,
-    /// Set when the drag started by pulling an existing wire off an input.
-    /// That edge is hidden while dragging; no `EditCmd` fires until drop,
-    /// so a cancelled drag causes zero rebakes.
-    pub detached_from: Option<(NodeRef, InputKey)>,
+pub enum WireDrag {
+    /// Pulled from an output; looking for an input to land on.
+    FromOutput {
+        src: LayerId,
+        /// Set when the drag started by pulling an existing wire off an
+        /// input. That edge is hidden while dragging; no `EditCmd` fires
+        /// until drop, so a cancelled drag causes zero rebakes.
+        detached_from: Option<(NodeRef, InputKey)>,
+    },
+    /// Pulled from an *unconnected* input; looking for an output.
+    ///
+    /// Only unconnected inputs start this: dragging a connected one means
+    /// "take this wire off", which is [`WireDrag::FromOutput`] with the far
+    /// end still anchored.
+    FromInput { node: NodeRef, key: InputKey },
+}
+
+impl WireDrag {
+    /// The edge this drag detached, hidden until the drop resolves.
+    pub fn detached_from(self) -> Option<(NodeRef, InputKey)> {
+        match self {
+            WireDrag::FromOutput { detached_from, .. } => detached_from,
+            WireDrag::FromInput { .. } => None,
+        }
+    }
+}
+
+/// A node title being typed over. The text lives here rather than in the
+/// graph because layer names must be unique: a rename that isn't yet
+/// acceptable needs somewhere to sit while it's being typed.
+#[derive(Clone, Debug)]
+pub struct Renaming {
+    pub node: LayerId,
+    pub text: String,
+    /// Whether the field has been handed keyboard focus yet. Only the first
+    /// frame asks for it — asking every frame would make the field
+    /// impossible to blur, and blurring is how a rename is committed.
+    pub focused: bool,
 }
 
 impl Default for UiState {
     fn default() -> Self {
         Self {
             selected: None,
+            renaming: None,
             last_loaded_name: None,
             dirty: false,
             pending: Vec::new(),
@@ -153,19 +192,104 @@ impl UiState {
         }
     }
 
-    /// Apply every queued command to `graph`. Errors from individual
-    /// commands are recorded in `last_error`; remaining commands continue
-    /// to apply.
-    pub fn drain_into(&mut self, graph: &mut Graph) {
+    /// Apply every queued command to `graph`, in order. A command that
+    /// fails records its reason and the rest still apply — one refused
+    /// connection must not swallow the node drag queued behind it.
+    ///
+    /// Returns whether anything landed at all.
+    pub fn drain_into(&mut self, graph: &mut Graph) -> bool {
+        let mut changed = false;
+        let mut refused = false;
         for cmd in std::mem::take(&mut self.pending) {
             let affects_eval = cmd.affects_evaluation();
-            match cmd.apply(graph) {
+            match self.apply(cmd, graph) {
                 Ok(()) => {
+                    changed = true;
                     if affects_eval {
                         self.dirty = true;
                     }
                 }
-                Err(e) => self.last_error = Some(e),
+                Err(e) => {
+                    refused = true;
+                    self.last_error = Some(e);
+                }
+            }
+        }
+        // A refusal is about the edit that was just refused, so the next
+        // edit that lands clears it. Otherwise the message outlives what it
+        // was about and sits in the status row for the rest of the session,
+        // describing something the user has long since worked around.
+        if changed && !refused {
+            self.last_error = None;
+        }
+        changed
+    }
+
+    /// Everything a freshly loaded graph must forget. Layer ids mean
+    /// something different in the new graph, so anything holding one — a
+    /// selection, a half-finished drag, a stashed const — would silently
+    /// refer to a different node.
+    pub fn reset_for_new_graph(&mut self) {
+        self.selected = None;
+        self.renaming = None;
+        self.last_error = None;
+        self.drag = None;
+        self.wire_drag = None;
+        self.ramp_drag = None;
+        self.saved_consts.clear();
+        self.ctx_menu_world = None;
+        self.preview_target = None;
+    }
+
+    /// Apply one command. Lives here rather than on [`EditCmd`] because
+    /// some commands have UI-side bookkeeping attached: a removed layer has
+    /// to stop being the selection, the preview target and a `saved_consts`
+    /// key, or all three go on naming a node that no longer exists.
+    fn apply(&mut self, cmd: EditCmd, graph: &mut Graph) -> Result<(), String> {
+        match cmd {
+            EditCmd::AddLayer { name, kind, pos } => {
+                let id = graph.add_layer(name, kind).map_err(|e| e.to_string())?;
+                self.selected = Some(id);
+                if let Some((canvas, pos)) = pos {
+                    // Best-effort: the layer exists either way; a vanished
+                    // canvas just leaves it unplaced.
+                    let _ = graph.set_position(&canvas, id, pos);
+                }
+                Ok(())
+            }
+            EditCmd::Remove(id) => {
+                if self.selected == Some(id) {
+                    self.selected = None;
+                }
+                if self.preview_target == Some(id) {
+                    self.preview_target = None;
+                }
+                if self.renaming.as_ref().is_some_and(|r| r.node == id) {
+                    self.renaming = None;
+                }
+                self.saved_consts.retain(|(n, _), _| *n != NodeRef::Layer(id));
+                graph.remove(id).map_err(|e| e.to_string())
+            }
+            EditCmd::Rename(id, new) => graph.rename(id, new).map_err(|e| e.to_string()),
+            EditCmd::SetKind(id, k) => graph.set_kind(id, k).map_err(|e| e.to_string()),
+            EditCmd::SetOutput(o) => graph.set_output(o).map_err(|e| e.to_string()),
+            EditCmd::SetListPos(id, to) => {
+                graph.set_list_position(id, to).map_err(|e| e.to_string())
+            }
+            EditCmd::SetPos { canvas, id, pos } => {
+                graph.set_position(&canvas, id, pos).map_err(|e| e.to_string())
+            }
+            EditCmd::SetOutputPos { canvas, pos } => graph
+                .set_output_position(&canvas, pos)
+                .map_err(|e| e.to_string()),
+            EditCmd::AddCanvas(name) => graph.add_canvas(name).map_err(|e| e.to_string()),
+            EditCmd::RemoveCanvas(name) => {
+                graph.remove_canvas(&name).map_err(|e| e.to_string())
+            }
+            EditCmd::Replace(new) => {
+                *graph = new;
+                self.reset_for_new_graph();
+                Ok(())
             }
         }
     }
@@ -213,41 +337,6 @@ impl EditCmd {
             | EditCmd::SetOutputPos { .. }
             | EditCmd::AddCanvas(_)
             | EditCmd::RemoveCanvas(_) => false,
-        }
-    }
-
-    fn apply(self, graph: &mut Graph) -> Result<(), String> {
-        match self {
-            EditCmd::AddLayer { name, kind, pos } => {
-                let id = graph.add_layer(name, kind).map_err(|e| e.to_string())?;
-                if let Some((canvas, pos)) = pos {
-                    // Best-effort: the layer exists either way; a vanished
-                    // canvas just leaves it unplaced.
-                    let _ = graph.set_position(&canvas, id, pos);
-                }
-                Ok(())
-            }
-            EditCmd::Remove(id) => graph.remove(id).map_err(|e| e.to_string()),
-            EditCmd::Rename(id, new) => graph.rename(id, new).map_err(|e| e.to_string()),
-            EditCmd::SetKind(id, k) => graph.set_kind(id, k).map_err(|e| e.to_string()),
-            EditCmd::SetOutput(o) => graph.set_output(o).map_err(|e| e.to_string()),
-            EditCmd::SetListPos(id, to) => {
-                graph.set_list_position(id, to).map_err(|e| e.to_string())
-            }
-            EditCmd::SetPos { canvas, id, pos } => {
-                graph.set_position(&canvas, id, pos).map_err(|e| e.to_string())
-            }
-            EditCmd::SetOutputPos { canvas, pos } => graph
-                .set_output_position(&canvas, pos)
-                .map_err(|e| e.to_string()),
-            EditCmd::AddCanvas(name) => graph.add_canvas(name).map_err(|e| e.to_string()),
-            EditCmd::RemoveCanvas(name) => {
-                graph.remove_canvas(&name).map_err(|e| e.to_string())
-            }
-            EditCmd::Replace(new) => {
-                *graph = new;
-                Ok(())
-            }
         }
     }
 }

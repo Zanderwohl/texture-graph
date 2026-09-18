@@ -2,11 +2,15 @@
 //!
 //! - **Scroll wheel** zooms about the pointer.
 //! - **Drag on empty space** pans; **drag on a node body** moves the node.
-//! - **Drag from a socket** starts a wire: output → input connects
-//!   (replacing whatever was there); pulling a connected input off detaches
-//!   the wire, and dropping it on empty space disconnects.
+//! - **Drag from a socket** starts a wire, in either direction: an output
+//!   onto an input connects, replacing whatever was there, and an
+//!   *unconnected* input onto an output does the same thing from the other
+//!   end. Pulling a *connected* input off detaches it instead, and dropping
+//!   on empty space disconnects.
+//! - **Click a node's title** to rename it: Enter or clicking away commits,
+//!   Escape discards.
 //! - **Right-click on empty space** adds a node at the pointer;
-//!   right-click on a node offers Delete.
+//!   right-click on a node offers rename, preview, duplicate and delete.
 //!
 //! Node positions live at `Canvas.positions` (the Output pseudo-node at
 //! `Canvas.output_pos`) for `state.active_canvas`; edges are derived from
@@ -71,6 +75,7 @@ pub fn show(
     let (canvas_rect, canvas_resp) =
         ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
     let painter = ui.painter_at(canvas_rect);
+    painter.rect_filled(canvas_rect, 0.0, egui::Color32::from_gray(28));
 
     handle_zoom(ui, state, &canvas_resp, canvas_rect);
 
