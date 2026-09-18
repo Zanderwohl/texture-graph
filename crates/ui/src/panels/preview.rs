@@ -576,7 +576,7 @@ fn bake_cpu(
         for x in 0..size {
             let u = x as f32 / (size - 1) as f32;
             let v = y as f32 / (size - 1) as f32;
-            let m = evaluate_material(graph, Sample::uv(u, v), eval_ctx);
+            let m = evaluate_material(graph, Sample::flat(u, v), eval_ctx);
             let rgba = match channel {
                 PreviewChannel::Color => to_srgb8(m.color),
                 PreviewChannel::Normal => to_srgb8(m.normal),

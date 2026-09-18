@@ -49,13 +49,56 @@ with volumes done by re-running the whole 2D pipeline once per slice
 (`crates/gpu/src/baker.rs:647-796`). Note the generalization is over 1D/2D/3D —
 there is no 4D anywhere in MBG.
 
-One idea transfers cheaply and independently: the parity discipline in
-`crates/worldgen-gpu/tests/parity.rs`. Two rules get `assert_eq!` on
-`f32::to_bits` between CPU and GPU — (1) fuse every multiply-add in a stated
-association order (`mul_add` / `fma`, left-associated), (2) never divide by
-anything a shader could rewrite as a reciprocal; invert per-node constants once
-on the CPU and upload. Our `crates/gpu/src/bake_test.rs` asserts tolerances
-(`max_delta <= 14`), which is the standard that let MBG's noise drift.
+### CPU/GPU noise parity — DONE
+
+I originally described the parity discipline here as transferring "cheaply and
+independently". That was wrong, and the correction is worth keeping: the two
+backends were not one algorithm with different rounding, they were **two
+different algorithms**. The CPU ran the `noise` crate's `Simplex` in f64 off one
+permutation table; the GPU ran Gustavson's textureless simplex in f32 off
+another. `noise.wgsl`'s own header said so. FMA discipline cannot close that.
+
+**What landed:** `crates/core/src/noise.rs` is now the specification — Gustavson
+simplex in Rust, function for function against `crates/gpu/src/shaders/noise.wgsl`,
+with the shader's exact float literals. `eval_noise` calls it and the `noise`
+crate dependency is gone. The *GPU* was chosen as the authority because it is
+what users actually see, so no saved graph changed appearance.
+
+**The bug this fixed:** on a machine with no working wgpu backend, previews
+showed visibly different noise than a GPU bake of the same graph.
+
+**A second bug it uncovered:** a flat GPU bake samples 3D fields at `w = 0.5`,
+but the CPU fallbacks reached for `Sample::uv`, which is `w = 0.0` — two
+different slices of the same volume. D1 and D2 hid it (they ignore `w`); D3
+showed a worst-case sRGB delta of 203. There is now a `FLAT_W` constant and a
+`Sample::flat` constructor so the convention has one home, used by both
+fallbacks and the baker.
+
+**What parity is actually held:** `cpu_and_gpu_noise_agree` bakes on the GPU and
+evaluates the same points on the CPU across D1/D2/D3 and both ranges — the two
+agree **within one sRGB step**, most samples identical. It reports a histogram,
+because the shape of the disagreement is the diagnostic.
+
+**What is not held: bit-exactness.** Two things are still missing, both real
+work rather than oversights:
+
+1. A float read-back path, so the comparison is on the field rather than on
+   8-bit pixels. `bake_output` hands back `Rgba8Unorm`.
+2. Every multiply-add pinned into explicitly fused form on both sides. A shader
+   compiler contracts `a*b + c` into an FMA whether asked to or not, so the spec
+   has to contract too (`mul_add` / `fma`). Doing this means rewriting the
+   shader's arithmetic, which shifts GPU output by an ulp or two.
+
+The residual ±1 is also not all noise: Oklch→sRGB is a separate pair of
+implementations, and the out-of-range checker is a deliberate GPU-only display
+choice (the parity test skips out-of-gamut samples and says so).
+
+**What cannot go exact here at all:** tolerances like the extend-transform
+test's `max_delta <= 14` are not arithmetic. The GPU bakes into intermediate
+textures and resamples them at texel centres while the CPU evaluates
+analytically. MBG's flat-buffer compute design makes that cell-for-cell exact;
+our render-to-texture pipeline does not, and closing it would mean the kernel
+rewrite described above.
 
 ---
 

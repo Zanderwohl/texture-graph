@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-use noise::{NoiseFn, Simplex};
-
 use crate::color::{Color, blend, normal_to_color, scalar_of};
 use crate::graph::{Graph, Layer};
 use crate::id::LayerId;
@@ -21,12 +19,27 @@ pub struct Sample {
     pub w: f32,
 }
 
+/// The `w` a *flat* bake samples a 3D field at — the middle of the unit
+/// cube, not its floor.
+///
+/// Both backends have to agree on this or a 3D graph is two different
+/// slices of the same volume depending on where it was rendered, which is
+/// exactly what used to happen: the GPU has always baked flat passes at
+/// 0.5, while the CPU fallback reached for [`Sample::uv`] and got 0.0.
+pub const FLAT_W: f32 = 0.5;
+
 impl Sample {
     pub const fn new(u: f32, v: f32, w: f32) -> Self {
         Self { u, v, w }
     }
+    /// A sample at `w = 0`. For a *flat bake* of a graph that may contain
+    /// 3D fields, use [`Sample::flat`] instead — see [`FLAT_W`].
     pub const fn uv(u: f32, v: f32) -> Self {
         Self { u, v, w: 0.0 }
+    }
+    /// The sample a flat bake takes at `(u, v)`, on the [`FLAT_W`] slice.
+    pub const fn flat(u: f32, v: f32) -> Self {
+        Self { u, v, w: FLAT_W }
     }
 }
 
@@ -137,18 +150,21 @@ fn eval_scalar(si: &ScalarInput, s: Sample, by_id: &HashMap<LayerId, &Layer>, ct
 // ---- Node implementations ----------------------------------------------
 
 fn eval_noise(n: &Noise, s: Sample, ctx: &EvalCtx) -> Color {
+    // Straight through to the shared kernel — see `crate::noise` for why the
+    // CPU no longer has a noise implementation of its own.
     let sample = |off: u32| -> f32 {
-        let simplex = Simplex::new(ctx.seed.wrapping_add(n.seed_offset).wrapping_add(off));
-        let f = n.frequency as f64;
-        let raw = match n.dims {
-            NoiseDims::D1 => simplex.get([s.u as f64 * f, 0.0]),
-            NoiseDims::D2 => simplex.get([s.u as f64 * f, s.v as f64 * f]),
-            NoiseDims::D3 => simplex.get([s.u as f64 * f, s.v as f64 * f, s.w as f64 * f]),
-        } as f32;
-        match n.range {
-            NoiseRange::Signed => raw,
-            NoiseRange::Unsigned => raw * 0.5 + 0.5,
-        }
+        let dims = match n.dims {
+            NoiseDims::D1 => crate::noise::Dims::D1,
+            NoiseDims::D2 => crate::noise::Dims::D2,
+            NoiseDims::D3 => crate::noise::Dims::D3,
+        };
+        crate::noise::sample(
+            dims,
+            ctx.seed.wrapping_add(n.seed_offset).wrapping_add(off),
+            n.frequency,
+            [s.u, s.v, s.w],
+            matches!(n.range, NoiseRange::Signed),
+        )
     };
 
     match n.output {

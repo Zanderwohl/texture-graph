@@ -9,7 +9,6 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 palette = { version = "0.7", features = ["serializing"] }
-noise = "0.9"
 serde = { version = "1", features = ["derive"] }
 ron = "0.8"
 thiserror = "1"

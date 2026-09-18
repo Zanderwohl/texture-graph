@@ -251,7 +251,7 @@ fn bake_cpu(
         for x in 0..w {
             let u = x as f32 / (w - 1) as f32;
             let v = y as f32 / (h - 1) as f32;
-            let color = evaluate(graph, id, Sample::uv(u, v), eval_ctx);
+            let color = evaluate(graph, id, Sample::flat(u, v), eval_ctx);
             let [r, g, b, a] = to_srgb8(color);
             pixels.push(Color32::from_rgba_unmultiplied(r, g, b, a));
         }

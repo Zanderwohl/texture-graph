@@ -1363,3 +1363,111 @@ fn radial_extend_past_limit_shows_missing_grid_like_cpu() {
         }
     }
 }
+
+/// CPU/GPU noise parity — the claim `core::noise` exists to make good.
+///
+/// Before that module the two backends ran different algorithms off
+/// different permutation tables (the `noise` crate's `Simplex` in f64 on one
+/// side, Gustavson's textureless simplex in f32 on the other), so a graph
+/// looked one way baked on the GPU and another way in the CPU fallback. They
+/// now run one specification twice.
+///
+/// Reported as a histogram rather than a single max, because the shape of
+/// the disagreement is the diagnostic: a handful of ±1 steps is rounding in
+/// the Oklch→sRGB stage, while a long tail means the two kernels have
+/// genuinely diverged.
+///
+/// Samples whose L falls outside `[0, 1]` are counted and skipped, not
+/// compared. That is where signed noise spends about a sixth of its range,
+/// and the two backends disagree there *on purpose*: `to_srgb8` clamps,
+/// while `pack_srgb8` paints the magenta/black out-of-range checker (see
+/// `out_of_range_l_paints_magenta_black_checker`). That is a display-stage
+/// choice, and this test is about the field underneath it.
+///
+/// Returns `(histogram, worst, compared, skipped)`.
+fn noise_parity_histogram(
+    dims: NoiseDims,
+    range: NoiseRange,
+    frequency: f32,
+) -> (Vec<u32>, u32, u32, u32) {
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let id = graph.output.color.unwrap();
+    graph
+        .set_kind(
+            id,
+            LayerKind::Noise(Noise {
+                dims,
+                seed_offset: 3,
+                frequency,
+                range,
+                output: NoiseOutput::Grayscale,
+            }),
+        )
+        .unwrap();
+
+    const RES: u32 = 64;
+    let eval = EvalCtx::default();
+    let out = baker.bake_output(&graph, (RES, RES), &eval, false).expect("bake");
+    let px = readback_all_pixels(&ctx, &out.color, (RES, RES));
+
+    let mut hist = vec![0u32; 6];
+    let (mut worst, mut compared, mut skipped) = (0u32, 0u32, 0u32);
+    for y in 0..RES {
+        for x in 0..RES {
+            let u = (x as f32 + 0.5) / RES as f32;
+            let v = (y as f32 + 0.5) / RES as f32;
+            let m = texture_graph_core::evaluate_material(
+                &graph,
+                // w = 0.5, which is where a flat GPU bake slices a 3D
+                // field (`dispatch_kind`'s `w` argument). `Sample::uv` says
+                // 0.0, so a D3 graph compared that way is two different
+                // slices of the same volume.
+                texture_graph_core::Sample::new(u, v, 0.5),
+                &eval,
+            );
+            if !(0.0..=1.0).contains(&m.color.l) {
+                skipped += 1;
+                continue;
+            }
+            compared += 1;
+            let expected = to_srgb8(m.color);
+            let got = px[(y * RES + x) as usize];
+            for i in 0..3 {
+                let d = (expected[i] as i32 - got[i] as i32).unsigned_abs();
+                worst = worst.max(d);
+                hist[(d as usize).min(5)] += 1;
+            }
+        }
+    }
+    (hist, worst, compared, skipped)
+}
+
+#[test]
+fn cpu_and_gpu_noise_agree() {
+    for (dims, range, freq) in [
+        (NoiseDims::D2, NoiseRange::Unsigned, 4.0),
+        (NoiseDims::D2, NoiseRange::Signed, 9.0),
+        (NoiseDims::D1, NoiseRange::Unsigned, 6.0),
+        (NoiseDims::D3, NoiseRange::Unsigned, 5.0),
+        (NoiseDims::D3, NoiseRange::Signed, 2.0),
+    ] {
+        let (hist, worst, compared, skipped) = noise_parity_histogram(dims, range, freq);
+        println!(
+            "{dims:?} {range:?} f={freq}: worst={worst} hist={hist:?} \
+             compared={compared} skipped={skipped}"
+        );
+        // A test that skipped everything would pass on an empty
+        // comparison. Signed noise spends a good third of its range below
+        // zero, so the floor is a quarter of the image rather than half.
+        assert!(
+            compared * 4 > 64 * 64,
+            "{dims:?} {range:?}: only {compared} samples were in range"
+        );
+        assert!(
+            worst <= 1,
+            "{dims:?} {range:?} f={freq}: worst sRGB delta {worst}, histogram {hist:?}"
+        );
+    }
+}

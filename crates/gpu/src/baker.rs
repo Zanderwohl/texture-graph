@@ -255,7 +255,7 @@ impl Baker {
         let (_missing_tex, missing_view) = make_missing_texture(&device, size);
         dispatch_missing(
             &self.ctx, &mut encoder, &self.missing_pipeline, &self.color_bgl,
-            &missing_view, size, 0.5,
+            &missing_view, size, texture_graph_core::FLAT_W,
         );
 
         // 1. Dispatch every layer into its own intermediate slot.
@@ -532,7 +532,7 @@ impl Baker {
         let missing_view = self.missing_view.as_ref().unwrap();
         dispatch_missing(
             &self.ctx, &mut encoder, &self.missing_pipeline, &self.color_bgl,
-            missing_view, size, 0.5,
+            missing_view, size, texture_graph_core::FLAT_W,
         );
 
         // Dispatch each layer.
