@@ -22,8 +22,8 @@ eframe = { version = "0.35", default-features = false, features = [
 ] }
 egui = "0.35"
 egui-wgpu = "0.35"
-wgpu = "29"
-glam = "0.30"
+wgpu.workspace = true
+glam.workspace = true
 palette.workspace = true
 serde.workspace = true
 ron.workspace = true
