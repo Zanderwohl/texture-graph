@@ -4,14 +4,11 @@
 //! cargo run -p texture-graph-gpu --example bake -- out.ppm [graph.tg] [size]
 //! ```
 //!
-//! This is the whole headless path, and it exists as much to *hold* that path
-//! open as to be useful: an example is compiled by `cargo test`, so if the
-//! crate ever grows a dependency on the editor — or if baking stops being
-//! reachable without one — this stops building. `texture-graph-gpu` pulls in
-//! no egui, eframe or winit, and nothing here is allowed to change that.
+//! The whole headless path, and what holds it open: `cargo test` compiles
+//! examples, so this stops building if the crate ever grows a dependency on
+//! the editor. `texture-graph-gpu` pulls in no egui, eframe or winit.
 //!
-//! PPM because it needs no dependency at all: a short ASCII header and raw
-//! RGB bytes. `magick out.ppm out.png` if you want something smaller.
+//! PPM needs no dependency to write. `magick out.ppm out.png` to shrink it.
 
 use std::path::PathBuf;
 
@@ -38,9 +35,8 @@ fn main() {
         None => demo_graph(),
     };
 
-    // Nothing here has a window, a surface or an event loop — just an adapter
-    // and a queue. `pollster` only turns the async init into a blocking call;
-    // a caller with its own runtime would await it instead.
+    // No window, surface or event loop: just an adapter and a queue.
+    // `pollster` only blocks on the init; a caller with a runtime awaits it.
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("no usable GPU adapter");
     let mut baker = Baker::new(ctx.clone());
     let baked = baker
@@ -57,8 +53,8 @@ fn main() {
     println!("baked {what} at {size}x{size} -> {}", out_path.display());
 }
 
-/// Something with visible structure, so a run with no arguments still shows
-/// whether the pipeline is working: noise through a two-stop ramp.
+/// Noise through a two-stop ramp, so a run with no arguments still shows
+/// whether the pipeline works.
 fn demo_graph() -> Graph {
     let mut g = Graph::new();
     let noise = g
@@ -85,8 +81,7 @@ fn demo_graph() -> Graph {
             }),
         )
         .unwrap();
-    // The ramp reads the noise as its own domain via a Map: value in, palette
-    // across. `Map` is what turns a scalar field into colour.
+    // `Map` turns the scalar noise into colour: value in, palette across.
     let mapped = g
         .add_layer(
             "mapped",

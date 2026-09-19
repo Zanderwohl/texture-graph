@@ -12,10 +12,8 @@ use crate::panels::preview::PreviewPanelState;
 use crate::previews::PreviewCache;
 use crate::state::UiState;
 
-/// GPU state — Baker plus the shared egui-wgpu renderer we register
-/// textures against. Absent when the wgpu backend fails to initialize
-/// (should never happen with the eframe wgpu feature enabled, but we don't
-/// hard-crash on it).
+/// Baker plus the egui-wgpu renderer baked textures are registered against.
+/// Absent if the wgpu backend failed to initialize.
 pub struct GpuBits {
     pub baker: Baker,
     pub scene: SceneRenderer,
@@ -33,7 +31,7 @@ pub struct TextureGraphApp {
 
 impl TextureGraphApp {
     pub fn new(cc: &CreationContext<'_>) -> Self {
-        // Web builds default to 256² to keep per-frame cost tolerable.
+        // Smaller on web, where per-frame cost bites harder.
         #[cfg(target_arch = "wasm32")]
         let default_size = 256;
         #[cfg(not(target_arch = "wasm32"))]
@@ -74,9 +72,8 @@ impl eframe::App for TextureGraphApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Retire the thumbnails last frame's edits invalidated, before
-        // anything asks for one. `None` means "all of them"; a set means
-        // exactly those layers and the consumers `state` already folded in.
+        // Retire thumbnails invalidated last frame before anything asks for
+        // one. `None` means all of them.
         let dirty = self.ui.dirty_previews.replace(HashSet::new());
         self.previews.begin_frame(
             &self.graph,
@@ -117,18 +114,15 @@ impl eframe::App for TextureGraphApp {
             );
         });
 
-        // File dialogs. Both platforms run the dialog off the UI thread
-        // (native: background thread; wasm: browser event loop) and hand
-        // the outcome back via `poll_pending` on a later frame — blocking
-        // the UI thread on the dialog deadlocks on macOS.
+        // Both platforms run the dialog off the UI thread and report back
+        // through `poll_pending`: blocking on it deadlocks on macOS.
         file_io::handle_wants_save(&self.graph, &mut self.ui, ui.ctx());
         file_io::handle_wants_open(&mut self.ui, ui.ctx());
         file_io::poll_pending(&mut self.ui);
 
-        // Apply queued mutations. What this dirties for the thumbnail
-        // cache is recorded in `ui.dirty_previews` and consumed at the top
-        // of the next frame; the big preview panel consumes `state.dirty`
-        // for its own bake, so leave that set here.
+        // Apply queued mutations. `dirty_previews` is consumed at the top of
+        // the next frame; `state.dirty` belongs to the preview panel, so it
+        // stays set here.
         self.ui.drain_into(&mut self.graph);
     }
 }

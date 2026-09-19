@@ -2,12 +2,9 @@
 //! UI: native on a background thread, web via `spawn_local`. Results land
 //! in a pending slot polled once per frame by [`poll_pending`].
 //!
-//! Native MUST NOT block the UI thread on the dialog future: on macOS the
-//! panel is dispatched to the main queue, so parking the main thread while
-//! waiting deadlocks — the dialog never appears and the app hangs.
-//!
-//! Called from the app once per frame when `UiState::wants_save` or
-//! `wants_open` is set; consumes the flag either way.
+//! Native must not block the UI thread on the dialog future: macOS dispatches
+//! the panel to the main queue, so parking that thread hangs the app with no
+//! dialog ever appearing.
 
 use texture_graph_core::{FILE_EXTENSION, FileMetadata, Graph, TextureGraphFile};
 
@@ -68,7 +65,7 @@ fn file_stem(path: &std::path::Path) -> Option<String> {
 fn finish_dialog(outcome: Option<native::Outcome>, ctx: &egui::Context) {
     *native::PENDING.lock().unwrap() = outcome;
     native::DIALOG_OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
-    // Wake the UI even if the user isn't generating input events.
+    // Wake the UI even with no input events arriving.
     ctx.request_repaint();
 }
 
@@ -177,8 +174,7 @@ fn do_open(_state: &mut UiState, ctx: &egui::Context) {
     });
 }
 
-/// Called every frame; picks up the outcome of any finished dialog and
-/// applies it to the UI state.
+/// Picks up the outcome of any finished dialog. Called every frame.
 pub fn poll_pending(state: &mut UiState) {
     #[cfg(target_arch = "wasm32")]
     {

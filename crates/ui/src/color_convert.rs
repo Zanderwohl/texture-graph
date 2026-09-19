@@ -1,8 +1,7 @@
-//! Round-trip conversions between our Oklcha storage and egui's
-//! sRGB-space color widgets.
+//! Conversions between Oklcha storage and egui's sRGB color widgets.
 //!
-//! We lose precision on out-of-sRGB-gamut Oklch values — that's accepted
-//! for MVP; the LCh sliders in `widgets::color_edit` are the escape hatch.
+//! Oklch values outside the sRGB gamut lose precision here; the LCh sliders
+//! in `widgets::color_edit` reach them instead.
 
 use palette::{IntoColor, Oklch, Srgb};
 use texture_graph_core::Color;

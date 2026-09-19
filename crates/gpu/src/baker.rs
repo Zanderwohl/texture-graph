@@ -1,15 +1,13 @@
 //! GPU compute-shader baker.
 //!
-//! The Baker owns the wgpu device handles, a cached pool of `Rgba32Float`
-//! intermediate textures sized to the current output, and one compute
-//! pipeline per LayerKind variant. It walks the schedule from `schedule.rs`
-//! and dispatches one shader per layer, then packs the four PBR channels
-//! into `Rgba8Unorm` textures the UI can register with egui-wgpu.
+//! Owns the device handles, a pool of `Rgba32Float` intermediates sized to
+//! the current output, and one compute pipeline per `LayerKind`. Walks the
+//! schedule dispatching a shader per layer, then packs the four PBR channels
+//! into `Rgba8Unorm`.
 //!
-//! **Storage note.** wgpu does not permit storage bindings to sRGB view
-//! formats, so packed outputs are `Rgba8Unorm` containing sRGB-encoded
-//! values. `pack_srgb8.wgsl` applies the gamma manually to match
-//! `core::color::to_srgb8`.
+//! wgpu forbids storage bindings to sRGB view formats, so those outputs hold
+//! sRGB-encoded values in a linear format and `pack_srgb8.wgsl` applies the
+//! gamma by hand to match `core::color::to_srgb8`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -27,8 +25,7 @@ use crate::schedule::{Domain, OutputSlots, ScalarSlot, Schedule, schedule, sched
 
 /// Max stops per ColorRamp supported by the GPU baker.
 const MAX_RAMP_STOPS: usize = 16;
-/// Max distinct layer-referenced stops per ColorRamp. Bindings must be
-/// declared at pipeline-creation time, so this is a hard cap.
+/// Bindings are declared at pipeline creation, so this is a hard cap.
 const MAX_RAMP_INPUTS: usize = 8;
 
 /// Four sRGB-encoded 8-bit-per-channel textures ready for display.
@@ -40,10 +37,9 @@ pub struct BakeOutput {
     pub size: (u32, u32),
 }
 
-/// A solid-texture bake: the four PBR channels evaluated over a full
-/// `res × res × depth` volume (w = slice center), stored as 3D
-/// `Rgba8Unorm` textures. The 3D preview samples these at each fragment's
-/// object-space position instead of UV-mapping a single flat slice.
+/// The four PBR channels over a whole `res × res × depth` volume, `w` at each
+/// slice centre. The 3D preview samples these at object-space position rather
+/// than UV-mapping one flat slice.
 pub struct VolumeOutput {
     pub color: wgpu::Texture,
     pub roughness: wgpu::Texture,
@@ -96,9 +92,8 @@ pub struct Baker {
     // min_max reuses `map_bgl` — same binding shape (uniform + storage_out + 2 inputs).
     ramp_pipeline: wgpu::ComputePipeline,
     ramp_bgl: wgpu::BindGroupLayout,
-    /// 1×1 Rgba32Float sampled-only texture. Bound into unused ramp input
-    /// slots so we never collide with an output storage binding. Kept alive
-    /// by the Baker so `dummy_input_view` stays valid.
+    /// Bound into unused ramp input slots, so they never collide with an
+    /// output storage binding. Held here to keep `dummy_input_view` valid.
     #[allow(dead_code)]
     dummy_input: wgpu::Texture,
     dummy_input_view: wgpu::TextureView,
@@ -106,9 +101,8 @@ pub struct Baker {
     // h2n reuses `transform_bgl` — same binding shape (uniform + storage_out + input_2d).
     // missing reuses `color_bgl`: same binding shape (uniform + storage_texture).
     missing_pipeline: wgpu::ComputePipeline,
-    /// Pool-sized texture holding the magenta/black "missing texture"
-    /// grid, bound wherever a layer input is `None`. Refilled at the
-    /// start of every bake (per slice for volumes, so the grid is 3D).
+    /// The magenta/black missing-texture grid, bound wherever a layer input
+    /// is `None`. Refilled per bake, and per slice for volumes.
     missing_tex: Option<wgpu::Texture>,
     missing_view: Option<wgpu::TextureView>,
     pack_pipeline: wgpu::ComputePipeline,
@@ -134,7 +128,7 @@ impl Baker {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba32Float,
-            // Sampled only — no STORAGE_BINDING so wgpu can't confuse this
+            // Sampled only: no STORAGE_BINDING, so wgpu can't confuse this
             // with an output slot.
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],

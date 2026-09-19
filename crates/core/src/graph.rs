@@ -7,9 +7,8 @@ use crate::color::Color;
 use crate::id::LayerId;
 use crate::kind::{ColorRamp, LayerKind, ScalarInput};
 
-/// Named node in the graph. Position on any workspace canvas is stored
-/// separately in [`Graph::canvases`], so identity/display/layout stay
-/// independent.
+/// Named node in the graph. Canvas position lives in [`Graph::canvases`], so
+/// identity, display and layout stay independent.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Layer {
     pub id: LayerId,
@@ -49,30 +48,24 @@ impl Output {
     }
 }
 
-/// One named workspace canvas — a scatter of layer positions plus any
-/// per-canvas view state we grow later. Edges are derived from
-/// [`LayerKind::inputs`] at render time and not stored.
+/// One named workspace canvas: a scatter of layer positions. Edges come from
+/// [`LayerKind::inputs`] at render time and are not stored.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Canvas {
-    /// Position of each layer within this canvas. Layers absent from the
-    /// map should be treated as unplaced (UI decides where to drop them).
+    /// Layers absent from the map are unplaced, and the UI picks a spot.
     pub positions: BTreeMap<LayerId, [f32; 2]>,
-    /// Position of the material Output pseudo-node on this canvas.
-    /// `None` = unplaced (UI picks a spot). `serde(default)` keeps files
-    /// from before this field loading unchanged.
+    /// The Output pseudo-node. `None` is unplaced, and also what a file
+    /// without the field loads as.
     #[serde(default)]
     pub output_pos: Option<[f32; 2]>,
 }
 
 /// The full graph. Three orthogonal shapes travel with the data:
 ///
-/// - **Identity** — [`Layer::id`], monotonically assigned, never reused.
-///   Layers are kept in ID-ascending order in [`Graph::layers`] so
-///   serialization is stable regardless of any UI reordering.
-/// - **List order** — [`Graph::list_order`], a permutation of layer IDs
-///   for the linear layer-panel view.
-/// - **Canvas positions** — [`Graph::canvases`], zero or more named
-///   node-graph workspaces each with its own scatter of positions.
+/// - **Identity** — [`Layer::id`], never reused. Layers stay ID-ascending so
+///   serialization is stable however the UI reorders them.
+/// - **List order** — [`Graph::list_order`], for the linear panel view.
+/// - **Canvas positions** — [`Graph::canvases`], one scatter per workspace.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Graph {
     /// ID-ascending. Do not reorder for display; use `list_order` instead.

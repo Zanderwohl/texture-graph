@@ -1,9 +1,8 @@
-//! 3D preview renderer. Takes a `BakeOutput` (color / roughness / metallic
-//! / normal textures) and draws a lit mesh — sphere, cube, or quad — into a small
-//! `Rgba8Unorm` texture ready for the UI to hand to egui-wgpu.
+//! 3D preview renderer: draws a `BakeOutput` onto a lit sphere, cube or quad
+//! and into an `Rgba8Unorm` texture for egui-wgpu.
 //!
-//! One directional light, Cook-Torrance BRDF, tangent-space normal mapping,
-//! Reinhard tonemap, gamma-correct sRGB output.
+//! Cook-Torrance BRDF, tangent-space normal mapping, Reinhard tonemap,
+//! gamma-correct sRGB out.
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec3};
@@ -17,32 +16,26 @@ use crate::device::DeviceCtx;
 pub enum SceneShape {
     Sphere,
     Cube,
-    /// A 1×1 quad lying flat on the ground (XZ plane, normal +Y) — a lit
-    /// 3D view of the flat material, viewed from a raised angle.
+    /// A 1×1 quad flat on the XZ plane, seen from a raised angle.
     Quad,
 }
 
 /// What the mesh is textured with.
 ///
-/// - `Uv`: flat 2D channels wrapped by the mesh's UVs (the classic path).
-/// - `Solid`: 3D volume channels sampled at each fragment's object-space
-///   position — the mesh looks carved out of the material; no UV seams,
-///   no pole pinching. Produced by [`crate::Baker::bake_volume`].
+/// - `Uv`: 2D channels wrapped by the mesh's UVs.
+/// - `Solid`: 3D volume channels sampled at object-space position, so the
+///   mesh looks carved from the material — no seams, no pole pinching.
 pub enum SceneMaterial<'a> {
     Uv(&'a BakeOutput),
     Solid(&'a VolumeOutput),
 }
 
-/// Orbit camera + directional light. The renderer owns nothing here; the
-/// caller drives it (e.g. an auto-spin timer in the UI panel).
+/// Orbit camera and light rig, driven entirely by the caller.
 #[derive(Copy, Clone, Debug)]
 pub struct SceneCamera {
-    /// Model orientation: the camera and light rig stay fixed while this
-    /// spins/orbits the MODEL. Auto-spin advances it around world Y; user
-    /// drag-orbit composes arbitrary trackball rotations onto it.
+    /// Spins the model; the camera and lights stay put.
     pub orientation: Quat,
-    /// Rotation in radians around the model's local X axis (positive =
-    /// tip toward camera). Fixed for now; ready if we ever wire drag.
+    /// Radians around the model's local X axis, positive tipping toward the camera.
     pub pitch: f32,
     /// Distance from the model's origin to the camera.
     pub distance: f32,
@@ -67,21 +60,16 @@ struct SceneUniforms {
     view_proj: [[f32; 4]; 4],
     model:     [[f32; 4]; 4],
     camera_pos: [f32; 4],
-    /// Three-point white studio rig. Each vec4 packs xyz = normalized
-    /// direction FROM surface TO light, w = intensity. All lights are
-    /// pure white in the shader.
+    /// Three-point rig: xyz = normalized surface-to-light direction, w = intensity.
     lights: [[f32; 4]; 3],
     /// xyz = linear ambient tint. w = object-space → texture-space scale
     /// used by the solid-material variant (`tex = obj_pos * w + 0.5`).
     ambient: [f32; 4],
 }
 
-/// 48-byte packed vertex. Field offsets MUST match the attribute offsets
-/// `vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4,
-/// 3 => Float32x2]` computes (0, 12, 24, 40). Any padding between fields
-/// desyncs Rust's Rgba32Float layout from wgpu's cumulative-offset layout
-/// — the GPU reads normal / tangent / uv from the wrong bytes and the
-/// mesh renders with garbage shading.
+/// 48-byte packed vertex. Field offsets must stay at (0, 12, 24, 40) to match
+/// what `vertex_attr_array!` computes below: any padding and the GPU reads
+/// normal, tangent and uv from the wrong bytes.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct Vertex {
@@ -114,8 +102,8 @@ pub struct SceneRenderer {
 
 impl SceneRenderer {
     pub fn new(device: &wgpu::Device) -> Self {
-        // The two shader variants share scene_common.wgsl; each appends
-        // its own material bindings + fs_main (2D vs 3D channel textures).
+        // Both variants share scene_common.wgsl and append their own material
+        // bindings and fs_main.
         let common = include_str!("shaders/scene_common.wgsl");
         let src_uv = format!("{common}{}", include_str!("shaders/scene_uv.wgsl"));
         let src_solid = format!("{common}{}", include_str!("shaders/scene_solid.wgsl"));
@@ -163,9 +151,8 @@ impl SceneRenderer {
         }
     }
 
-    /// Allocate a scene color target (Rgba8Unorm, RENDER_ATTACHMENT +
-    /// TEXTURE_BINDING). Caller keeps this alive and re-registers with
-    /// egui-wgpu whenever it recreates.
+    /// Allocate a scene color target. The caller keeps it alive and
+    /// re-registers with egui-wgpu on every recreate.
     pub fn make_color_target(&self, device: &wgpu::Device, size: (u32, u32)) -> wgpu::Texture {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some("scene-color"),
@@ -181,8 +168,7 @@ impl SceneRenderer {
         })
     }
 
-    /// Allocate a matching depth target. Not registered with egui — private
-    /// to the scene pass.
+    /// Matching depth target, private to the scene pass.
     pub fn make_depth_target(&self, device: &wgpu::Device, size: (u32, u32)) -> wgpu::Texture {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some("scene-depth"),
@@ -196,10 +182,9 @@ impl SceneRenderer {
         })
     }
 
-    /// Render `material` onto `shape` into an existing color+depth pair.
-    /// Caller owns both attachments so they can survive across frames
-    /// (essential for smooth auto-spin — otherwise every frame re-registers
-    /// a texture with egui-wgpu).
+    /// Render `material` onto `shape` into an existing color+depth pair. The
+    /// caller owns both so they survive across frames; reallocating would
+    /// re-register a texture with egui-wgpu every frame.
     pub fn render_into(
         &self,
         ctx: &DeviceCtx,

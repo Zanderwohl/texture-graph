@@ -1,14 +1,11 @@
-//! Procedural texture graph — pure data model + evaluator.
+//! Procedural texture graph: data model and CPU evaluator.
 //!
-//! No rendering, no UI, no async. Consumers (WGPU preview, Tauri frontend,
-//! headless bake) drive evaluation by sampling `(u, v, w) ∈ [0, 1]³` and
-//! reading the resulting [`Color`].
+//! No rendering, no UI, no async. Sample at `(u, v, w) ∈ [0, 1]³` and read
+//! back a [`Color`].
 //!
-//! Contract:
-//! - Every [`Layer`] produces a [`Color`] (Oklcha), unclamped.
-//! - Clamping to display range happens only at the [`Output`] stage.
-//! - The graph is a DAG; cycles are rejected at edit time, so the evaluator
-//!   assumes acyclicity.
+//! - Every [`Layer`] produces unclamped Oklcha.
+//! - Clamping to display range happens only at [`Output`].
+//! - Cycles are rejected at edit time, so the evaluator assumes a DAG.
 
 pub mod color;
 pub mod eval;

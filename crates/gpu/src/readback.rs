@@ -1,12 +1,8 @@
-//! Getting baked pixels back off the GPU.
+//! Getting baked pixels back off the GPU, for consumers that need them on
+//! the CPU. See `examples/bake.rs`.
 //!
-//! The editor never needs this — it hands the baked `wgpu::Texture` straight
-//! to egui and the pixels stay on the device. A headless consumer does: a
-//! bake it cannot read is not a bake it can save. See `examples/bake.rs`.
-//!
-//! Blocking, because that is what a batch caller wants and the async
-//! alternative would be an executor dependency in the public API. The future
-//! this waits on is resolved by `Device::poll`, not by any runtime.
+//! Blocking: the wait is resolved by `Device::poll`, so an async version
+//! would put an executor in the public API for no gain to a batch caller.
 
 use crate::device::DeviceCtx;
 
@@ -37,9 +33,8 @@ impl Image {
         ])
     }
 
-    /// Encode as binary PPM (`P6`), which every image tool reads and which
-    /// costs no dependency to write. Alpha is dropped — PPM has no channel
-    /// for it.
+    /// Binary PPM (`P6`) — no dependency to write. PPM has no alpha channel,
+    /// so alpha is dropped.
     pub fn to_ppm(&self) -> Vec<u8> {
         let mut out = format!("P6\n{} {}\n255\n", self.width, self.height).into_bytes();
         out.reserve(self.pixels.len() / 4 * 3);
@@ -52,13 +47,11 @@ impl Image {
 
 /// Copy an `Rgba8Unorm`-family texture back to the CPU.
 ///
-/// `size` is the texture's dimensions; passing anything else reads the wrong
-/// rectangle rather than failing, because a `wgpu::Texture` carries its own
-/// size and this asks for exactly what it is told to.
+/// A `size` other than the texture's own reads the wrong rectangle rather
+/// than failing.
 pub fn read_rgba8(ctx: &DeviceCtx, tex: &wgpu::Texture, size: (u32, u32)) -> Image {
     let (width, height) = size;
-    // wgpu requires the copy's row stride to be 256-byte aligned, so the
-    // buffer is padded and the padding is dropped on the way out.
+    // Padded to the required stride, unpadded on the way out.
     let packed_bpr = width * 4;
     let padded_bpr = packed_bpr.div_ceil(COPY_ALIGN) * COPY_ALIGN;
 
@@ -126,9 +119,7 @@ mod tests {
         Image { width, height, pixels }
     }
 
-    /// The header is what tools parse, and the body must be exactly three
-    /// bytes a pixel with no alpha and no row padding — the padding the
-    /// readback strips is the whole reason this type exists.
+    /// Three bytes a pixel, no alpha and no row padding.
     #[test]
     fn ppm_has_a_p6_header_and_three_bytes_per_pixel() {
         let img = image(3, 2, |x, y| [x as u8, y as u8, 7, 255]);
@@ -141,8 +132,7 @@ mod tests {
         assert_eq!(&body[body.len() - 3..], &[2, 1, 7]);
     }
 
-    /// Alpha is dropped rather than composited — a bake with transparency
-    /// must not come back with its colours silently multiplied.
+    /// Dropped, not composited: transparency must not multiply the colours.
     #[test]
     fn ppm_drops_alpha_without_touching_colour() {
         let img = image(2, 1, |x, _| [200, 100, 50, if x == 0 { 0 } else { 255 }]);

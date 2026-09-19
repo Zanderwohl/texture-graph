@@ -1,20 +1,16 @@
-//! Shared "color OR layer" picker for `ColorInput` fields.
+//! Shared "color or layer" picker for `ColorInput` fields.
 //!
-//! Presents the current mode's editor plus a small toggle button to switch
-//! modes. Every id_source must be unique across the frame — pass a tuple
-//! including the parent layer id and the field name (e.g. `(id.0, "ramp-stop", i)`).
+//! `id_source` must be unique across the frame: pass a tuple of the parent
+//! layer id and the field name, e.g. `(id.0, "ramp-stop", i)`.
 
 use texture_graph_core::{ColorInput, Graph, LayerId, color::oklcha};
 
 use crate::widgets::{color_edit, layer_ref};
 
-/// Draw a `ColorInput` inline and mutate it in place. Returns `true` if
-/// the value changed this frame.
+/// Draw a `ColorInput` inline and mutate it in place.
 ///
-/// * `label` — prefixed onto the layer combo when in Layer mode. When empty,
-///   the picker is drawn without a label prefix.
-/// * `except` — layer id to hide from the picker (typically the layer we're
-///   editing, so trivial self-references are unreachable).
+/// * `label` — prefixes the layer combo in Layer mode; empty for none.
+/// * `except` — hidden from the picker, so a layer can't reference itself.
 pub fn color_input_widget(
     ui: &mut egui::Ui,
     graph: &Graph,

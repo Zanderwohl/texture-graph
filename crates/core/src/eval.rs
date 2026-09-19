@@ -22,10 +22,8 @@ pub struct Sample {
 /// The `w` a *flat* bake samples a 3D field at — the middle of the unit
 /// cube, not its floor.
 ///
-/// Both backends have to agree on this or a 3D graph is two different
-/// slices of the same volume depending on where it was rendered, which is
-/// exactly what used to happen: the GPU has always baked flat passes at
-/// 0.5, while the CPU fallback reached for [`Sample::uv`] and got 0.0.
+/// Both backends must agree, or a 3D graph is two different slices of the
+/// same volume depending on where it was rendered.
 pub const FLAT_W: f32 = 0.5;
 
 impl Sample {
@@ -150,8 +148,7 @@ fn eval_scalar(si: &ScalarInput, s: Sample, by_id: &HashMap<LayerId, &Layer>, ct
 // ---- Node implementations ----------------------------------------------
 
 fn eval_noise(n: &Noise, s: Sample, ctx: &EvalCtx) -> Color {
-    // Straight through to the shared kernel — see `crate::noise` for why the
-    // CPU no longer has a noise implementation of its own.
+    // Straight through to the shared kernel; `crate::noise` has the why.
     let sample = |off: u32| -> f32 {
         let dims = match n.dims {
             NoiseDims::D1 => crate::noise::Dims::D1,

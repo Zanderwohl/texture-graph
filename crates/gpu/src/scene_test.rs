@@ -1,12 +1,11 @@
 //! Readback tests for the 3D scene renderer's orientation and lighting.
 //!
-//! Renders each shape with a color texture that is red for u < 0.5 and
-//! green for u >= 0.5, then inspects actual pixels:
+//! Each shape renders with a texture that is red for u < 0.5 and green
+//! above, and the pixels are inspected:
 //!
-//! - If a mesh renders inside-out (winding/culling bug) the camera sees the
-//!   *far* surface through the mesh, so the red/green split shows up
-//!   mirrored (cube) or as the wrong hemisphere entirely (sphere).
-//! - If lighting is broken the lit-face brightness collapses to ambient.
+//! - A mesh rendering inside-out shows the far surface through itself, so the
+//!   split comes out mirrored on a cube, or the wrong hemisphere on a sphere.
+//! - Broken lighting collapses lit-face brightness to ambient.
 
 use texture_graph_core::{
     Color, EvalCtx, Graph, LayerKind, Noise, NoiseDims, NoiseOutput, NoiseRange,
@@ -146,7 +145,7 @@ fn render_frame_with(
     };
     scene.render_into(ctx, material, shape, &color_view, &depth_view, (SIZE, SIZE), &camera);
 
-    // Readback. 128 px * 4 B = 512 B rows — already 256-aligned.
+    // 128 px * 4 B = 512 B rows, already 256-aligned.
     let bytes_per_row = SIZE * 4;
     let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("scene-readback"),
@@ -214,10 +213,9 @@ fn cube_front_face_is_lit_and_not_mirrored() {
     let center = px(&frame, c, c);
     eprintln!("cube: left={left:?} right={right:?} center={center:?}");
 
-    // Camera sits on +Z at yaw 0; the +Z face has u increasing with +X, so
-    // the red (u < 0.5) half must appear on the LEFT of the screen. If the
-    // mesh renders inside-out we see the -Z face through the cube and the
-    // split mirrors.
+    // The camera is on +Z at yaw 0 and the +Z face has u increasing with +X,
+    // so red (u < 0.5) belongs on the left. Inside-out shows the -Z face
+    // through the cube and mirrors the split.
     assert!(
         left[0] > left[1] + 40,
         "left of cube face should be red-dominant, got {left:?} (mirrored ⇒ inside-out winding)"
