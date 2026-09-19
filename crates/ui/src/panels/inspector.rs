@@ -141,9 +141,7 @@ fn ramp_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, r: &mut ColorRamp
     let mut remove_at: Option<usize> = None;
     for (i, stop) in r.stops.iter_mut().enumerate() {
         ui.horizontal(|ui| {
-            changed |= ui
-                .add(egui::DragValue::new(&mut stop.t).speed(0.01).range(0.0..=1.0))
-                .changed();
+            changed |= crate::widgets::ramp_stop::stop_t(ui, &mut stop.t).changed();
             changed |= crate::widgets::color_input::color_input_widget(
                 ui,
                 graph,
