@@ -6,17 +6,16 @@ use texture_graph_core::Color;
 
 use crate::color_convert::{oklcha_to_srgba, srgba_to_oklcha};
 
-/// Returns `true` if the color was mutated this frame.
+/// Whether the color changed.
 pub fn oklcha_edit(ui: &mut egui::Ui, color: &mut Color) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
-        // Swatch → sRGB picker.
         let mut rgba = oklcha_to_srgba(*color);
         if ui.color_edit_button_rgba_unmultiplied(&mut rgba).changed() {
             *color = srgba_to_oklcha(rgba);
             changed = true;
         }
-        // LCh popover — the escape hatch for out-of-sRGB-gamut colors.
+        // The escape hatch for colors the sRGB picker can't reach.
         let btn = ui.small_button("LCh…");
         egui::Popup::from_toggle_button_response(&btn)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)

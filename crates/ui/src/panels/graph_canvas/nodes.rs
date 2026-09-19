@@ -1,9 +1,7 @@
-//! Node pass: body interaction, chrome, thumbnails, inline widget rows,
-//! and socket interaction/painting.
+//! Node pass: body interaction, chrome, thumbnails, widget rows, sockets.
 //!
-//! Registration order inside a node gives egui's top-most-wins hit testing
-//! the right precedence automatically: body interact first, then inline
-//! widgets, then sockets — so sockets beat widgets beat node-drag.
+//! Registration order sets hit-test precedence, since egui's top-most wins.
+//! Body first, then widgets, then sockets: sockets beat widgets beat drag.
 
 use std::sync::Arc;
 
@@ -16,15 +14,16 @@ use texture_graph_core::{
 use crate::app::GpuBits;
 use crate::color_convert::{oklcha_to_srgba, srgba_to_oklcha};
 use crate::previews::PreviewCache;
-use crate::state::{EditCmd, NodeDrag, NodeRef, RampDrag, Renaming, UiState, WireDrag};
+use crate::state::{
+    EditCmd, NodeDrag, NodeRef, RampDrag, RampMenu, Renaming, UiState, WireDrag,
+};
 use crate::widgets::enum_combo::enum_combo;
 
 use super::layout::{socket_label, NodeLayout, ParamRow, Row};
 use super::ramp;
 use super::{socket_hit_radius, HEADER_H, SOCKET_R, ZOOM_LABELS_MIN, ZOOM_WIDGETS_MIN};
 
-/// Returns `true` if any node body, widget, or socket claimed the pointer
-/// this frame — the caller suppresses background pan.
+/// Whether anything claimed the pointer, which suppresses background pan.
 pub fn draw_and_interact_nodes(
     ui: &mut egui::Ui,
     painter: &egui::Painter,
@@ -39,10 +38,9 @@ pub fn draw_and_interact_nodes(
     let mut hit = false;
     let style = row_style(ui.style(), state.canvas_zoom);
     for layout in layouts {
-        // Off-screen nodes are skipped whole: no interaction, no painting,
-        // and no `get_or_build`, so the frame's bake budget goes to
+        // Skipping off-screen nodes whole spends the frame's bake budget on
         // thumbnails somebody can see. The margin covers the sockets, which
-        // sit on the node's edge and so reach slightly past its rect.
+        // sit on the edge and reach past the rect.
         let margin = socket_hit_radius(state.canvas_zoom);
         if !layout.rect.expand(margin).intersects(canvas_rect) && !held(state, layout.node) {
             continue;
@@ -51,7 +49,7 @@ pub fn draw_and_interact_nodes(
         let renaming = matches!(layout.node, NodeRef::Layer(id)
             if state.renaming.as_ref().is_some_and(|r| r.node == id));
         draw_chrome(painter, graph, state, layout, renaming);
-        // After the body, so the field wins the pointer over the node drag.
+        // After the body, so the field beats the node drag.
         hit |= title(ui, graph, state, layout);
         if let (NodeRef::Layer(id), Some(thumb)) = (layout.node, layout.thumb_rect) {
             draw_thumbnail(ui, painter, graph, thumb, id, previews, eval_ctx, gpu.as_deref_mut());
@@ -69,24 +67,21 @@ pub fn draw_and_interact_nodes(
     hit
 }
 
-/// Whether this node has to be drawn and interacted with wherever it is,
-/// off screen or not.
+/// Whether this node must be drawn wherever it is, on screen or not.
 ///
-/// Two do: the one the pointer is holding, because the drag is resolved
-/// against the pointer and a node that stopped interacting on leaving the
-/// view would be dropped there; and the one being renamed, because a text
-/// field that stops existing takes the keyboard focus the rename is
-/// committed by with it.
+/// A node being dragged, or whose ramp stop is, resolves that drag against
+/// the pointer and would be dropped where it left the view. A node being
+/// renamed would take the keyboard focus the rename commits by with it.
 fn held(state: &UiState, node: NodeRef) -> bool {
     state.drag.is_some_and(|d| d.node == node)
         || matches!(node, NodeRef::Layer(id)
-            if state.renaming.as_ref().is_some_and(|r| r.node == id))
+            if state.ramp_drag.is_some_and(|d| d.node == id)
+                || state.renaming.as_ref().is_some_and(|r| r.node == id))
 }
 
 // ---- Body ---------------------------------------------------------------
 
-/// World-space offset of a duplicated node from its original — down and to
-/// the right so the copy is visibly a separate, nearby node.
+/// Offsets a duplicate down and right, so the copy reads as a second node.
 const DUPLICATE_OFFSET: f32 = 40.0;
 
 fn body_interact(
@@ -127,13 +122,10 @@ fn body_interact(
     }
     match layout.node {
         NodeRef::Layer(id) => {
-            // World position for a duplicate — offset from this node.
             let world = super::screen_to_world(layout.rect.min, canvas_rect.min, state);
             resp.context_menu(|ui| {
-                // The menu entry only arms the header field; the typing
-                // happens up there, where the name is. Kept alongside the
-                // click-the-title path because a context menu is where
-                // people look for "rename".
+                // Arms the header field rather than typing here; a menu is
+                // where people look for "rename".
                 if ui.button("Rename").clicked() {
                     state.renaming = Some(Renaming {
                         node: id,
@@ -142,14 +134,11 @@ fn body_interact(
                     });
                     ui.close();
                 }
-                // Preview this node's color alone (default roughness/
-                // metallic/normal) in the preview panel.
+                // This layer's color alone, over default PBR channels.
                 if ui.button("Preview").clicked() {
                     state.preview_target = Some(id);
                     ui.close();
                 }
-                // Duplicate: copy every param (and input wiring) into a new
-                // node placed down-and-right of this one.
                 if ui.button("Duplicate").clicked() {
                     if let Some(layer) = graph.get(id) {
                         let name = crate::catalog::unique_name(graph, &layer.name);
@@ -170,7 +159,6 @@ fn body_interact(
         }
         NodeRef::Output => {
             resp.context_menu(|ui| {
-                // Back to the full PBR material.
                 if ui.button("Preview").clicked() {
                     state.preview_target = None;
                     ui.close();
@@ -220,7 +208,7 @@ fn draw_chrome(
         },
         NodeRef::Output => ("Material Output".to_string(), "Output"),
     };
-    // While the title is being typed over, the text field *is* the title.
+    // While it is being typed over, the field is the title.
     if !renaming {
         painter.text(
             layout.rect.min + egui::vec2(10.0, 4.0) * z,
@@ -241,8 +229,7 @@ fn draw_chrome(
 
 // ---- Title --------------------------------------------------------------
 
-/// The name's line in the header — what you click to rename, and where the
-/// field appears when you do.
+/// The name's line in the header: click to rename, field appears in place.
 fn title_rect(node: egui::Rect, z: f32) -> egui::Rect {
     egui::Rect::from_min_size(
         node.min + egui::vec2(8.0, 2.0) * z,
@@ -250,36 +237,27 @@ fn title_rect(node: egui::Rect, z: f32) -> egui::Rect {
     )
 }
 
-/// Click the title to edit it; **Enter** or clicking away commits,
-/// **Escape** discards. Both paths put the painted label back.
+/// Enter or clicking away commits, Escape discards.
 ///
-/// The text lives in `UiState` rather than in the graph because names must
-/// be unique: a rename is refused like any other edit, and half-typed text
-/// needs somewhere to sit while it is briefly a duplicate of something.
-/// Committing queues a `Rename` command like everything else, so a refusal
-/// lands in the status row and the title simply stays what it was.
+/// The text lives in `UiState`, not the graph: names must be unique, and
+/// half-typed text needs somewhere to sit while it is briefly a duplicate.
+/// Committing queues a `Rename` like any edit, so a refusal lands in the
+/// status row and the title stays put.
 ///
-/// Returns whether the field claimed the pointer, which suppresses the node
-/// drag underneath it.
+/// Returns whether the field claimed the pointer.
 fn title(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, layout: &NodeLayout) -> bool {
     let NodeRef::Layer(id) = layout.node else { return false };
     let z = state.canvas_zoom;
-    // Zoomed out far enough that the header is a smudge, there is nothing
-    // worth typing into; the label is painted and that is all.
+    // Too far out for the header to be legible, let alone typed into.
     if z < ZOOM_WIDGETS_MIN {
         return false;
     }
     let rect = title_rect(layout.rect, z);
     let editing = state.renaming.as_ref().is_some_and(|r| r.node == id);
 
-    // Both branches go through the same child Ui, at the same rect, with the
-    // same explicit id — so each registers exactly one widget, at one rect,
-    // under one auto-id, whether the title is a label you can click or a
-    // field you can type in. Swapping the *shape* of what is registered
-    // here is what egui's `warn_if_rect_changes_id` is watching for: the
-    // widget at this rect would have one id on the frame before a rename
-    // and another on the frame after, which paints a red outline and, worse,
-    // hands any in-flight interaction to the wrong widget.
+    // Both branches register one widget, at one rect, under one id. Changing
+    // the shape of what is registered here is what `warn_if_rect_changes_id`
+    // watches for, and it hands in-flight interactions to the wrong widget.
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .id(egui::Id::new(("graph-title", id.0)))
@@ -312,14 +290,13 @@ fn title(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, layout: &NodeLay
             .margin(egui::Margin::symmetric((2.0 * z) as i8, 0)),
     );
     if !focused {
-        // Only on the first frame. Asking every frame would make the field
-        // impossible to blur, and blurring is one of the two ways to commit.
+        // Asking every frame would make the field impossible to blur, and
+        // blurring commits.
         resp.request_focus();
     }
 
-    // Escape is checked before the field's own handling matters: it also
-    // surrenders focus, so checking the discard case first is what keeps a
-    // cancelled rename from being read as a blur and committed.
+    // Escape surrenders focus too, so it has to be read before the blur or a
+    // cancelled rename commits.
     if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
         state.renaming = None;
     } else if resp.lost_focus() {
@@ -333,11 +310,9 @@ fn title(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, layout: &NodeLay
     true
 }
 
-/// The edit a committed title amounts to, or `None` when it amounts to
-/// nothing. Clicking a title, reading it and clicking away is not a change,
-/// and queueing a no-op rename would mark the file unsaved for having been
-/// read. An emptied field is the same case: a nameless layer isn't what the
-/// user meant, and the model would refuse it anyway.
+/// The edit a committed title amounts to, or `None` for a no-op. Reading a
+/// title and clicking away must not mark the file unsaved; an emptied field
+/// is the same case, and the model would refuse it anyway.
 fn rename_command(graph: &Graph, id: LayerId, text: &str) -> Option<EditCmd> {
     let trimmed = text.trim();
     let current = &graph.get(id)?.name;
@@ -378,20 +353,14 @@ fn draw_thumbnail(
 
 // ---- Inline widget rows -------------------------------------------------
 
-/// Child Ui spanning one row, with the app style scaled to the canvas zoom
-/// so fonts, spacing, and interact sizes track the node visually.
+/// Child Ui spanning one row, styled to the canvas zoom so fonts and
+/// interact sizes track the node.
 ///
-/// The id is set with [`egui::UiBuilder::id`] — *explicit*, not a salt.
-/// A salted child derives its `unique_id`, and with it the auto-ids of
-/// every widget inside, from the parent's running `next_auto_id_salt`.
-/// That makes each inline slider and drag-value depend on how many child
-/// Uis happened to be created before it this frame — which changes when
-/// the rename field appears or disappears, and when a node scrolls out of
-/// view and stops registering. The widgets then swap ids under each other
-/// for a frame: egui paints its `warn_if_rect_changes_id` outlines across
-/// the whole canvas, and an in-progress drag lands on the wrong widget. An
-/// explicit id is independent of the parent, so a row's widgets keep their
-/// ids no matter what else is on screen.
+/// The id is explicit, not a salt. A salted child takes its id — and the
+/// auto-ids of every widget inside it — from the parent's running counter,
+/// so a row's widgets would depend on how many child Uis happened to come
+/// before them: the rename field appearing, or a node scrolling out of view,
+/// would swap ids under them and land an in-flight drag on the wrong one.
 fn row_ui(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -412,10 +381,8 @@ fn row_ui(
     child
 }
 
-/// The row style, which depends on the canvas zoom and on nothing else.
-/// Built once per frame and shared by every row of every node: it was a
-/// full `Style` clone per row per node per frame, which on a twenty-node
-/// graph is hundreds of them.
+/// Depends on the canvas zoom and nothing else, so it is built once a frame
+/// and shared: per-row it would be hundreds of `Style` clones.
 fn row_style(base: &egui::Style, zoom: f32) -> Arc<egui::Style> {
     let mut style = base.clone();
     for font in style.text_styles.values_mut() {
@@ -431,19 +398,17 @@ fn row_style(base: &egui::Style, zoom: f32) -> Arc<egui::Style> {
     Arc::new(style)
 }
 
-/// Compact color swatch (no LCh popover — nodes are tight; the inspector
-/// still has the full editor).
-fn color_swatch(ui: &mut egui::Ui, color: &mut texture_graph_core::Color) -> bool {
+/// Compact swatch, no LCh popover; nodes are tight and the inspector has one.
+fn color_swatch(ui: &mut egui::Ui, color: &mut texture_graph_core::Color) -> egui::Response {
     let mut rgba = oklcha_to_srgba(*color);
-    if ui.color_edit_button_rgba_unmultiplied(&mut rgba).changed() {
+    let resp = ui.color_edit_button_rgba_unmultiplied(&mut rgba);
+    if resp.changed() {
         *color = srgba_to_oklcha(rgba);
-        return true;
     }
-    false
+    resp
 }
 
-/// Painter-only fallback label for a socket row when zoom is too low for
-/// real widgets.
+/// Painter-only socket label, for zoom too low to bother with widgets.
 fn painter_row_label(painter: &egui::Painter, rect: egui::Rect, zoom: f32, label: &str) {
     painter.text(
         egui::pos2(rect.left() + 10.0 * zoom, rect.center().y),
@@ -475,8 +440,7 @@ fn layer_rows(
                 match row {
                     Row::Socket(key) => painter_row_label(painter, *rect, z, socket_label(*key)),
                     Row::Param(ParamRow::RampBar) => {
-                        // Keep the gradient recognizable when zoomed out —
-                        // paint only, no interaction.
+                        // Recognizable when zoomed out, but not interactive.
                         if let LayerKind::ColorRamp(r) = &layer.kind {
                             paint_ramp_bar(painter, graph, r, *rect, z, eval_ctx, None);
                         }
@@ -512,18 +476,94 @@ fn layer_rows(
     }
 }
 
-// ---- Ramp bar -----------------------------------------------------------
+// ---- Ramp stops ---------------------------------------------------------
 
-/// Screen-space grab radius around a stop indicator, clamped so indicators
-/// stay grabbable when zoomed out.
-fn ramp_grab_radius(z: f32) -> f32 {
-    (6.0 * z).max(6.0)
+/// What a stop's right-click menu asked for.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum StopAction {
+    Duplicate,
+    Delete,
 }
 
-/// Split a RampBar row rect into the gradient strip and the arrow strip
-/// below it. Vertical budget (world units × z): 3 pad + 22 gradient +
-/// 12 arrows + 3 pad = RAMP_BAR_H.
-fn ramp_bar_rects(rect: egui::Rect, z: f32) -> (egui::Rect, egui::Rect) {
+/// The items themselves, for whichever menu is showing them. Delete greys
+/// out at the two-stop floor rather than vanishing, so the menu keeps its
+/// shape.
+fn stop_menu_items(ui: &mut egui::Ui, can_delete: bool) -> Option<StopAction> {
+    let mut action = None;
+    if ui.button("Duplicate").clicked() {
+        action = Some(StopAction::Duplicate);
+        ui.close();
+    }
+    if ui
+        .add_enabled(can_delete, egui::Button::new("Delete"))
+        .clicked()
+    {
+        action = Some(StopAction::Delete);
+        ui.close();
+    }
+    action
+}
+
+/// The row's menu, hung on its number, its swatch or the bare stretch
+/// beside them.
+fn stop_menu(resp: &egui::Response, can_delete: bool) -> Option<StopAction> {
+    let mut action = None;
+    resp.context_menu(|ui| {
+        action = stop_menu_items(ui, can_delete);
+    });
+    action
+}
+
+/// Carry out `action`. `saved_consts` keys are positional, so an insert or
+/// remove has to drag them along; see [`UiState::remap_ramp_consts`].
+fn apply_stop_action(
+    r: &mut ColorRamp,
+    i: usize,
+    action: StopAction,
+    state: &mut UiState,
+    node: NodeRef,
+) -> bool {
+    match action {
+        StopAction::Duplicate => {
+            let Some(src) = r.stops.get(i).copied() else {
+                return false;
+            };
+            let t = ramp::duplicate_t(&r.stops, i);
+            let j = ramp::insert_index(&r.stops, t);
+            r.stops.insert(j, ColorStop { t, ..src });
+            // The copy inherits no saved const: those belong to the stop a
+            // wire displaced one on, and the remap moves keys, not copies.
+            state.remap_ramp_consts(node, move |k| Some(if k >= j { k + 1 } else { k }));
+            true
+        }
+        StopAction::Delete => {
+            // The floor the data depends on; the menu greys out there too.
+            if i >= r.stops.len() || r.stops.len() <= 2 {
+                return false;
+            }
+            r.stops.remove(i);
+            state.remap_ramp_consts(node, move |k| match k.cmp(&i) {
+                std::cmp::Ordering::Less => Some(k),
+                std::cmp::Ordering::Equal => None,
+                std::cmp::Ordering::Greater => Some(k - 1),
+            });
+            true
+        }
+    }
+}
+
+// ---- Ramp bar -----------------------------------------------------------
+
+/// Grab radius around an indicator: its half-width plus slop, floored so it
+/// stays grabbable zoomed out. Generous, because a near miss drags nothing
+/// at all and the row's height is reserved for this one gesture.
+fn ramp_grab_radius(z: f32) -> f32 {
+    (4.0 * z).max(4.0) + 5.0
+}
+
+/// Gradient strip and the arrow strip below it. Vertically, in world units:
+/// 3 pad + 22 gradient + 12 arrows + 3 pad = RAMP_BAR_H.
+pub(super) fn ramp_bar_rects(rect: egui::Rect, z: f32) -> (egui::Rect, egui::Rect) {
     let inner = rect.shrink2(egui::vec2(10.0 * z, 0.0));
     let grad = egui::Rect::from_min_size(
         inner.min + egui::vec2(0.0, 3.0 * z),
@@ -546,9 +586,8 @@ fn ramp_color32(c: Color) -> egui::Color32 {
     )
 }
 
-/// Gradient mesh + stop indicators. `highlight` outlines that stop white
-/// (hovered or dragged). Paint-only — shared by the interactive widget and
-/// the low-zoom path.
+/// Gradient mesh and indicators; `highlight` outlines one white. Paint-only,
+/// shared by the interactive widget and the low-zoom path.
 fn paint_ramp_bar(
     painter: &egui::Painter,
     graph: &Graph,
@@ -568,8 +607,8 @@ fn paint_ramp_bar(
         .map(|s| (s.t, ramp::stop_display_color(graph, s, eval_ctx)))
         .collect();
 
-    // Sample positions: uniform coverage plus every interior stop t, so
-    // hard cusps land exactly on a vertex instead of straddling a segment.
+    // Uniform coverage plus every interior stop, so a hard cusp lands on a
+    // vertex instead of straddling a segment.
     const SEGMENTS: usize = 48;
     let mut xs: Vec<f32> = (0..=SEGMENTS).map(|i| i as f32 / SEGMENTS as f32).collect();
     xs.extend(display.iter().map(|(t, _)| *t).filter(|t| *t > 0.0 && *t < 1.0));
@@ -598,8 +637,7 @@ fn paint_ramp_bar(
         egui::StrokeKind::Middle,
     );
 
-    // Indicators: house-shaped pentagons pointing up at the stop's t, in
-    // stop order so a later stop paints on top at coincident t.
+    // In stop order, so a later stop paints on top at coincident t.
     let hw = 4.0 * z;
     let shoulder = arrows.top() + 5.0 * z;
     for (i, (t, c)) in display.iter().enumerate() {
@@ -624,8 +662,8 @@ fn paint_ramp_bar(
     }
 }
 
-/// Interactive gradient bar: drag indicators (crossing reorders), double-
-/// click empty bar to add a stop. Returns whether `ramp` changed.
+/// Interactive bar: drag indicators (crossing reorders), double-click the
+/// gradient to add a stop.
 #[allow(clippy::too_many_arguments)]
 fn ramp_bar(
     ui: &mut egui::Ui,
@@ -644,9 +682,9 @@ fn ramp_bar(
     }
     let grab = ramp_grab_radius(z);
     let ind_x = |t: f32| grad.left() + t.clamp(0.0, 1.0) * grad.width();
-    let pointer_t = |x: f32| ((x - grad.left()) / grad.width()).clamp(0.0, 1.0);
-    // Nearest indicator within the grab radius; `<=` so the later (topmost-
-    // painted) stop wins a tie at coincident t.
+    // Unclamped, so a grab offset stays meaningful past either end.
+    let pointer_t = |x: f32| (x - grad.left()) / grad.width();
+    // `<=` so the topmost-painted stop wins a tie at coincident t.
     let indicator_at = |stops: &[ColorStop], x: f32| -> Option<usize> {
         let mut best: Option<(usize, f32)> = None;
         for (i, s) in stops.iter().enumerate() {
@@ -658,9 +696,8 @@ fn ramp_bar(
         best.map(|(i, _)| i)
     };
 
-    // One interact for the whole bar: a single stable id keeps egui drag
-    // ownership through crossing reorders (per-indicator ids would change
-    // index mid-drag).
+    // One interact for the whole bar: a stable id keeps drag ownership
+    // through a crossing reorder, which moves indices.
     let resp = ui.interact(
         rect,
         egui::Id::new(("ramp-bar", id.0)),
@@ -668,43 +705,64 @@ fn ramp_bar(
     );
     let mut changed = false;
 
-    if resp.drag_started() {
+    // Arm on the press, not `drag_started`: egui withholds that until the
+    // pointer has travelled `max_click_dist`, and `interact_pointer_pos`
+    // reports where it is now, so the hit test would run a grab radius from
+    // where the user aimed. `is_pointer_button_down_on` is set on the press
+    // frame and confirms the press is the bar's.
+    if ui.ctx().input(|i| i.pointer.primary_pressed()) && resp.is_pointer_button_down_on() {
         if let Some(p) = resp.interact_pointer_pos() {
             if let Some(i) = indicator_at(&ramp.stops, p.x) {
-                state.ramp_drag = Some(RampDrag { node: id, stop: i });
+                state.ramp_drag = Some(RampDrag {
+                    node: id,
+                    stop: i,
+                    // Against where the indicator is drawn, which `ind_x`
+                    // clamps: a `t` loaded out of range would otherwise set
+                    // the offset to however far out it sat.
+                    grab_dt: ramp.stops[i].t.clamp(0.0, 1.0) - pointer_t(p.x),
+                });
             }
         }
     }
-    // Advance from global pointer state, not `resp.dragged()` — the drag
-    // must stay stuck to the indicator even when the pointer overshoots the
-    // bar rect (t just clamps). Release is button-up, handled up front by
-    // `release_stale_ramp_drag`.
+    // From global pointer state, not `resp.dragged()`: the drag stays stuck
+    // to the indicator when the pointer overshoots the bar. Release is
+    // button-up, in `release_stale_ramp_drag`.
     if let Some(drag) = state.ramp_drag.filter(|d| d.node == id) {
-        if let Some(p) = ui.ctx().input(|i| i.pointer.hover_pos()) {
+        // `interact_pos`, not `hover_pos`: the latter goes `None` when the
+        // pointer leaves the window, stalling the indicator mid-drag.
+        if let Some(p) = ui.ctx().input(|i| i.pointer.interact_pos()) {
             if drag.stop < ramp.stops.len() {
-                let (new_i, swaps) =
-                    ramp::drag_stop_to(&mut ramp.stops, drag.stop, pointer_t(p.x));
-                for (a, b) in swaps {
-                    state.remap_ramp_consts(NodeRef::Layer(id), move |j| {
-                        Some(if j == a {
-                            b
-                        } else if j == b {
-                            a
-                        } else {
-                            j
-                        })
-                    });
+                // Carry the grab offset, so the indicator travels with the
+                // cursor instead of snapping its centre under it.
+                let t = (pointer_t(p.x) + drag.grab_dt).clamp(0.0, 1.0);
+                // A press that hasn't moved is not an edit; pushing SetKind
+                // anyway re-bakes every downstream thumbnail per frame.
+                if ramp.stops[drag.stop].t != t {
+                    let (new_i, swaps) = ramp::drag_stop_to(&mut ramp.stops, drag.stop, t);
+                    for (a, b) in swaps {
+                        state.remap_ramp_consts(NodeRef::Layer(id), move |j| {
+                            Some(if j == a {
+                                b
+                            } else if j == b {
+                                a
+                            } else {
+                                j
+                            })
+                        });
+                    }
+                    state.ramp_drag = Some(RampDrag { stop: new_i, ..drag });
+                    changed = true;
                 }
-                state.ramp_drag = Some(RampDrag { node: id, stop: new_i });
-                changed = true;
             }
         }
     }
     if resp.double_clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
-            // Only on empty bar — near an indicator it's a mis-click.
+            // Near an indicator it's a mis-click.
             if indicator_at(&ramp.stops, p.x).is_none() {
-                let t = pointer_t(p.x);
+                // The row is wider than its gradient; a press in the padding
+                // adds a stop at the near end.
+                let t = pointer_t(p.x).clamp(0.0, 1.0);
                 let display: Vec<(f32, Color)> = ramp
                     .stops
                     .iter()
@@ -721,23 +779,74 @@ fn ramp_bar(
         }
     }
 
+    // The indicators share the bar's response rather than each holding an
+    // interact rect. A per-indicator id would be the stop's index while its
+    // rect follows the stop's `t`, and removing a stop from the middle parts
+    // those: the indicator to its right keeps its pixels under a new id,
+    // which egui flags and which would point an open menu at the wrong stop.
+    let menu_id = egui::Popup::default_response_id(&resp);
+    let secondary = resp.secondary_clicked();
+    let hit = secondary
+        .then(|| resp.interact_pointer_pos())
+        .flatten()
+        .and_then(|p| indicator_at(&ramp.stops, p.x));
+    if secondary {
+        // Open gradient closes the menu rather than opening one about
+        // whichever stop is nearest. It has to be said explicitly: only
+        // `show` applies the command below, and there is nothing to show.
+        state.ramp_menu = hit.map(|stop| RampMenu { node: id, stop });
+        if hit.is_none() {
+            egui::Popup::close_id(ui.ctx(), menu_id);
+        }
+    } else if state.ramp_menu.is_some_and(|m| m.node == id)
+        && !egui::Popup::is_id_open(ui.ctx(), menu_id)
+    {
+        // It can also close without the bar hearing the click — inside the
+        // popup, or Escape — so the stop must not outlive it.
+        state.ramp_menu = None;
+    }
+    // `Response::context_menu`, minus opening on every secondary click.
+    let open = if hit.is_some() {
+        Some(egui::SetOpenCommand::Bool(true))
+    } else if secondary || resp.clicked() {
+        Some(egui::SetOpenCommand::Bool(false))
+    } else {
+        None
+    };
+    if let Some(menu) = state
+        .ramp_menu
+        .filter(|m| m.node == id && m.stop < ramp.stops.len())
+    {
+        let mut action = None;
+        egui::Popup::menu(&resp)
+            .open_memory(open)
+            .at_pointer_fixed()
+            .show(|ui| action = stop_menu_items(ui, ramp.stops.len() > 2));
+        if let Some(a) = action {
+            changed |= apply_stop_action(ramp, menu.stop, a, state, NodeRef::Layer(id));
+            // Both actions move the indices, and the menu closed on the
+            // click, so don't leave it naming whatever slid into that slot.
+            state.ramp_menu = None;
+        }
+    }
+
     // Paint after interaction so indicators track this frame's drag.
-    let highlight = state
-        .ramp_drag
-        .filter(|d| d.node == id)
-        .map(|d| d.stop)
-        .or_else(|| {
-            let p = ui.ctx().input(|i| i.pointer.hover_pos())?;
-            rect.contains(p)
-                .then(|| indicator_at(&ramp.stops, p.x))
-                .flatten()
-        });
-    paint_ramp_bar(painter, graph, ramp, rect, z, eval_ctx, highlight);
+    let dragging = state.ramp_drag.filter(|d| d.node == id).map(|d| d.stop);
+    let hovering = resp
+        .contains_pointer()
+        .then(|| ui.ctx().input(|i| i.pointer.hover_pos()))
+        .flatten()
+        .and_then(|p| indicator_at(&ramp.stops, p.x));
+    // The grab radius reaches past the outline, so the cursor is what tells
+    // you you're inside it before committing to the press.
+    if dragging.is_some() || hovering.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
+    paint_ramp_bar(painter, graph, ramp, rect, z, eval_ctx, dragging.or(hovering));
     changed
 }
 
-/// Label plus the unconnected-const widget, if this socket type has one.
-/// Connected sockets show the label only.
+/// Label plus the const widget, if unconnected and the type has one.
 fn socket_row(
     ui: &mut egui::Ui,
     kind: &mut LayerKind,
@@ -754,26 +863,31 @@ fn socket_row(
             }
         }
         (LayerKind::ColorRamp(r), InputKey::RampStop(i)) => {
-            let count = r.stops.len();
+            let can_delete = r.stops.len() > 2;
+            // egui doesn't bubble a secondary click from a child to its
+            // parent, so the row's widgets carry the menu themselves and this
+            // covers what they leave bare. Registered first, so they keep
+            // first claim on the pointer for everything else.
+            let mut action = stop_menu(
+                &ui.interact(
+                    ui.max_rect(),
+                    egui::Id::new(("ramp-stop-row", node, i)),
+                    egui::Sense::click(),
+                ),
+                can_delete,
+            );
             if let Some(stop) = r.stops.get_mut(i) {
-                changed |= ui
-                    .add(egui::DragValue::new(&mut stop.t).speed(0.01).range(0.0..=1.0))
-                    .changed();
+                let t = crate::widgets::ramp_stop::stop_t(ui, &mut stop.t);
+                changed |= t.changed();
+                action = action.or_else(|| stop_menu(&t, can_delete));
                 if let ColorInput::Const(c) = &mut stop.color {
-                    changed |= color_swatch(ui, c);
+                    let swatch = color_swatch(ui, c);
+                    changed |= swatch.changed();
+                    action = action.or_else(|| stop_menu(&swatch, can_delete));
                 }
-                // A ramp needs at least two stops; hide remove at the floor.
-                if count > 2 && ui.small_button("x").clicked() {
-                    r.stops.remove(i);
-                    // RampStop keys are positional — shift saved consts down
-                    // past the removed index, drop the removed stop's own.
-                    state.remap_ramp_consts(node, move |j| match j.cmp(&i) {
-                        std::cmp::Ordering::Less => Some(j),
-                        std::cmp::Ordering::Equal => None,
-                        std::cmp::Ordering::Greater => Some(j - 1),
-                    });
-                    changed = true;
-                }
+            }
+            if let Some(a) = action {
+                changed |= apply_stop_action(r, i, a, state, node);
             }
         }
         _ => {
@@ -788,7 +902,7 @@ fn param_row(ui: &mut egui::Ui, id: LayerId, kind: &mut LayerKind, p: ParamRow) 
     match (&mut *kind, p) {
         (LayerKind::Color(c), ParamRow::ColorValue) => {
             ui.label("color");
-            color_swatch(ui, c)
+            color_swatch(ui, c).changed()
         }
         (LayerKind::Noise(n), ParamRow::NoiseDims) => enum_combo(
             ui,
@@ -1088,9 +1202,8 @@ fn sockets(
             egui::Sense::click_and_drag(),
         );
         if resp.drag_started() {
-            // A connected input hands its wire over — the far end stays put
-            // and the loose end is looking for a new home. An unconnected
-            // one starts a wire of its own, going the other way.
+            // A connected input hands its wire over, far end still anchored.
+            // An unconnected one starts a wire going the other way.
             state.wire_drag = Some(match sock.value.connected_to() {
                 Some(src) => WireDrag::FromOutput {
                     src,
@@ -1104,8 +1217,8 @@ fn sockets(
             hit = true;
         }
 
-        // Hover from raw pointer distance — Response::hovered is unreliable
-        // while another widget owns the drag.
+        // Raw distance: `Response::hovered` is unreliable while another
+        // widget owns the drag.
         let hovered = ptr.is_some_and(|p| sock.center.distance(p) <= hit_r);
         let (radius, stroke_color) = socket_style(graph, state, layout.node, hovered, z);
         painter.circle(
@@ -1143,8 +1256,8 @@ fn sockets(
 
 /// How much a hovered socket, or one a live wire could land on, grows by.
 const SOCKET_HOVER: f32 = 1.35;
-/// Smallest a socket ever draws, so it stays visible when zoomed far out —
-/// larger for one a wire could land on, which has an answer to give.
+/// Smallest a socket ever draws, so it survives zooming out. Larger for one
+/// a wire could land on, which has an answer to give.
 const SOCKET_DRAW_MIN: f32 = 2.0;
 const SOCKET_CANDIDATE_MIN: f32 = 3.0;
 
@@ -1158,9 +1271,8 @@ fn eligibility(eligible: bool, z: f32) -> (f32, egui::Color32) {
     (big, if eligible { egui::Color32::BLACK } else { egui::Color32::RED })
 }
 
-/// Radius and outline for an input socket. A socket that would refuse the
-/// wire currently in the air rings red — the answer arrives while the wire
-/// is still cancellable, rather than as a message after the drop.
+/// Radius and outline for an input socket. One that would refuse the wire in
+/// the air rings red, while the drag can still be cancelled.
 fn socket_style(
     graph: &Graph,
     state: &UiState,
@@ -1169,8 +1281,7 @@ fn socket_style(
     z: f32,
 ) -> (f32, egui::Color32) {
     match state.wire_drag {
-        // A wire pulled out of an input is hunting for an *output*; no
-        // input socket is a candidate for it, so none of them react.
+        // That wire hunts for an output, so no input is a candidate.
         Some(WireDrag::FromOutput { src, .. }) if hovered => {
             eligibility(super::wires::refusal(graph, node, src).is_none(), z)
         }
@@ -1178,8 +1289,7 @@ fn socket_style(
     }
 }
 
-/// The same, for an output socket while a wire is being pulled backwards
-/// out of an input.
+/// The same for an output, while a wire is pulled backwards out of an input.
 fn output_socket_style(
     graph: &Graph,
     state: &UiState,
@@ -1200,10 +1310,7 @@ mod tests {
     use super::*;
     use texture_graph_core::color::oklcha;
 
-    /// Committing a title that was not actually changed must not queue an
-    /// edit. Otherwise clicking a name to read it and clicking away marks
-    /// the graph unsaved, and the user is asked to save a file they did not
-    /// touch.
+    /// Reading a name and clicking away must not mark the graph unsaved.
     #[test]
     fn committing_an_unchanged_title_is_not_an_edit() {
         let mut graph = Graph::new();

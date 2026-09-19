@@ -23,9 +23,8 @@ pub fn wire_shape(a: egui::Pos2, b: egui::Pos2, zoom: f32, stroke: egui::Stroke)
     })
 }
 
-/// Draw every stored connection at exact socket geometry. The edge being
-/// detach-dragged is hidden — no `EditCmd` has fired for it yet, so a
-/// cancelled drag makes it simply reappear.
+/// Every stored connection at exact socket geometry. A detach-dragged edge
+/// is hidden but unedited, so cancelling makes it reappear.
 pub fn draw_edges(
     painter: &egui::Painter,
     layouts: &[NodeLayout],
@@ -49,8 +48,7 @@ pub fn draw_edges(
     }
 }
 
-/// The nearest of `sockets` to the pointer, within the grab radius. Both
-/// socket sides hunt the same way; only the set differs.
+/// Nearest of `sockets` within the grab radius. Both sides hunt alike.
 fn nearest<T>(
     sockets: impl Iterator<Item = (egui::Pos2, T)>,
     ptr: egui::Pos2,
@@ -79,9 +77,8 @@ fn hovered_input(
     nearest(sockets, ptr, zoom)
 }
 
-/// The output socket under the pointer, if any — what a wire pulled
-/// backwards out of an input is hunting for. The Output pseudo-node has
-/// none, which `NodeLayout::output_socket` being `None` there already says.
+/// The output socket under the pointer: what a wire pulled backwards out of
+/// an input hunts for. The Output pseudo-node has none.
 pub fn hovered_output(
     layouts: &[NodeLayout],
     ptr: egui::Pos2,
@@ -103,8 +100,7 @@ struct Candidate {
     at: egui::Pos2,
 }
 
-/// Where the wire is anchored: the socket the drag started from, which
-/// stays put for the whole drag.
+/// The socket the drag started from, anchored for its duration.
 fn anchor(
     wire: WireDrag,
     layouts: &[NodeLayout],
@@ -122,18 +118,15 @@ fn anchor(
     }
 }
 
-/// Why a drop would be refused, decided while the wire is still in the air
-/// so the socket can ring red *before* the user commits — and reused as the
-/// message when they commit anyway. One function so the colour and the
-/// sentence cannot disagree about what is wrong.
+/// Why a drop would be refused, decided while the wire is in the air so the
+/// socket can ring red before the user commits, and reused as the message if
+/// they commit anyway — one function, so colour and sentence agree.
 ///
-/// Only cycles, for now. Every layer produces a `Color` and every socket
-/// takes one, so there is no type mismatch to catch; when there is, it
-/// belongs here. The graph stays the authority either way: a drop always
-/// goes through `set_kind`, and anything this misses is refused there with
-/// its own message instead of landing.
+/// Only cycles: every layer produces a `Color` and every socket takes one,
+/// so there is no type mismatch to catch. The graph stays the authority; a
+/// drop goes through `set_kind`, which refuses anything this misses.
 pub fn refusal(graph: &Graph, node: NodeRef, src: LayerId) -> Option<String> {
-    // Nothing reads the material output, so it can never be part of a loop.
+    // Nothing reads the material output, so it can't be in a loop.
     let NodeRef::Layer(dst) = node else { return None };
     if !graph.would_cycle(dst, src) {
         return None;
@@ -147,16 +140,14 @@ pub fn refusal(graph: &Graph, node: NodeRef, src: LayerId) -> Option<String> {
     Some(if src == dst {
         format!("{} can't read itself", name(dst))
     } else {
-        // Naming both ends is the whole point: on a graph with a dozen
-        // nodes, "that would make a loop" leaves the user hunting for
-        // which existing wire is the other half of it.
+        // Naming both ends is the point: on a dozen nodes, "that would make
+        // a loop" leaves the user hunting for the other half.
         format!("{} already reads {} — that would make a loop", name(src), name(dst))
     })
 }
 
-/// Advance the wire-drag state machine: draw the live wire while the
-/// button is held, resolve the drop on release. Returns whether a wire
-/// drag is active this frame (suppresses pan).
+/// Draw the live wire while the button is held, resolve the drop on release.
+/// Returns whether a drag is active, which suppresses pan.
 pub fn advance_wire_drag(
     ui: &egui::Ui,
     graph: &Graph,
@@ -175,7 +166,7 @@ pub fn advance_wire_drag(
         .ctx()
         .input(|i| (i.pointer.primary_down(), i.pointer.hover_pos()));
     let Some(ptr) = ptr else {
-        // Pointer left the window entirely — treat as a cancel.
+        // Pointer left the window: cancel.
         state.wire_drag = None;
         return false;
     };
@@ -302,7 +293,7 @@ pub fn apply_socket_edits(
 }
 
 /// On connect: stash the `Const` the wire displaced. On disconnect: hand a
-/// previously stashed `Const` to `restore` so the socket comes back with
+/// stashed `Const` to `restore`, so the socket comes back with
 /// its pre-connection value instead of the default.
 fn remember_consts(
     state: &mut UiState,

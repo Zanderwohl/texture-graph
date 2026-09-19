@@ -5,19 +5,17 @@
 //! the same commit, or a graph will look one way in a GPU bake and another in
 //! the CPU fallback.
 //!
-//! This is Stefan Gustavson's textureless simplex noise: a
-//! permutation-polynomial gradient hash, all of it polynomial arithmetic on
-//! `f32`. It replaced the `noise` crate's `Simplex`, which ran in `f64` off a
-//! different permutation table and therefore produced *visibly different
-//! noise* from the GPU — the same graph rendered one way on a machine with a
-//! working wgpu backend and another way without one.
+//! Stefan Gustavson's textureless simplex noise: a permutation-polynomial
+//! gradient hash, entirely `f32` polynomial arithmetic. An `f64` kernel off a
+//! different permutation table would produce visibly different noise from the
+//! GPU, so the same graph would render one way with a working wgpu backend
+//! and another without.
 //!
 //! # Why the seed translates the coordinates
 //!
-//! Gustavson's kernel has no permutation table to reseed — the hash is baked
-//! into the polynomial. So the seed is hashed to a fixed offset and added to
-//! the sample position instead. That is what the GPU has always done; the CPU
-//! now agrees.
+//! Gustavson's kernel has no permutation table to reseed: the hash is baked
+//! into the polynomial. The seed is hashed to a fixed offset and added to the
+//! sample position instead.
 //!
 //! # Op-order contract
 //!
@@ -33,19 +31,17 @@
 //! `clippy::excessive_precision`, which would helpfully truncate them and
 //! quietly reintroduce the divergence.
 //!
-//! # What parity is actually held
+//! # What parity is held
 //!
-//! `cpu_and_gpu_noise_agree` in `texture-graph-gpu` bakes noise on the GPU and
-//! evaluates the same points on the CPU: across D1/D2/D3 and both ranges, the
-//! two agree to **within one sRGB step**, and most samples are identical.
+//! `cpu_and_gpu_noise_agree` in `texture-graph-gpu` holds the two backends to
+//! **within one sRGB step** across D1/D2/D3 and both ranges, most samples
+//! identical.
 //!
-//! That is not yet bit-exactness. Reaching it needs two more things neither
-//! backend does today: a float read-back path, so the comparison is on the
-//! field rather than on 8-bit pixels; and every multiply-add pinned into an
-//! explicitly fused form on both sides, since a shader compiler contracts
-//! `a*b + c` into an FMA whether or not it was asked to. The residual ±1 also
-//! includes the Oklch→sRGB conversion, which is a separate pair of
-//! implementations from this one.
+//! Not bit-exactness: that would need a float read-back path, so the
+//! comparison is on the field rather than 8-bit pixels, and every
+//! multiply-add pinned into an explicitly fused form, since shader compilers
+//! contract `a*b + c` unasked. The residual ±1 also covers the Oklch→sRGB
+//! stage, which is its own pair of implementations.
 
 #![allow(clippy::excessive_precision)]
 

@@ -1,8 +1,7 @@
 //! Per-layer preview cache.
 //!
-//! GPU path (default when eframe's wgpu backend is live): thumbnails are
-//! baked by `Baker::bake_previews`, registered with egui-wgpu, and kept
-//! per layer. CPU path (fallback): per-request lazy bake via `evaluate`.
+//! GPU path: `Baker::bake_previews` bakes thumbnails, registered with
+//! egui-wgpu and kept per layer. CPU fallback bakes lazily via `evaluate`.
 //!
 //! # Staleness
 //!
@@ -12,15 +11,12 @@
 //! being current. A layer whose entry is behind rebakes on the next request
 //! and keeps showing its previous image until the replacement exists.
 //!
-//! The staleness is per layer rather than global because an edit usually
-//! reaches a handful of layers, and a rebake is not free: the old code
-//! created two textures per layer, registered every one with egui-wgpu and
-//! freed every outgoing id — on every evaluation-changing edit, for the
-//! whole graph, including the branch nobody touched.
+//! Staleness is per layer because an edit usually reaches a handful of them
+//! and a rebake costs two textures, a registration and a freed id each.
 //!
-//! Whoever supplies the dirty set owes the closure: a layer is only safe to
-//! leave alone if nothing it reads has changed either. [`crate::state`]
-//! computes it, in `dirty_roots` + `downstream`.
+//! Whoever supplies the dirty set owes the closure: a layer is safe to leave
+//! alone only if nothing it reads changed either. [`crate::state`] computes
+//! that in `dirty_roots` and `downstream`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -32,8 +28,8 @@ use crate::app::GpuBits;
 
 pub const PREVIEW_SIZE: u32 = 128;
 
-/// One registered GPU thumbnail. Holds both the backing texture (to keep
-/// its view alive on the renderer side) and the `TextureId` we display.
+/// A registered GPU thumbnail. Keeps the texture, so the renderer's view
+/// stays alive, alongside the id to display.
 struct GpuThumb {
     #[allow(dead_code)]
     tex: wgpu::Texture,
@@ -54,25 +50,22 @@ struct CpuThumb {
 pub struct PreviewCache {
     gpu_entries: HashMap<LayerId, GpuThumb>,
     cpu_entries: HashMap<LayerId, CpuThumb>,
-    /// Per layer, the revision at which its picture stopped being current.
-    /// Missing means it never has been — an entry from any revision will do.
+    /// Per layer, the revision its picture stopped being current at. Missing
+    /// means it never did, so any entry will do.
     stale_at: HashMap<LayerId, u64>,
-    /// Bumped when every image must be retired for a reason the graph
-    /// revision cannot see: a replaced graph, a failed device.
+    /// Bumped to retire every image for a reason the revision can't see, like
+    /// a replaced graph or a failed device.
     forced: u64,
     /// The revision this frame is drawing at.
     revision: u64,
-    /// One bulk bake per frame at most. The first request for a stale
-    /// layer rebuilds every stale layer at once, because the baker runs
-    /// them in a single submit — asking again for each of the others would
-    /// pay the submit over and over.
+    /// At most one bulk bake a frame: the baker runs every stale layer in a
+    /// single submit, so the first request rebuilds all of them.
     rebuilt_this_frame: bool,
 }
 
 impl PreviewCache {
-    /// Start a frame at graph revision `revision`, retiring the images
-    /// `dirty` names — `None` for all of them. Images stay on screen until
-    /// their replacements exist.
+    /// Start a frame, retiring the images `dirty` names — `None` for all.
+    /// Images stay on screen until their replacements exist.
     ///
     /// Also drops entries for layers that no longer exist. That happens
     /// here rather than in `rebuild` because deleting a layer nothing reads
@@ -172,13 +165,11 @@ impl PreviewCache {
             return;
         };
         let Ok(new_texs) = gpu.baker.bake_previews(graph, eval_ctx, Some(&wanted)) else {
-            // Leave the current cache in place — the user still sees the
-            // previous state instead of a blank grid. The entries stay
-            // stale, so the next frame tries again; a bake that fails for
-            // a reason that persists costs one attempt per frame, which is
-            // what the old code avoided by giving up silently. Prefer
-            // retrying: the common failure is transient (a device lost on
-            // resume), and a thumbnail that never comes back is worse.
+            // Keep the cache, so the user sees the last good state rather
+            // than a blank grid. Entries stay stale and the next frame tries
+            // again: a persistent failure costs an attempt per frame, but the
+            // common one is transient and a thumbnail that never returns is
+            // worse.
             return;
         };
 

@@ -1,17 +1,11 @@
-//! The node catalog as the editor offers it: what the add-node menu and the
-//! inspector's variant switcher list, in what order, and what a freshly
-//! added node of each kind starts as.
+//! The node catalog the editor offers: what the add-node menu and the
+//! variant switcher list, in what order, and what a new node starts as.
 //!
 //! Separate from [`texture_graph_core::LayerKind`] on purpose. That type
-//! defines what a node *is*; this module decides what the menu calls it and
-//! what it looks like before anybody has touched it, which is an editor
-//! question — a Noise node that starts at frequency 4.0 is a nicer first
-//! impression than one at 0.0, and neither is more correct.
-//!
-//! The list lives here once. It used to be written out twice, keyed by
-//! string (`"ColorRamp"`), with a fallback arm that silently produced a
-//! Color for anything unrecognized — so a typo in one copy added the wrong
-//! node rather than failing to compile.
+//! says what a node *is*; this one says what the menu calls it and what it
+//! looks like untouched, which is an editor question — a Noise node at
+//! frequency 4.0 is a nicer first impression than one at 0.0, and neither
+//! is more correct.
 
 use texture_graph_core::color::oklcha;
 use texture_graph_core::{
@@ -24,8 +18,8 @@ use texture_graph_core::{
 pub struct Variant {
     /// Menu text.
     pub label: &'static str,
-    /// Which node the entry adds. Matched instead of the label, so editing
-    /// the menu text cannot quietly produce a different node.
+    /// Matched instead of the label, so editing menu text can't change what
+    /// an entry adds.
     pub kind: Kind,
 }
 
@@ -43,10 +37,10 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// Which variant a layer already is. Exhaustive over [`LayerKind`], so
-    /// a new node kind in core does not compile until it has an answer
-    /// here; [`tests::every_kind_is_offered_in_the_menu`] is what then
-    /// forces it into [`VARIANTS`].
+    /// Exhaustive over [`LayerKind`], so a new kind in core won't compile
+    /// without an answer here, and
+    /// [`tests::every_kind_is_offered_in_the_menu`] then forces it into
+    /// [`VARIANTS`].
     pub fn of(kind: &LayerKind) -> Kind {
         match kind {
             LayerKind::Color(_) => Kind::Color,

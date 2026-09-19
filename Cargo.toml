@@ -8,6 +8,13 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+# Held to what bevy 0.19 asks for, so a consumer embedding texture-graph-gpu
+# in bevy links one copy of each rather than two incompatible ones. Check
+# against `cargo tree -i wgpu` in the host project before bumping bevy.
+wgpu = "29.0.3"
+glam = { version = "0.32", features = ["bytemuck"] }
+bytemuck = { version = "1.5", features = ["derive"] }
+
 palette = { version = "0.7", features = ["serializing"] }
 serde = { version = "1", features = ["derive"] }
 ron = "0.8"

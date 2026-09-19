@@ -1,10 +1,8 @@
-//! Socket reflection over [`LayerKind`] and [`Output`] — a uniform way for
-//! node editors to enumerate a node's connectable inputs and rewire them
-//! without matching on every variant themselves.
+//! Socket reflection over [`LayerKind`] and [`Output`], so a node editor can
+//! enumerate and rewire inputs without matching on every variant.
 //!
-//! Keep [`LayerKind::input_sockets`] in lockstep with [`LayerKind::inputs`]
-//! in kind.rs: a fully-connected node must report the same layer ids from
-//! both, in the same order (tested below).
+//! [`LayerKind::input_sockets`] must agree with [`LayerKind::inputs`] on both
+//! ids and order; the test below holds them together.
 
 use crate::color::Color;
 use crate::graph::Output;
@@ -67,16 +65,15 @@ pub enum SocketError {
     NoSuchSocket,
 }
 
-/// A constant writable into a `ColorInput`/`ScalarInput` socket — lets
-/// editors restore the const a connection displaced after a disconnect.
+/// A constant writable into a `ColorInput`/`ScalarInput` socket, so an editor
+/// can restore what a connection displaced.
 #[derive(Copy, Clone, Debug)]
 pub enum ConstValue {
     Color(Color),
     Scalar(f32),
 }
 
-/// Const value a `ColorInput` socket falls back to on disconnect (mid gray,
-/// matching the UI's defaults).
+/// Mid gray, matching the UI's defaults.
 fn disconnect_color() -> Color {
     crate::color::oklcha(0.5, 0.0, 0.0, 1.0)
 }
@@ -148,8 +145,8 @@ impl LayerKind {
         }
     }
 
-    /// Connect (`Some(id)`) or disconnect (`None`) one socket. Disconnected
-    /// `ColorInput`/`ScalarInput` sockets fall back to a `Const` default —
+    /// Connect or disconnect one socket. A disconnected
+    /// `ColorInput`/`ScalarInput` falls back to a `Const` default —
     /// callers that want to restore a previous const value can do so from
     /// the returned replaced [`SocketValue`].
     pub fn set_input(

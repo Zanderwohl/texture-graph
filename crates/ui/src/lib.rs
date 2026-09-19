@@ -1,5 +1,4 @@
-//! Texture-graph editor UI. Same crate serves the native `texture-graph`
-//! binary and the wasm build driven by Trunk (see `index.html`).
+//! Texture-graph editor UI, shared by the native binary and the Trunk wasm build.
 
 pub mod app;
 pub mod catalog;
@@ -12,7 +11,6 @@ pub mod widgets;
 
 pub use app::TextureGraphApp;
 
-/// Native entry point. Called from `main.rs`.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn run_native() -> eframe::Result<()> {
     env_logger::init();
@@ -30,20 +28,18 @@ pub fn run_native() -> eframe::Result<()> {
     )
 }
 
-// Owns the `WebRunner` for the whole life of the wasm module. Dropping
-// the runner uninstalls its event listeners and cancels its animation
-// frame — so it must outlive the async setup that installed them.
+// Dropping the runner uninstalls its event listeners and cancels its
+// animation frame, so it has to outlive the setup that installed them.
 #[cfg(target_arch = "wasm32")]
 thread_local! {
     static RUNNER: std::cell::RefCell<Option<eframe::WebRunner>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Web entry point. Wired up by Trunk via `#[wasm_bindgen(start)]`.
+/// Web entry point, wired up by Trunk.
 ///
-/// wasm-bindgen's `start` attribute wants a synchronous function; we
-/// spawn the async eframe setup onto the browser event loop so errors
-/// aren't silently swallowed by a fire-and-forgotten promise.
+/// `start` must be synchronous, so the async eframe setup is spawned onto
+/// the browser event loop where its errors can still surface.
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen(start)]
 pub fn start_web() {
@@ -75,8 +71,6 @@ async fn run_web() -> Result<(), wasm_bindgen::JsValue> {
             Box::new(|cc| Ok(Box::new(TextureGraphApp::new(cc)))),
         )
         .await?;
-    // Park the runner so its event handlers + animation-frame callbacks
-    // outlive this async setup future.
     RUNNER.with(|cell| cell.borrow_mut().replace(runner));
     Ok(())
 }

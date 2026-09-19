@@ -1,6 +1,6 @@
-//! Deterministic node layout: per-kind row tables → rects and socket
-//! geometry, computed before any widget runs so edges, sockets, and
-//! interaction all agree on positions with no measure-then-place flicker.
+//! Node layout: per-kind row tables to rects and socket geometry, resolved
+//! before any widget runs so edges, sockets and interaction agree on
+//! positions without measure-then-place flicker.
 
 use std::collections::HashMap;
 
@@ -13,7 +13,7 @@ use super::{world_to_screen, BOTTOM_PAD, HEADER_H, NODE_WIDTH, RAMP_BAR_H, ROW_H
 /// One visual row in a node body, below the header (and thumbnail).
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Row {
-    /// Socket circle on the left edge; label + inline widget when unconnected.
+    /// Socket on the left edge; label and widget when unconnected.
     Socket(InputKey),
     /// No socket — a literal parameter row.
     Param(ParamRow),
@@ -29,8 +29,7 @@ pub enum ParamRow {
     NoiseFrequency,
     NoiseSeed,
     RampSpace,
-    /// Gradient preview bar with draggable stop indicators — taller than a
-    /// standard row (see `row_height`).
+    /// Gradient bar with draggable indicators; taller than a standard row.
     RampBar,
     TransformOffset,
     TransformRotate,
@@ -47,8 +46,8 @@ pub enum ParamRow {
     H2nStrength,
 }
 
-/// Row table for a layer node. Height is fully determined by the current
-/// kind (including conditional rows), never by widget measurement.
+/// Row table for a layer node. Height follows the kind, conditional rows
+/// included, never widget measurement.
 pub fn rows_for(kind: &LayerKind) -> Vec<Row> {
     use texture_graph_core::{BlendMode, CoordMode, ScalarInput};
     let mut rows = Vec::new();
@@ -95,15 +94,10 @@ pub fn rows_for(kind: &LayerKind) -> Vec<Row> {
             if matches!(m.mode, BlendMode::Blend) {
                 rows.push(Row::Param(ParamRow::MixSpace));
             }
-            // Only Blend reads the factor, so the row is hidden for the
-            // other modes — but the *socket* exists in every mode:
-            // `LayerKind::inputs` counts it as a dependency and
-            // `Graph::remove` scrubs it through `input_sockets`. A factor
-            // wired up in Blend and then switched to Add is still a real
-            // edge, so keep the row whenever something is attached to it.
-            // Hiding it there would strand the wire: no anchor to draw it
-            // from, and the inspector hides it too, so nothing could reach
-            // it again.
+            // Only Blend reads the factor, but the socket exists in every
+            // mode and stays a real edge across a mode switch. Hiding an
+            // attached one strands the wire: no anchor to draw it from, and
+            // the inspector hides it too, so nothing could reach it again.
             if matches!(m.mode, BlendMode::Blend)
                 || matches!(m.factor, ScalarInput::Layer(_))
             {
@@ -158,14 +152,13 @@ pub fn socket_label(key: InputKey) -> &'static str {
 /// One input socket resolved to screen geometry.
 pub struct SocketLayout {
     pub key: InputKey,
-    /// Circle center, on the node's left edge, vertically centered in its
-    /// row.
+    /// Circle centre, on the left edge and centred in its row.
     pub center: egui::Pos2,
     pub value: SocketValue,
 }
 
-/// Everything the edge pass, node pass, and wire pass need to agree on for
-/// one node, all in screen space for the current pan/zoom.
+/// What the edge, node and wire passes must agree on for one node, in screen
+/// space at the current pan and zoom.
 pub struct NodeLayout {
     pub node: NodeRef,
     pub rect: egui::Rect,
@@ -177,8 +170,7 @@ pub struct NodeLayout {
     pub output_socket: Option<egui::Pos2>,
 }
 
-/// Height of one row in world units. Everything is `ROW_H` except the
-/// ColorRamp gradient bar.
+/// `ROW_H` for everything but the ColorRamp bar.
 pub fn row_height(row: &Row) -> f32 {
     match row {
         Row::Param(ParamRow::RampBar) => RAMP_BAR_H,

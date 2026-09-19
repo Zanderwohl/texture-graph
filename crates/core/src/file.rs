@@ -1,11 +1,7 @@
-//! On-disk file format for texture graphs — RON with a structural magic
-//! marker, a metadata block, and the graph payload.
+//! On-disk format: RON, with a metadata block and the graph payload.
 //!
-//! The file MUST start (after whitespace) with `TextureGraphFile(` — that
-//! literal token is the format's magic. Anything else is rejected before
-//! the RON parser is even invoked.
-//!
-//! Recommended extension: `.tgraph`.
+//! A file must start with `TextureGraphFile(`, which doubles as the format's
+//! magic; anything else is rejected before RON sees it. Extension `.tgraph`.
 
 use std::fs;
 use std::io;
@@ -17,9 +13,8 @@ use thiserror::Error;
 
 use crate::graph::Graph;
 
-/// Extension we recommend for files written by this crate. Not enforced on
-/// load — you can put a graph in any file — but `save_to_path` uses it if
-/// the path is missing an extension.
+/// Not enforced on load, but `save_to_path` supplies it to an extensionless
+/// path.
 pub const FILE_EXTENSION: &str = "tgraph";
 
 /// Current on-disk format version. Bump on any breaking layout change.
@@ -46,8 +41,7 @@ pub struct FileMetadata {
     /// Free-form description.
     pub description: Option<String>,
     pub authors: Vec<String>,
-    /// Timestamp of the last save, in ISO-8601 UTC. Caller-supplied so
-    /// this crate stays clock-free — UI/app crates fill it in on save.
+    /// ISO-8601 UTC. Caller-supplied, so this crate stays clock-free.
     pub modified: String,
     /// Version string of the application that wrote this file. Free-form.
     pub written_by: String,
@@ -85,9 +79,8 @@ pub enum LoadError {
     Deserialize(#[from] ron::error::SpannedError),
 }
 
-/// Serialize `file` to a pretty RON string. Struct names are enabled so
-/// the top-level token is `TextureGraphFile(` — that IS the magic marker
-/// on load. Field order is stable and reads well as a git diff.
+/// Pretty RON. Struct names are on, so the top-level token is the magic
+/// marker; field order is stable and diffs readably.
 pub fn save_to_string(file: &TextureGraphFile) -> Result<String, ron::Error> {
     let cfg = PrettyConfig::new()
         .depth_limit(usize::MAX)
@@ -105,9 +98,7 @@ pub fn load_from_str(s: &str) -> Result<TextureGraphFile, LoadError> {
     if !trimmed.starts_with(MAGIC_PREFIX) {
         return Err(LoadError::NotATextureGraph);
     }
-    // `implicit_some` lets files from before layer inputs became
-    // `Option<LayerId>` (bare `source: 3` instead of `Some(3)`) keep
-    // loading unchanged.
+    // `implicit_some` accepts a bare `source: 3` for an `Option<LayerId>`.
     let options = ron::Options::default()
         .with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME);
     let file: TextureGraphFile = options.from_str(s)?;

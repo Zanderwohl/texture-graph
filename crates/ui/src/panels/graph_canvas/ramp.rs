@@ -1,19 +1,18 @@
-//! Pure logic for the ColorRamp gradient-bar editor: stop dragging with
-//! crossing reorders, sorted insertion, and gradient sampling for display.
+//! Logic for the ColorRamp gradient bar: crossing reorders, sorted
+//! insertion, duplicate placement, gradient sampling.
 //!
-//! Kept free of egui so the reorder/swap behavior is unit-testable. The
-//! widget itself lives in `nodes.rs`.
+//! Free of egui so the reorder behaviour is unit-testable; the widget lives
+//! in `nodes.rs`.
 
 use texture_graph_core::color::blend;
 use texture_graph_core::{
     BlendSpace, Color, ColorInput, ColorStop, EvalCtx, Graph, Sample, evaluate,
 };
 
-/// Move `stops[i]` to position `t`, then bubble-swap it while strictly out
-/// of order with its neighbors — a drag that crosses other stops reorders
-/// them, Blender-style. Returns `(new_index, swaps)`; each swap `(a, b)` is
-/// a transposition to feed `UiState::remap_ramp_consts`. Strict comparisons
-/// mean coincident-t stops don't thrash.
+/// Move `stops[i]` to `t`, bubble-swapping while strictly out of order, so a
+/// drag across another stop reorders them. Each returned swap is a
+/// transposition for `UiState::remap_ramp_consts`; the comparison is strict
+/// so coincident stops don't thrash.
 pub fn drag_stop_to(stops: &mut [ColorStop], mut i: usize, t: f32) -> (usize, Vec<(usize, usize)>) {
     let mut swaps = Vec::new();
     stops[i].t = t;
@@ -30,10 +29,61 @@ pub fn drag_stop_to(stops: &mut [ColorStop], mut i: usize, t: f32) -> (usize, Ve
     (i, swaps)
 }
 
-/// Index at which a new stop at `t` keeps `stops` sorted (after any equal
-/// t, so the new stop paints on top).
+/// Where a stop at `t` keeps `stops` sorted, after any equal `t` so it
+/// paints on top.
 pub fn insert_index(stops: &[ColorStop], t: f32) -> usize {
     stops.partition_point(|s| s.t <= t)
+}
+
+/// How far a duplicate lands from its source, in ramp `t`. About one grab
+/// radius at a typical bar width, so the copy is its own target at once.
+pub const DUPLICATE_NUDGE: f32 = 0.05;
+
+/// Slack for [`has_room`]. A candidate is one nudge from its source by
+/// construction, so that comparison sits exactly on the boundary — and
+/// `0.55f32 - 0.5f32` is 0.04999995, which reads as a collision.
+const DUPLICATE_EPS: f32 = 1e-4;
+
+/// Whether a stop fits at `c`: on the ramp, and a clear nudge from every
+/// existing stop. Any less and the two handles share a grab radius.
+fn has_room(stops: &[ColorStop], c: f32) -> bool {
+    (0.0..=1.0).contains(&c)
+        && stops
+            .iter()
+            .all(|s| (s.t - c).abs() >= DUPLICATE_NUDGE - DUPLICATE_EPS)
+}
+
+/// Where a duplicate of `stops[i]` goes: a nudge right, else left, else the
+/// middle of the nearest gap with room.
+///
+/// The fallback hunts by proximity rather than size, since the copy belongs
+/// next to its source. A ramp with no room anywhere returns the source's own
+/// `t` and accepts the overlap, rather than silently not appearing.
+pub fn duplicate_t(stops: &[ColorStop], i: usize) -> f32 {
+    let t = stops[i].t;
+    [t + DUPLICATE_NUDGE, t - DUPLICATE_NUDGE]
+        .into_iter()
+        .find(|c| has_room(stops, *c))
+        .or_else(|| nearest_gap_mid(stops, t))
+        .unwrap_or(t)
+}
+
+/// Middle of the empty run nearest `t` with room for a stop, counting the
+/// stretches out to 0.0 and 1.0.
+///
+/// Gap middles are just more candidates for [`has_room`], so there is only
+/// ever one idea of how much space is enough. Ties go to the lower gap.
+fn nearest_gap_mid(stops: &[ColorStop], t: f32) -> Option<f32> {
+    // Every path that writes stops keeps them sorted, but a loaded graph is
+    // whatever the file said.
+    let mut ts: Vec<f32> = stops.iter().map(|s| s.t.clamp(0.0, 1.0)).collect();
+    ts.push(0.0);
+    ts.push(1.0);
+    ts.sort_by(f32::total_cmp);
+    ts.windows(2)
+        .map(|w| (w[0] + w[1]) / 2.0)
+        .filter(|c| has_room(stops, *c))
+        .min_by(|a, b| (a - t).abs().total_cmp(&(b - t).abs()))
 }
 
 /// Display color of one stop: a `Const` passes through; a wired stop
@@ -154,6 +204,50 @@ mod tests {
         assert_eq!(i, 0);
         assert_eq!(swaps, vec![(1, 0)]);
         assert_eq!(lightness(&stops[0]), 0.2);
+    }
+
+    #[test]
+    fn duplicate_goes_right_when_there_is_room() {
+        let stops = vec![stop(0.0, 0.1), stop(0.5, 0.2), stop(1.0, 0.3)];
+        assert!((duplicate_t(&stops, 1) - 0.55).abs() < 1e-6);
+    }
+
+    #[test]
+    fn duplicate_goes_left_when_the_right_is_taken() {
+        // 0.55 is occupied, so the copy of the 0.5 stop goes to 0.45.
+        let stops = vec![stop(0.5, 0.1), stop(0.55, 0.2)];
+        assert!((duplicate_t(&stops, 0) - 0.45).abs() < 1e-6);
+        // And the end stop can only go inward — 1.05 is off the ramp.
+        let stops = vec![stop(0.0, 0.1), stop(1.0, 0.2)];
+        assert!((duplicate_t(&stops, 1) - 0.95).abs() < 1e-6);
+    }
+
+    #[test]
+    fn duplicate_falls_back_to_the_nearest_roomy_gap_when_boxed_in() {
+        // Both slots beside 0.5 are taken and the 0.05-wide gaps either
+        // side of it are too tight to hold a stop clear of both edges, so
+        // the copy goes to the middle of [0.55, 0.9] — nearer than the
+        // wider [0.0, 0.45] a widest-gap rule would have picked.
+        let stops = vec![stop(0.45, 0.1), stop(0.5, 0.2), stop(0.55, 0.3), stop(0.9, 0.4)];
+        assert!((duplicate_t(&stops, 1) - 0.725).abs() < 1e-6);
+    }
+
+    #[test]
+    fn duplicate_of_a_packed_ramp_overlaps_rather_than_vanishing() {
+        // Nowhere to go: every candidate is crowded and so is every gap.
+        let stops: Vec<ColorStop> =
+            (0..=100).map(|i| stop(i as f32 / 100.0, 0.5)).collect();
+        let t = duplicate_t(&stops, 50);
+        assert!((0.0..=1.0).contains(&t), "stayed on the ramp: {t}");
+    }
+
+    #[test]
+    fn duplicate_lands_where_insert_index_keeps_the_ramp_sorted() {
+        let stops = vec![stop(0.0, 0.1), stop(0.5, 0.2), stop(1.0, 0.3)];
+        let t = duplicate_t(&stops, 1);
+        let mut after = stops.clone();
+        after.insert(insert_index(&stops, t), stop(t, 0.2));
+        assert!(after.windows(2).all(|w| w[0].t <= w[1].t), "still sorted");
     }
 
     #[test]

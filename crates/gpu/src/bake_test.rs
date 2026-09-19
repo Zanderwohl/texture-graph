@@ -1,5 +1,5 @@
-//! End-to-end bake tests. Each variant that lands should add one here
-//! comparing the GPU output to `core`'s CPU evaluator.
+//! End-to-end bake tests. Every variant should have one here comparing the
+//! GPU output against `core`'s CPU evaluator.
 
 use std::collections::HashSet;
 
@@ -50,9 +50,9 @@ fn add_transform(
 
 /// Every pixel of an Rgba8Unorm texture, as `[r, g, b, a]`.
 ///
-/// Thin wrapper over the crate's public [`crate::readback::read_rgba8`], so
-/// the path a headless caller uses is the same one 45 tests exercise —
-/// there is no second copy of the row-padding arithmetic to get wrong.
+/// Wraps the public [`crate::readback::read_rgba8`], so these tests exercise
+/// the path a headless caller takes and there is no second copy of the
+/// row-padding arithmetic to get wrong.
 fn readback_all_pixels(ctx: &DeviceCtx, tex: &wgpu::Texture, size: (u32, u32)) -> Vec<[u8; 4]> {
     crate::readback::read_rgba8(ctx, tex, size)
         .pixels
@@ -455,12 +455,12 @@ fn map_gray_value_through_bw_ramp_matches_ramp_lookup() {
     }
 }
 
-/// Timing observation, not a hard assertion. Runs a 15-octave fractal noise
-/// stack at 1024² five times and prints median record-and-submit latency
-/// plus the peak_slots the scheduler computed. GPU wall time isn't measured
-/// here (that needs timestamp queries — not landed yet).
+/// Timing observation, not an assertion: five 1024² bakes of a 15-octave
+/// fractal stack, reporting median record-and-submit latency and the
+/// scheduler's peak_slots. Measuring GPU wall time would need timestamp
+/// queries.
 ///
-/// Run with `cargo test -p texture-graph-gpu perf_fractal -- --nocapture`.
+/// `cargo test -p texture-graph-gpu perf_fractal -- --nocapture`
 #[test]
 fn perf_fractal_stack_1024() {
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
@@ -529,8 +529,7 @@ fn perf_fractal_stack_1024() {
         let _ = baker
             .bake_output(&graph, (1024, 1024), &EvalCtx::default(), false)
             .expect("bake");
-        // Force sync so we measure through GPU completion, not just command
-        // recording.
+        // Measure through GPU completion, not just command recording.
         ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
         times.push(t0.elapsed());
     }
@@ -583,9 +582,8 @@ fn min_max_by_luma_picks_brighter_pixel_whole() {
 
 #[test]
 fn min_max_matches_cpu_over_all_criteria() {
-    // Cross-check GPU vs CPU for each criterion using a fixed pair of opaque
-    // colors. Any implementation drift in `criterion_of` on either side
-    // flags here. Alpha criterion needs a separate test because using
+    // GPU against CPU per criterion, on a fixed pair of opaque colors, so
+    // drift in either `criterion_of` shows up. Alpha needs its own test:
     // non-1.0 alpha would trip the display-side gray checker compositing
     // and make packed-pixel equality meaningless.
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
@@ -995,10 +993,9 @@ fn noise_signed_range_lifts_grays_around_50pct() {
 
 #[test]
 fn null_inputs_render_missing_texture_grid() {
-    // The regression: with a single layer, switching it to Map (or any
-    // multi-input kind) used to default its inputs to the only available
-    // layer — itself — and die on "would create a cycle". Inputs now
-    // default to None and render as the magenta/black missing grid.
+    // A multi-input kind on a single-layer graph must not default its inputs
+    // to the only layer available — itself — and die on "would create a
+    // cycle". They default to None and render as the missing grid.
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
     let mut baker = Baker::new(ctx.clone());
 
@@ -1330,23 +1327,14 @@ fn radial_extend_past_limit_shows_missing_grid_like_cpu() {
 
 /// CPU/GPU noise parity — the claim `core::noise` exists to make good.
 ///
-/// Before that module the two backends ran different algorithms off
-/// different permutation tables (the `noise` crate's `Simplex` in f64 on one
-/// side, Gustavson's textureless simplex in f32 on the other), so a graph
-/// looked one way baked on the GPU and another way in the CPU fallback. They
-/// now run one specification twice.
+/// A histogram rather than a single max, because the shape of the
+/// disagreement is the diagnostic: a few ±1 steps are rounding in the
+/// Oklch→sRGB stage, while a long tail means the kernels have diverged.
 ///
-/// Reported as a histogram rather than a single max, because the shape of
-/// the disagreement is the diagnostic: a handful of ±1 steps is rounding in
-/// the Oklch→sRGB stage, while a long tail means the two kernels have
-/// genuinely diverged.
-///
-/// Samples whose L falls outside `[0, 1]` are counted and skipped, not
-/// compared. That is where signed noise spends about a sixth of its range,
-/// and the two backends disagree there *on purpose*: `to_srgb8` clamps,
-/// while `pack_srgb8` paints the magenta/black out-of-range checker (see
-/// `out_of_range_l_paints_magenta_black_checker`). That is a display-stage
-/// choice, and this test is about the field underneath it.
+/// Samples with L outside `[0, 1]` are skipped, not compared. Signed noise
+/// spends about a sixth of its range there, and the backends differ on
+/// purpose: `to_srgb8` clamps where `pack_srgb8` paints the out-of-range
+/// checker. That is a display choice, and this is about the field under it.
 ///
 /// Returns `(histogram, worst, compared, skipped)`.
 fn noise_parity_histogram(

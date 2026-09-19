@@ -4,9 +4,8 @@
 
 use texture_graph_core::{Graph, LayerId};
 
-/// Nullable variant of [`layer_ref`]: shows a "(none)" entry above the
-/// layer list. `None` inputs render as the missing-texture grid. Returns
-/// `Some(new_value)` if the selection changed this frame.
+/// Nullable variant of [`layer_ref`], with a "(none)" entry above the list.
+/// `None` renders as the missing-texture grid.
 pub fn layer_ref_opt(
     ui: &mut egui::Ui,
     id_source: impl std::hash::Hash + std::fmt::Debug,
@@ -40,8 +39,7 @@ pub fn layer_ref_opt(
     new_selection
 }
 
-/// Show a combo of "layer name" options. Returns `Some(new)` if the
-/// selection changed this frame.
+/// Combo of layer names, `Some` when the selection changed.
 pub fn layer_ref(
     ui: &mut egui::Ui,
     id_source: impl std::hash::Hash + std::fmt::Debug,

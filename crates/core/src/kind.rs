@@ -31,11 +31,8 @@ impl LayerKind {
     }
 
     /// Every layer this node depends on, for cycle detection and
-    /// invalidation.
-    ///
-    /// Keep in sync with [`LayerKind::input_sockets`] in socket.rs — a
-    /// fully-connected node must report the same ids in the same order
-    /// from both.
+    /// invalidation. Must agree with [`LayerKind::input_sockets`] on both
+    /// ids and order.
     pub fn inputs(&self) -> Vec<LayerId> {
         let mut out = Vec::new();
         let push_color = |out: &mut Vec<LayerId>, ci: ColorInput| {
@@ -126,9 +123,8 @@ pub enum NoiseOutput {
     Color,
 }
 
-/// Multi-stop 1D color ramp. Sampled along the U axis; feed through a
-/// [`Transform`] to run it along V or radially. Stops SHOULD be sorted by
-/// `t` ascending; the graph enforces this on mutation.
+/// Multi-stop 1D color ramp, sampled along U; a [`Transform`] runs it along
+/// V or radially. The graph keeps stops sorted by `t` on mutation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ColorRamp {
     pub stops: Vec<ColorStop>,
@@ -154,8 +150,8 @@ pub struct Transform {
     pub rotate_uv: f32,
     pub scale: [f32; 3],
     pub coord_mode: CoordMode,
-    /// What happens when the transformed sample leaves the [0, 1] UV
-    /// square. Absent in older files, defaulting to `Clamp`.
+    /// What happens when the transformed sample leaves the UV square.
+    /// Defaults to `Clamp` where a file doesn't say.
     #[serde(default)]
     pub edge_mode: EdgeMode,
 }

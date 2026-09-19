@@ -7,18 +7,13 @@
 //! - the peak number of slots that were live simultaneously — the exact
 //!   texture-pool size to allocate.
 //!
-//! Method: standard linear-scan register allocation. Refcount every layer's
-//! remaining consumers (other layers + the four Output roots). Walk the
-//! topo order; for each layer, pop a slot from a free pool (or grow it);
-//! after dispatch, decrement each input's refcount and return its slot to
-//! the pool once no consumer remains. Output-root layers get an extra +1
-//! sentinel so their slot survives past dispatch and can be sampled by the
-//! `pack_srgb8` pass.
+//! Linear-scan register allocation: refcount each layer's remaining
+//! consumers, walk the topo order popping a slot per layer, and return a
+//! slot once its last consumer has run. Output roots carry a +1 sentinel so
+//! their slot survives to be sampled by `pack_srgb8`.
 //!
-//! The greedy allocation is optimal for **any fixed topo order** (interval
-//! coloring is trivially greedy-optimal); reordering the topo pass to
-//! minimize peak is NP-hard and left for later if peak_slots ever becomes a
-//! problem.
+//! Greedy is optimal for any fixed topo order, since interval coloring is.
+//! Reordering the topo pass to minimize peak is NP-hard.
 
 use std::collections::{HashMap, HashSet};
 
@@ -43,10 +38,10 @@ pub struct Schedule {
     pub domain_of: HashMap<LayerId, Domain>,
 }
 
-/// Axis-aligned UV rectangle a layer's bake covers. Always contains the
-/// unit square, so a layer's own [0, 1] view (thumbnails, direct output)
-/// stays renderable; extend-transform consumers grow it — exactly for
-/// affine requests, capped at the [`EXTEND_LIMIT`] box for radial ones.
+/// UV rectangle a layer's bake covers. Always contains the unit square, so
+/// thumbnails and direct output stay renderable; extend-transform consumers
+/// grow it, exactly for affine requests and capped at [`EXTEND_LIMIT`] for
+/// radial ones.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct Domain {
     pub min: [f32; 2],
@@ -75,13 +70,11 @@ impl Domain {
     }
 }
 
-/// Per-layer bake domains: start every reachable layer at the unit square,
-/// then walk consumers-first (reverse topo) and union in what each
-/// consumer actually samples. Only `EdgeMode::Extend` transforms request
-/// beyond the unit square; everything else samples its inputs at its own
-/// coordinates (so a widened consumer transitively widens its inputs).
-/// A `Map`'s palette is excluded — it's indexed by luminance, always
-/// within the unit range.
+/// Per-layer bake domains. Every reachable layer starts at the unit square,
+/// then a reverse-topo walk unions in what each consumer samples. Only
+/// `EdgeMode::Extend` reaches beyond the unit square; everything else samples
+/// at its own coordinates, so a widened consumer widens its inputs too. A
+/// `Map`'s palette is luminance-indexed and always within range.
 fn compute_domains(graph: &Graph, order: &[LayerId]) -> HashMap<LayerId, Domain> {
     let mut dom: HashMap<LayerId, Domain> =
         order.iter().map(|&id| (id, Domain::UNIT)).collect();
@@ -90,8 +83,7 @@ fn compute_domains(graph: &Graph, order: &[LayerId]) -> HashMap<LayerId, Domain>
         let Some(layer) = graph.get(id) else { continue };
         match &layer.kind {
             LayerKind::Transform(t) => {
-                // Clamp mode samples only within [0, 1] — the baseline
-                // unit domain already covers it.
+                // Clamp samples within [0, 1], which the baseline covers.
                 if t.edge_mode == EdgeMode::Extend {
                     if let (Some(src), Some(req)) = (t.source, transform_request(t, d)) {
                         if let Some(e) = dom.get_mut(&src) {
@@ -104,7 +96,7 @@ fn compute_domains(graph: &Graph, order: &[LayerId]) -> HashMap<LayerId, Domain>
                 if let Some(e) = m.value.and_then(|v| dom.get_mut(&v)) {
                     e.union(d);
                 }
-                // palette: luminance-indexed, unit domain suffices.
+                // Luminance-indexed, so the unit domain suffices.
             }
             _ => {
                 for input in layer.kind.inputs() {

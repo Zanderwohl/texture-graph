@@ -1,18 +1,12 @@
 //! Right panel: preview of the graph's `Output`.
 //!
-//! Display modes selected by dropdown:
-//! - **Flat** — the four PBR channels shown as flat textures, channel
-//!   selected by a second dropdown (existing behavior).
-//! - **Quad** / **Sphere** / **Cube** — a lit 3D preview via the
-//!   `SceneRenderer` (Cook-Torrance BRDF, tangent-space normal mapping,
-//!   auto-spin). Quad is a 1×1 ground plane — the flat material in 3D.
+//! **Flat** shows the four PBR channels as textures; **Quad**, **Sphere**
+//! and **Cube** light them through the `SceneRenderer`.
 //!
-//! Under the hood: the Baker always produces the four material textures.
-//! In Flat mode they're registered directly with egui-wgpu; in 3D modes
-//! they feed the scene renderer, which draws into a persistent color
-//! target that egui also holds a `TextureId` for. The color target and
-//! its `TextureId` only rebuild when the panel size or shape changes,
-//! so auto-spin doesn't churn allocations at 60 fps.
+//! The Baker always produces the four textures. Flat mode registers them with
+//! egui-wgpu directly; 3D modes feed the scene renderer, which draws into a
+//! persistent colour target rebuilt only on a size or shape change, so
+//! auto-spin doesn't churn allocations at 60 fps.
 
 use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
 use texture_graph_core::color::to_srgb8;
@@ -24,18 +18,16 @@ use texture_graph_gpu::{SceneCamera, SceneMaterial, SceneShape, VolumeOutput};
 use crate::app::GpuBits;
 use crate::state::UiState;
 
-/// Cap (per axis) on the solid-texture volume bake, which follows the
-/// preview size buttons. Volume memory is cubic — 256³ Rgba8 is 64 MiB
-/// per channel, where a hypothetical 1024³ would be 4 GiB — so past the
-/// cap the buttons only sharpen the viewport render target.
+/// Per-axis cap on the volume bake. Volume memory is cubic: 256³ Rgba8 is
+/// 64 MiB a channel and 1024³ would be 4 GiB, so past the cap the size
+/// buttons only sharpen the viewport.
 const VOLUME_RES_CAP: u32 = 256;
 
 pub struct PreviewPanelState {
     pub texture: Option<TextureHandle>,
     pub gpu_channels: Option<GpuChannels>,
-    /// Solid-texture volume channels; baked only when the graph is 3D
-    /// (`Graph::output_is_3d`) and a 3D shape is displayed. Never
-    /// registered with egui — only the scene pass samples it.
+    /// Baked only for a 3D graph shown on a 3D shape. Never registered with
+    /// egui; only the scene pass samples it.
     pub volume: Option<VolumeOutput>,
     /// Persistent 3D render target + its egui id; rebuilt on size change.
     pub scene: Option<Scene3d>,
@@ -44,19 +36,17 @@ pub struct PreviewPanelState {
     pub channel: PreviewChannel,
     pub gpu_error: Option<String>,
     pub yaw_rate_deg_per_sec: f32,
-    /// Model orientation shown in the 3D preview. Auto-spin advances it
-    /// around world Y; drag-orbit composes trackball rotations onto it.
+    /// Auto-spin advances this around world Y; drag-orbit composes trackball
+    /// rotations onto it.
     pub orientation: glam::Quat,
-    /// Auto-spin runs until the user drag-orbits; the "Rotate" button
-    /// under the viewport turns it back on.
+    /// Runs until the user drag-orbits; the "Rotate" button restores it.
     pub auto_spin: bool,
-    /// Staleness, per bake product. `state.dirty` is consumed once and
-    /// fans out into these so whichever mode is active rebakes its own
-    /// product now and the other lazily when the user switches to it.
+    /// `state.dirty` is consumed once and fans out here, so the active mode
+    /// rebakes now and the other when it is switched to.
     channels_stale: bool,
     volume_stale: bool,
-    /// Preview target rendered last frame; a change invalidates both bake
-    /// products so switching what a node previews rebakes immediately.
+    /// A change invalidates both bake products, so switching what a node
+    /// previews rebakes at once.
     last_preview_target: Option<LayerId>,
 }
 
