@@ -2,9 +2,16 @@
 //!
 //! A file must start with `TextureGraphFile(`, which doubles as the format's
 //! magic; anything else is rejected before RON sees it. Extension `.tgraph`.
+//!
+//! [`load_from_str`] and [`save_to_string`] are unconditional; the path
+//! helpers sit behind the default-on `std-fs` feature. `std::fs` compiles
+//! for `wasm32-unknown-unknown` and then fails at runtime, so a wasm
+//! consumer takes `default-features = false` and gets a compile error
+//! instead of a mystery at load time.
 
+#[cfg(feature = "std-fs")]
 use std::fs;
-use std::io;
+#[cfg(feature = "std-fs")]
 use std::path::Path;
 
 use ron::ser::PrettyConfig;
@@ -18,7 +25,13 @@ use crate::graph::Graph;
 pub const FILE_EXTENSION: &str = "tgraph";
 
 /// Current on-disk format version. Bump on any breaking layout change.
-pub const CURRENT_FORMAT_VERSION: u32 = 1;
+///
+/// RON tags enum variants by name, so a `LayerKind` variant added here
+/// keeps old files loading in new builds — it is the other direction that
+/// needs the version, and that is what a reader older than a writer checks.
+/// Bumped once for the batch in
+/// `documentation/game-consumer-features.md`, not once per node.
+pub const CURRENT_FORMAT_VERSION: u32 = 2;
 
 /// Structural magic — the RON parser sees this literal as the top-level
 /// struct name.
@@ -61,16 +74,18 @@ impl TextureGraphFile {
 
 #[derive(Debug, Error)]
 pub enum SaveError {
+    #[cfg(feature = "std-fs")]
     #[error("io: {0}")]
-    Io(#[from] io::Error),
+    Io(#[from] std::io::Error),
     #[error("serialize: {0}")]
     Serialize(#[from] ron::Error),
 }
 
 #[derive(Debug, Error)]
 pub enum LoadError {
+    #[cfg(feature = "std-fs")]
     #[error("io: {0}")]
-    Io(#[from] io::Error),
+    Io(#[from] std::io::Error),
     #[error("not a texture-graph file (missing `{MAGIC_PREFIX}` magic)")]
     NotATextureGraph,
     #[error("unsupported format version {0}; this build understands {CURRENT_FORMAT_VERSION}")]
@@ -110,6 +125,7 @@ pub fn load_from_str(s: &str) -> Result<TextureGraphFile, LoadError> {
 
 /// Write `file` to disk as pretty RON. If `path` has no extension, appends
 /// [`FILE_EXTENSION`].
+#[cfg(feature = "std-fs")]
 pub fn save_to_path(file: &TextureGraphFile, path: impl AsRef<Path>) -> Result<(), SaveError> {
     let mut p = path.as_ref().to_path_buf();
     if p.extension().is_none() {
@@ -121,6 +137,7 @@ pub fn save_to_path(file: &TextureGraphFile, path: impl AsRef<Path>) -> Result<(
 }
 
 /// Read a texture-graph file from disk.
+#[cfg(feature = "std-fs")]
 pub fn load_from_path(path: impl AsRef<Path>) -> Result<TextureGraphFile, LoadError> {
     let s = fs::read_to_string(path)?;
     load_from_str(&s)
@@ -151,6 +168,54 @@ mod tests {
         assert_eq!(back.format_version, CURRENT_FORMAT_VERSION);
         assert_eq!(back.metadata.name, "test");
         assert_eq!(back.graph.layers.len(), file.graph.layers.len());
+    }
+
+    /// A graph written before the value kernel, the period and the
+    /// fractal stack existed still loads, and loads as the node it meant:
+    /// one octave of aperiodic simplex.
+    #[test]
+    fn a_v1_noise_layer_loads_as_aperiodic_single_octave_simplex() {
+        let v1 = r#"TextureGraphFile(
+    format_version: 1,
+    metadata: (name: "old", description: None, authors: [], modified: "", written_by: ""),
+    graph: (
+        layers: [(id: 1, name: "n", kind: Noise((
+            dims: D2,
+            seed_offset: 0,
+            frequency: 4.0,
+            range: Unsigned,
+            output: Grayscale,
+        )))],
+        list_order: [1],
+        canvases: {},
+        output: (color: 1, roughness: Const(0.5), metallic: Const(0.0), normal: None),
+        next_id: 2,
+    ),
+)"#;
+        let file = load_from_str(v1).expect("a v1 file must still load");
+        let crate::kind::LayerKind::Noise(n) = &file.graph.layers[0].kind else {
+            panic!("expected a Noise layer")
+        };
+        assert_eq!(n.kernel, crate::kind::NoiseKernel::Simplex);
+        assert_eq!(n.period, [0; 3]);
+        assert_eq!(n.fractal, crate::kind::Fractal::default());
+        assert_eq!(n.fractal.octaves, 1);
+    }
+
+    /// The other direction is what the version is for: a file from a
+    /// newer build is refused rather than half-read.
+    #[test]
+    fn a_future_version_is_refused() {
+        let s = save_to_string(&TextureGraphFile {
+            format_version: CURRENT_FORMAT_VERSION + 1,
+            metadata: sample_metadata(),
+            graph: Graph::new(),
+        })
+        .unwrap();
+        assert!(matches!(
+            load_from_str(&s).unwrap_err(),
+            LoadError::UnsupportedVersion(_)
+        ));
     }
 
     #[test]

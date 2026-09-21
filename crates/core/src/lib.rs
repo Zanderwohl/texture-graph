@@ -20,8 +20,10 @@ pub use color::{BlendSpace, Color};
 pub use eval::{EvalCtx, FLAT_W, Material, Sample, evaluate, evaluate_material};
 pub use file::{
     CURRENT_FORMAT_VERSION, FILE_EXTENSION, FileMetadata, LoadError, SaveError, TextureGraphFile,
-    load_from_path, load_from_str, save_to_path, save_to_string,
+    load_from_str, save_to_string,
 };
+#[cfg(feature = "std-fs")]
+pub use file::{load_from_path, save_to_path};
 pub use graph::{Canvas, Graph, GraphError, Layer, Output};
 pub use id::LayerId;
 pub use kind::{

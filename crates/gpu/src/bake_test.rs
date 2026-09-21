@@ -10,7 +10,7 @@ use texture_graph_core::{
     ScalarInput, Transform, color::to_srgb8,
 };
 
-use crate::{Baker, DeviceCtx};
+use crate::{Baker, DeviceCtx, ScalarFormat};
 
 const SIZE: (u32, u32) = (8, 8);
 
@@ -1536,5 +1536,249 @@ fn an_aperiodic_bake_does_not_tile() {
     for kernel in [NoiseKernel::Simplex, NoiseKernel::Value] {
         let px = bake_noise_pixels(tiling_noise(kernel, [0; 3]));
         assert!(!repeats(&px), "{kernel:?} repeated across a tile boundary");
+    }
+}
+
+// ---- Single-channel output (§5) ----------------------------------------
+
+/// A graph whose Output is a plain gray, plus an unrelated noise layer.
+/// The noise is deliberately *not* wired to the Output: `bake_scalar` is
+/// supposed to bake the layer it is asked for, so a graph can carry
+/// several fields side by side.
+fn scalar_fixture(kernel: NoiseKernel) -> (Graph, LayerId) {
+    let mut graph = Graph::new();
+    let field = graph
+        .add_layer(
+            "field",
+            LayerKind::Noise(Noise {
+                dims: NoiseDims::D3,
+                seed_offset: 7,
+                frequency: 5.0,
+                range: NoiseRange::Unsigned,
+                output: NoiseOutput::Grayscale,
+                kernel,
+                period: [0; 3],
+                fractal: Fractal { octaves: 3, ..Fractal::default() },
+            }),
+        )
+        .unwrap();
+    (graph, field)
+}
+
+fn cpu_scalar(graph: &Graph, layer: LayerId, u: f32, v: f32, w: f32) -> f32 {
+    texture_graph_core::color::scalar_of(texture_graph_core::evaluate(
+        graph,
+        layer,
+        texture_graph_core::Sample::new(u, v, w),
+        &EvalCtx::default(),
+    ))
+}
+
+/// Every format reproduces the CPU field to its own precision, and the
+/// layer baked is the one asked for rather than whatever the Output
+/// happens to point at.
+#[test]
+fn scalar_bake_matches_the_cpu_field_in_every_format() {
+    const RES: u32 = 32;
+    let (graph, field) = scalar_fixture(NoiseKernel::Value);
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+
+    for (format, tol) in [
+        // 1/255 of quantization, plus the CPU/GPU kernel difference.
+        (ScalarFormat::R8Unorm, 1.0 / 255.0 + 2e-3),
+        // Half has ~3 decimal digits over [0, 1].
+        (ScalarFormat::R16Float, 1e-3 + 2e-3),
+        (ScalarFormat::R32Float, 2e-3),
+    ] {
+        let tex = baker
+            .bake_scalar(&graph, field, (RES, RES), format, &EvalCtx::default())
+            .expect("bake_scalar");
+        let img = crate::readback::read_scalar(&ctx, &tex, (RES, RES), format);
+        assert_eq!((img.width, img.height, img.depth), (RES, RES, 1));
+        assert_eq!(
+            img.bytes.len() as u32,
+            RES * RES * format.bytes_per_texel(),
+            "{format:?}: one texel per pixel, no row padding"
+        );
+
+        let mut worst = 0.0f32;
+        for y in 0..RES {
+            for x in 0..RES {
+                let u = (x as f32 + 0.5) / RES as f32;
+                let v = (y as f32 + 0.5) / RES as f32;
+                let expected = cpu_scalar(&graph, field, u, v, texture_graph_core::FLAT_W);
+                let got = img.value(x, y, 0).unwrap();
+                worst = worst.max((expected - got).abs());
+            }
+        }
+        assert!(worst <= tol, "{format:?}: worst scalar delta {worst} > {tol}");
+    }
+}
+
+/// `R8Unorm` clamps as the format requires; the float formats keep a
+/// signed field intact, which is the reason to pay for them.
+#[test]
+fn scalar_formats_differ_on_out_of_range_values() {
+    const RES: u32 = 16;
+    let mut graph = Graph::new();
+    let signed = graph
+        .add_layer(
+            "signed",
+            LayerKind::Noise(Noise {
+                dims: NoiseDims::D2,
+                seed_offset: 2,
+                frequency: 6.0,
+                range: NoiseRange::Signed,
+                output: NoiseOutput::Grayscale,
+                kernel: NoiseKernel::Value,
+                ..Noise::default()
+            }),
+        )
+        .unwrap();
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let read = |baker: &mut Baker, format| {
+        let tex = baker
+            .bake_scalar(&graph, signed, (RES, RES), format, &EvalCtx::default())
+            .expect("bake_scalar");
+        crate::readback::read_scalar(&ctx, &tex, (RES, RES), format)
+    };
+
+    let unorm = read(&mut baker, ScalarFormat::R8Unorm);
+    let float = read(&mut baker, ScalarFormat::R32Float);
+    let mut saw_negative = false;
+    for y in 0..RES {
+        for x in 0..RES {
+            let f = float.value(x, y, 0).unwrap();
+            if f < -1e-3 {
+                saw_negative = true;
+                assert_eq!(
+                    unorm.value(x, y, 0).unwrap(),
+                    0.0,
+                    "R8Unorm should have clamped {f} at ({x},{y})"
+                );
+            }
+        }
+    }
+    assert!(saw_negative, "signed noise produced nothing below zero to clamp");
+}
+
+/// The volume path: `res³` at slice centres, matching the CPU field and
+/// actually varying along w.
+#[test]
+fn scalar_volume_matches_the_cpu_field_through_w() {
+    const RES: u32 = 16;
+    const DEPTH: u32 = 8;
+    let (graph, field) = scalar_fixture(NoiseKernel::Value);
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let vol = baker
+        .bake_scalar_volume(
+            &graph, field, RES, DEPTH, ScalarFormat::R32Float, &EvalCtx::default(),
+        )
+        .expect("bake_scalar_volume");
+    assert_eq!(vol.size, (RES, RES, DEPTH));
+    let img = crate::readback::read_scalar_volume(&ctx, &vol.texture, vol.size, vol.format);
+
+    let mut worst = 0.0f32;
+    let mut varies_through_w = false;
+    for z in 0..DEPTH {
+        let w = (z as f32 + 0.5) / DEPTH as f32;
+        for y in 0..RES {
+            for x in 0..RES {
+                let u = (x as f32 + 0.5) / RES as f32;
+                let v = (y as f32 + 0.5) / RES as f32;
+                let expected = cpu_scalar(&graph, field, u, v, w);
+                let got = img.value(x, y, z).unwrap();
+                worst = worst.max((expected - got).abs());
+            }
+        }
+        if z > 0 && img.value(0, 0, z) != img.value(0, 0, 0) {
+            varies_through_w = true;
+        }
+    }
+    assert!(worst <= 2e-3, "worst scalar delta through the volume: {worst}");
+    assert!(varies_through_w, "the volume is the same slice repeated");
+}
+
+/// `bake_scalar` schedules only what its layer reads. A graph with a big
+/// unrelated Output branch must not pay for it.
+#[test]
+fn scalar_bake_ignores_layers_its_field_does_not_read() {
+    let (mut graph, field) = scalar_fixture(NoiseKernel::Simplex);
+    let mut chain = graph.output.color.unwrap();
+    for i in 0..4 {
+        chain = add_mix(&mut graph, &format!("unrelated-{i}"), chain, chain);
+    }
+    graph
+        .set_output(Output {
+            color: Some(chain),
+            roughness: ScalarInput::Const(0.5),
+            metallic: ScalarInput::Const(0.0),
+            normal: None,
+        })
+        .unwrap();
+    let sched = crate::schedule::schedule_layer(&graph, field).expect("schedule");
+    assert_eq!(sched.order, vec![field], "only the field should be dispatched");
+    // And the ordinary Output schedule still covers the branch, so the two
+    // are genuinely different plans rather than one that lost layers.
+    assert!(crate::schedule::schedule(&graph).unwrap().order.len() > 1);
+}
+
+/// The async readers have to produce the same bytes as the blocking ones —
+/// they are the only path a wasm host has, so a difference would be a bug
+/// nobody native ever hits.
+#[test]
+fn async_readback_agrees_with_the_blocking_one() {
+    const RES: u32 = 16;
+    let (graph, field) = scalar_fixture(NoiseKernel::Value);
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+
+    let tex = baker
+        .bake_scalar(&graph, field, (RES, RES), ScalarFormat::R16Float, &EvalCtx::default())
+        .expect("bake_scalar");
+    let blocking =
+        crate::readback::read_scalar(&ctx, &tex, (RES, RES), ScalarFormat::R16Float);
+    let asynced = drive(
+        &ctx,
+        crate::readback::read_scalar_async(&ctx, &tex, (RES, RES), ScalarFormat::R16Float),
+    );
+    assert_eq!(blocking.bytes, asynced.bytes);
+
+    let color = baker
+        .bake_output(&graph, (RES, RES), &EvalCtx::default(), false)
+        .expect("bake")
+        .color;
+    let blocking_rgba = crate::readback::read_rgba8(&ctx, &color, (RES, RES));
+    let async_rgba = drive(&ctx, crate::readback::read_rgba8_async(&ctx, &color, (RES, RES)));
+    assert_eq!(blocking_rgba.pixels, async_rgba.pixels);
+}
+
+/// Run a readback future to completion on native, the way a host with a
+/// frame loop would: poll the future, then give the device a chance to
+/// resolve the buffer map, and repeat.
+///
+/// `pollster::block_on` alone deadlocks here — it parks the only thread
+/// that could call `Device::poll`. On wasm neither is needed; the browser
+/// resolves the map on its own event loop, which is the whole reason the
+/// async readers exist.
+fn drive<F: std::future::Future>(ctx: &DeviceCtx, fut: F) -> F::Output {
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct Noop;
+    impl Wake for Noop {
+        fn wake(self: Arc<Self>) {}
+    }
+    let waker = Waker::from(Arc::new(Noop));
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = Box::pin(fut);
+    loop {
+        if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+            return v;
+        }
+        let _ = ctx.device.poll(wgpu::PollType::Poll);
     }
 }

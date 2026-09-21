@@ -235,10 +235,79 @@ impl std::error::Error for ScheduleError {}
 /// included; unreachable layers cost neither dispatches nor slots.
 pub fn schedule(graph: &Graph) -> Result<Schedule, ScheduleError> {
     let output_roots = output_referenced(graph);
+    let plan = plan_from(graph, &output_roots)?;
 
+    // Resolve the four output channels against the final slot_of.
+    let output_slots = OutputSlots {
+        color: match graph.output.color {
+            Some(id) => Some(*plan.slot_of.get(&id).ok_or(ScheduleError::UnknownLayer(id))?),
+            None => None,
+        },
+        roughness: scalar_to_slot(&graph.output.roughness, &plan.slot_of)?,
+        metallic: scalar_to_slot(&graph.output.metallic, &plan.slot_of)?,
+        normal: match graph.output.normal {
+            Some(id) => Some(
+                *plan.slot_of.get(&id).ok_or(ScheduleError::UnknownLayer(id))?,
+            ),
+            None => None,
+        },
+    };
+    Ok(plan.into_schedule(output_slots))
+}
+
+/// Build a `Schedule` that produces one layer and nothing else — `root`
+/// plus everything it transitively reads, with the same slot reuse
+/// `schedule` gets.
+///
+/// This is the plan a single-channel bake wants: the graph's Output may
+/// route through nodes the caller does not care about, and a consumer
+/// asking for one scalar field should not pay for the other three PBR
+/// channels' dispatches.
+///
+/// `output_slots.color` points at `root`, so a caller that wants to reuse
+/// the ordinary pack path can. The scalar channels report their constants
+/// and `normal` is `None`; nothing here consults them.
+pub fn schedule_layer(graph: &Graph, root: LayerId) -> Result<Schedule, ScheduleError> {
+    if graph.get(root).is_none() {
+        return Err(ScheduleError::UnknownLayer(root));
+    }
+    let plan = plan_from(graph, &[root])?;
+    let output_slots = OutputSlots {
+        color: plan.slot_of.get(&root).copied(),
+        roughness: ScalarSlot::Const(0.5),
+        metallic: ScalarSlot::Const(0.0),
+        normal: None,
+    };
+    Ok(plan.into_schedule(output_slots))
+}
+
+/// Everything a `Schedule` holds except which slots the output channels
+/// read, which is the one part that depends on why the bake was asked for.
+struct Plan {
+    order: Vec<LayerId>,
+    slot_of: HashMap<LayerId, u32>,
+    peak_slots: u32,
+    domain_of: HashMap<LayerId, Domain>,
+}
+
+impl Plan {
+    fn into_schedule(self, output_slots: OutputSlots) -> Schedule {
+        Schedule {
+            order: self.order,
+            slot_of: self.slot_of,
+            peak_slots: self.peak_slots,
+            output_slots,
+            domain_of: self.domain_of,
+        }
+    }
+}
+
+/// Topological order over `roots` and their upstream closure, with slots
+/// allocated by the pebble game described in the module docs.
+fn plan_from(graph: &Graph, roots: &[LayerId]) -> Result<Plan, ScheduleError> {
     // Reverse-transitive closure — every layer reachable from any root.
     let mut required: HashSet<LayerId> = HashSet::new();
-    let mut stack = output_roots.clone();
+    let mut stack = roots.to_vec();
     while let Some(id) = stack.pop() {
         if !required.insert(id) {
             continue;
@@ -254,12 +323,13 @@ pub fn schedule(graph: &Graph) -> Result<Schedule, ScheduleError> {
     let mut order = Vec::with_capacity(required.len());
     let mut done: HashSet<LayerId> = HashSet::new();
     let mut visiting: HashSet<LayerId> = HashSet::new();
-    for &root in &output_roots {
+    for &root in roots {
         topo_dfs(graph, root, &required, &mut visiting, &mut done, &mut order)?;
     }
 
     // Refcount consumers. Every occurrence of an id in another layer's
-    // `inputs()` counts once; each Output-root reference also counts once.
+    // `inputs()` counts once; each root reference also counts once, which
+    // is the sentinel that keeps a root's slot alive to be packed.
     let mut remaining: HashMap<LayerId, u32> = HashMap::new();
     for &id in &order {
         remaining.entry(id).or_insert(0);
@@ -270,7 +340,7 @@ pub fn schedule(graph: &Graph) -> Result<Schedule, ScheduleError> {
             *remaining.entry(input).or_insert(0) += 1;
         }
     }
-    for &root in &output_roots {
+    for &root in roots {
         *remaining.entry(root).or_insert(0) += 1;
     }
 
@@ -308,24 +378,8 @@ pub fn schedule(graph: &Graph) -> Result<Schedule, ScheduleError> {
         }
     }
 
-    // Resolve the four output channels against the final slot_of.
-    let output_slots = OutputSlots {
-        color: match graph.output.color {
-            Some(id) => Some(*slot_of.get(&id).ok_or(ScheduleError::UnknownLayer(id))?),
-            None => None,
-        },
-        roughness: scalar_to_slot(&graph.output.roughness, &slot_of)?,
-        metallic: scalar_to_slot(&graph.output.metallic, &slot_of)?,
-        normal: match graph.output.normal {
-            Some(id) => Some(
-                *slot_of.get(&id).ok_or(ScheduleError::UnknownLayer(id))?,
-            ),
-            None => None,
-        },
-    };
-
     let domain_of = compute_domains(graph, &order);
-    Ok(Schedule { order, slot_of, peak_slots, output_slots, domain_of })
+    Ok(Plan { order, slot_of, peak_slots, domain_of })
 }
 
 /// One texture per layer, no reuse — used for the per-layer preview pass
