@@ -52,6 +52,56 @@ pub struct VolumeOutput {
     pub size: (u32, u32, u32),
 }
 
+/// A [`Baker::bake_volume`] in progress; see [`Baker::begin_volume`].
+pub struct VolumeJob {
+    graph: Graph,
+    /// Already resolved against the graph's parameters.
+    eval_ctx: EvalCtx,
+    sched: Schedule,
+    res: u32,
+    depth: u32,
+    next_z: u32,
+    /// Behind `pool_views` and `missing_view`; held for as long as they are.
+    _scratch: Vec<wgpu::Texture>,
+    pool_views: Vec<wgpu::TextureView>,
+    missing_view: wgpu::TextureView,
+    slices: Vec<wgpu::Texture>,
+    slice_views: Vec<wgpu::TextureView>,
+    volumes: Vec<wgpu::Texture>,
+    chan_doms: [[f32; 4]; 4],
+}
+
+impl VolumeJob {
+    /// Width and height in texels.
+    pub fn res(&self) -> u32 {
+        self.res
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.next_z >= self.depth
+    }
+
+    /// Compute dispatches one slice records, for sizing a step to a
+    /// budget: a slice of a deep graph costs more than one of a shallow.
+    pub fn dispatches_per_slice(&self) -> u32 {
+        // The missing-texture refill and the four channel packs.
+        self.sched.order.len() as u32 + 5
+    }
+
+    /// The volume. Only meaningful once [`Self::is_done`]; before that the
+    /// slices not yet reached hold nothing.
+    pub fn into_output(self) -> VolumeOutput {
+        let mut it = self.volumes.into_iter();
+        VolumeOutput {
+            color: it.next().unwrap(),
+            roughness: it.next().unwrap(),
+            metallic: it.next().unwrap(),
+            normal: it.next().unwrap(),
+            size: (self.res, self.res, self.depth),
+        }
+    }
+}
+
 /// Texel format for a single-channel bake.
 ///
 /// All three are renderable in core WebGPU, which is why `bake_scalar`
@@ -670,22 +720,7 @@ impl Baker {
             self.missing_view = Some(view);
         }
         while self.pool.len() < needed as usize {
-            let tex = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("tg-pool"),
-                size: wgpu::Extent3d {
-                    width: size.0,
-                    height: size.1,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba32Float,
-                usage: wgpu::TextureUsages::STORAGE_BINDING
-                    | wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
+            let tex = make_pool_texture(&self.ctx.device, size);
             let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
             self.pool.push(tex);
             self.pool_views.push(view);
@@ -1102,6 +1137,9 @@ impl Baker {
     /// difference is the `w` uniform fed to the coordinate-generating
     /// stages (noise, transform).
     ///
+    /// All at once, which can take a good fraction of a second of CPU at
+    /// 256³; see [`Baker::begin_volume`] to spread it over frames.
+    ///
     /// Known limitation (same as the flat GPU path): a Transform's w
     /// *offset/scale* can't re-sample its input at a different w, because
     /// each slice only has its inputs baked at the same w.
@@ -1112,17 +1150,41 @@ impl Baker {
         depth: u32,
         eval_ctx: &EvalCtx,
     ) -> Result<VolumeOutput, BakeError> {
-        let t0 = BakeTimer::start();
-        let eval_ctx = &graph.resolve_params(eval_ctx);
-        let sched = schedule(graph, eval_ctx)?;
-        let size = (res, res);
-        self.ensure_pool(size, sched.peak_slots.max(1));
+        let mut job = self.begin_volume(graph, res, depth, eval_ctx)?;
+        self.step_volume(&mut job, u32::MAX)?;
+        Ok(job.into_output())
+    }
 
+    /// Start a [`Baker::bake_volume`] that [`Baker::step_volume`] carries
+    /// out a few slices at a time. Nothing is recorded yet.
+    ///
+    /// The job snapshots the graph and owns its intermediates, so the
+    /// graph can be edited and other bakes run between steps without
+    /// disturbing it.
+    pub fn begin_volume(
+        &mut self,
+        graph: &Graph,
+        res: u32,
+        depth: u32,
+        eval_ctx: &EvalCtx,
+    ) -> Result<VolumeJob, BakeError> {
+        let eval_ctx = graph.resolve_params(eval_ctx);
+        let sched = schedule(graph, &eval_ctx)?;
+        let size = (res, res);
+        let device = &self.ctx.device;
+
+        let pool: Vec<wgpu::Texture> =
+            (0..sched.peak_slots.max(1)).map(|_| make_pool_texture(device, size)).collect();
+        let pool_views: Vec<wgpu::TextureView> = pool
+            .iter()
+            .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()))
+            .collect();
+        let (missing_tex, missing_view) = make_missing_texture(device, size);
         // Reusable 2D slice targets (storage-written by pack, then copied
         // out) and the four 3D destination volumes.
         let slices: Vec<wgpu::Texture> = ["color", "rough", "metal", "normal"]
             .iter()
-            .map(|n| make_output_texture(&self.ctx.device, size, &format!("tg-vol-slice-{n}")))
+            .map(|n| make_output_texture(device, size, &format!("tg-vol-slice-{n}")))
             .collect();
         let slice_views: Vec<wgpu::TextureView> = slices
             .iter()
@@ -1130,15 +1192,9 @@ impl Baker {
             .collect();
         let volumes: Vec<wgpu::Texture> = ["color", "rough", "metal", "normal"]
             .iter()
-            .map(|n| make_volume_texture(&self.ctx.device, res, depth, &format!("tg-vol-{n}")))
+            .map(|n| make_volume_texture(device, res, depth, &format!("tg-vol-{n}")))
             .collect();
 
-        const CHANNELS: [OutputChannel; 4] = [
-            OutputChannel::Color,
-            OutputChannel::Roughness,
-            OutputChannel::Metallic,
-            OutputChannel::Normal,
-        ];
         let chan_dom = |id: Option<LayerId>| -> [f32; 4] {
             match id {
                 Some(id) => domain_of(&sched, id),
@@ -1157,8 +1213,39 @@ impl Baker {
             },
             chan_dom(graph.output.normal),
         ];
-        let missing_view = self.missing_view.as_ref().unwrap();
-        for z in 0..depth {
+
+        Ok(VolumeJob {
+            graph: graph.clone(),
+            eval_ctx,
+            sched,
+            res,
+            depth,
+            next_z: 0,
+            _scratch: pool.into_iter().chain([missing_tex]).collect(),
+            pool_views,
+            missing_view,
+            slices,
+            slice_views,
+            volumes,
+            chan_doms,
+        })
+    }
+
+    /// Record and submit up to `max_slices` more of `job`'s slices.
+    /// Whether it is finished; once it is, [`VolumeJob::into_output`] has
+    /// the volume.
+    pub fn step_volume(&mut self, job: &mut VolumeJob, max_slices: u32) -> Result<bool, BakeError> {
+        const CHANNELS: [OutputChannel; 4] = [
+            OutputChannel::Color,
+            OutputChannel::Roughness,
+            OutputChannel::Metallic,
+            OutputChannel::Normal,
+        ];
+        let t0 = BakeTimer::start();
+        let first = job.next_z;
+        let size = (job.res, job.res);
+        let stop = job.next_z.saturating_add(max_slices).min(job.depth);
+        for z in job.next_z..stop {
             // One encoder + submit PER SLICE. On Metal every compute pass
             // becomes its own command buffer that stays "outstanding" until
             // its encoder is submitted; recording all slices into one
@@ -1173,25 +1260,25 @@ impl Baker {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("tg-bake-volume"),
                 });
-            let w = (z as f32 + 0.5) / depth as f32;
+            let w = (z as f32 + 0.5) / job.depth as f32;
             // Refill per slice — the grid alternates along w too.
             dispatch_missing(
                 &self.ctx, &mut encoder, &self.missing_pipeline, &self.color_bgl,
-                missing_view, size, w,
+                &job.missing_view, size, w,
             );
-            for &id in &sched.order {
-                let slot = *sched.slot_of.get(&id).unwrap() as usize;
-                let layer = graph.get(id).unwrap();
+            for &id in &job.sched.order {
+                let slot = *job.sched.slot_of.get(&id).unwrap() as usize;
+                let layer = job.graph.get(id).unwrap();
                 self.dispatch_kind(
                     &mut encoder,
                     layer,
-                    eval_ctx,
-                    &sched,
-                    &self.pool_views,
+                    &job.eval_ctx,
+                    &job.sched,
+                    &job.pool_views,
                     size,
                     slot,
                     Slice::Plane { w },
-                    missing_view,
+                    &job.missing_view,
                 )?;
             }
             for (i, channel) in CHANNELS.iter().enumerate() {
@@ -1202,52 +1289,48 @@ impl Baker {
                     &self.pack_bgl,
                     &self.solid_pipeline,
                     &self.solid_bgl,
-                    &self.pool_views,
-                    missing_view,
-                    &slice_views[i],
+                    &job.pool_views,
+                    &job.missing_view,
+                    &job.slice_views[i],
                     size,
                     *channel,
-                    &sched.output_slots,
+                    &job.sched.output_slots,
                     true,
                     z,
-                    chan_doms[i],
+                    job.chan_doms[i],
                 );
                 encoder.copy_texture_to_texture(
                     wgpu::TexelCopyTextureInfo {
-                        texture: &slices[i],
+                        texture: &job.slices[i],
                         mip_level: 0,
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
                     },
                     wgpu::TexelCopyTextureInfo {
-                        texture: &volumes[i],
+                        texture: &job.volumes[i],
                         mip_level: 0,
                         origin: wgpu::Origin3d { x: 0, y: 0, z },
                         aspect: wgpu::TextureAspect::All,
                     },
                     wgpu::Extent3d {
-                        width: res,
-                        height: res,
+                        width: job.res,
+                        height: job.res,
                         depth_or_array_layers: 1,
                     },
                 );
             }
             self.ctx.queue.submit([encoder.finish()]);
+            job.next_z = z + 1;
         }
 
         log::debug!(
-            "bake_volume {res}³ (depth={depth}): layers/slice={} record+submit={:?}",
-            sched.order.len(),
+            "bake_volume {}³ slices {first}..{}: layers/slice={} record+submit={:?}",
+            job.res,
+            job.next_z,
+            job.sched.order.len(),
             t0.elapsed(),
         );
-        let mut it = volumes.into_iter();
-        Ok(VolumeOutput {
-            color: it.next().unwrap(),
-            roughness: it.next().unwrap(),
-            metallic: it.next().unwrap(),
-            normal: it.next().unwrap(),
-            size: (res, res, depth),
-        })
+        Ok(job.is_done())
     }
 }
 
@@ -2477,6 +2560,26 @@ fn make_volume_texture(device: &wgpu::Device, res: u32, depth: u32, label: &str)
         format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    })
+}
+
+/// An `Rgba32Float` intermediate a layer is baked into and read back from.
+fn make_pool_texture(device: &wgpu::Device, size: (u32, u32)) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("tg-pool"),
+        size: wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba32Float,
+        usage: wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     })

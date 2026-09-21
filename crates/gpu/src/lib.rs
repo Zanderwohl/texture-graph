@@ -20,7 +20,7 @@ pub mod scene;
 pub mod schedule;
 
 pub use baker::{
-    BakeError, BakeOutput, Baker, ScalarCube, ScalarFormat, ScalarVolume, VolumeOutput,
+    BakeError, BakeOutput, Baker, ScalarCube, ScalarFormat, ScalarVolume, VolumeJob, VolumeOutput,
 };
 pub use device::DeviceCtx;
 pub use readback::{
