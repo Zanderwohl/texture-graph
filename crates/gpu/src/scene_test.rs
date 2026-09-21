@@ -384,6 +384,7 @@ fn noise_graph(dims: NoiseDims) -> Graph {
                 frequency: 4.0,
                 range: NoiseRange::Unsigned,
                 output: NoiseOutput::Grayscale,
+                ..Noise::default()
             }),
         )
         .unwrap();
@@ -510,6 +511,7 @@ fn out_of_range_checker_alternates_along_w() {
                 frequency: 4.0,
                 range: NoiseRange::Signed,
                 output: NoiseOutput::Grayscale,
+                ..Noise::default()
             }),
         )
         .unwrap();

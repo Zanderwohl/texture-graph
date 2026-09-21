@@ -18,8 +18,8 @@
 use std::collections::{HashMap, HashSet};
 
 use texture_graph_core::{
-    Axis, CoordMode, EXTEND_LIMIT, EdgeMode, Graph, LayerId, LayerKind, RadialDim, ScalarInput,
-    Transform,
+    Axis, CoordMode, EXTEND_LIMIT, EdgeMode, EvalCtx, Graph, LayerId, LayerKind, RadialDim,
+    ScalarInput, Transform, Warp,
 };
 
 /// Fully-resolved dispatch plan for one bake.
@@ -97,6 +97,20 @@ fn compute_domains(graph: &Graph, order: &[LayerId]) -> HashMap<LayerId, Domain>
                     e.union(d);
                 }
                 // Luminance-indexed, so the unit domain suffices.
+            }
+            LayerKind::Warp(w) => {
+                // The displacement field is read at the warp's own
+                // coordinates, so it needs no more than the warp's domain.
+                if let Some(e) = w.by.and_then(|b| dom.get_mut(&b)) {
+                    e.union(d);
+                }
+                // The source is read at the displaced ones. `Warp` promises
+                // its driver lies in [-1, 1], so |amount| bounds the reach;
+                // cap it like a radial extend, since `amount` is a float a
+                // user can type any number into.
+                if let Some(e) = w.source.and_then(|src| dom.get_mut(&src)) {
+                    e.union(warp_request(w, d));
+                }
             }
             _ => {
                 for input in layer.kind.inputs() {
@@ -195,6 +209,24 @@ fn transform_request(t: &Transform, d: Domain) -> Option<Domain> {
     Some(Domain { min: [u0, v0], max: [u1, v1] })
 }
 
+/// The UV rectangle a warp samples its source over: its own domain grown
+/// by `|amount|`, capped at the [`EXTEND_LIMIT`] box.
+///
+/// The twin of this bound on the CPU side is `warp_bounds` in
+/// `core::eval`, which states it over the unit square. They agree wherever
+/// the warp's own domain is the unit square, which is everywhere but under
+/// an extend transform.
+fn warp_request(w: &Warp, d: Domain) -> Domain {
+    let lo = 0.5 - EXTEND_LIMIT;
+    let hi = 0.5 + EXTEND_LIMIT;
+    let grow = |min: f32, max: f32, a: f32| {
+        ((min - a.abs()).max(lo), (max + a.abs()).min(hi))
+    };
+    let (u0, u1) = grow(d.min[0], d.max[0], w.amount[0]);
+    let (v0, v1) = grow(d.min[1], d.max[1], w.amount[1]);
+    Domain { min: [u0, v0], max: [u1, v1] }
+}
+
 /// Post-schedule descriptor for the `pack_srgb8` stage.
 #[derive(Debug, Copy, Clone)]
 pub struct OutputSlots {
@@ -233,12 +265,82 @@ impl std::error::Error for ScheduleError {}
 
 /// Build a `Schedule` for `graph`. Only layers reachable from `Output` are
 /// included; unreachable layers cost neither dispatches nor slots.
-pub fn schedule(graph: &Graph) -> Result<Schedule, ScheduleError> {
+pub fn schedule(graph: &Graph, ctx: &EvalCtx) -> Result<Schedule, ScheduleError> {
+    let ctx = &graph.resolve_params(ctx);
     let output_roots = output_referenced(graph);
+    let plan = plan_from(graph, &output_roots)?;
 
+    // Resolve the four output channels against the final slot_of.
+    let output_slots = OutputSlots {
+        color: match graph.output.color {
+            Some(id) => Some(*plan.slot_of.get(&id).ok_or(ScheduleError::UnknownLayer(id))?),
+            None => None,
+        },
+        roughness: scalar_to_slot(&graph.output.roughness, &plan.slot_of, ctx)?,
+        metallic: scalar_to_slot(&graph.output.metallic, &plan.slot_of, ctx)?,
+        normal: match graph.output.normal {
+            Some(id) => Some(
+                *plan.slot_of.get(&id).ok_or(ScheduleError::UnknownLayer(id))?,
+            ),
+            None => None,
+        },
+    };
+    Ok(plan.into_schedule(output_slots))
+}
+
+/// Build a `Schedule` that produces one layer and nothing else — `root`
+/// plus everything it transitively reads, with the same slot reuse
+/// `schedule` gets.
+///
+/// This is the plan a single-channel bake wants: the graph's Output may
+/// route through nodes the caller does not care about, and a consumer
+/// asking for one scalar field should not pay for the other three PBR
+/// channels' dispatches.
+///
+/// `output_slots.color` points at `root`, so a caller that wants to reuse
+/// the ordinary pack path can. The scalar channels report their constants
+/// and `normal` is `None`; nothing here consults them.
+pub fn schedule_layer(graph: &Graph, root: LayerId) -> Result<Schedule, ScheduleError> {
+    if graph.get(root).is_none() {
+        return Err(ScheduleError::UnknownLayer(root));
+    }
+    let plan = plan_from(graph, &[root])?;
+    let output_slots = OutputSlots {
+        color: plan.slot_of.get(&root).copied(),
+        roughness: ScalarSlot::Const(0.5),
+        metallic: ScalarSlot::Const(0.0),
+        normal: None,
+    };
+    Ok(plan.into_schedule(output_slots))
+}
+
+/// Everything a `Schedule` holds except which slots the output channels
+/// read, which is the one part that depends on why the bake was asked for.
+struct Plan {
+    order: Vec<LayerId>,
+    slot_of: HashMap<LayerId, u32>,
+    peak_slots: u32,
+    domain_of: HashMap<LayerId, Domain>,
+}
+
+impl Plan {
+    fn into_schedule(self, output_slots: OutputSlots) -> Schedule {
+        Schedule {
+            order: self.order,
+            slot_of: self.slot_of,
+            peak_slots: self.peak_slots,
+            output_slots,
+            domain_of: self.domain_of,
+        }
+    }
+}
+
+/// Topological order over `roots` and their upstream closure, with slots
+/// allocated by the pebble game described in the module docs.
+fn plan_from(graph: &Graph, roots: &[LayerId]) -> Result<Plan, ScheduleError> {
     // Reverse-transitive closure — every layer reachable from any root.
     let mut required: HashSet<LayerId> = HashSet::new();
-    let mut stack = output_roots.clone();
+    let mut stack = roots.to_vec();
     while let Some(id) = stack.pop() {
         if !required.insert(id) {
             continue;
@@ -254,12 +356,13 @@ pub fn schedule(graph: &Graph) -> Result<Schedule, ScheduleError> {
     let mut order = Vec::with_capacity(required.len());
     let mut done: HashSet<LayerId> = HashSet::new();
     let mut visiting: HashSet<LayerId> = HashSet::new();
-    for &root in &output_roots {
+    for &root in roots {
         topo_dfs(graph, root, &required, &mut visiting, &mut done, &mut order)?;
     }
 
     // Refcount consumers. Every occurrence of an id in another layer's
-    // `inputs()` counts once; each Output-root reference also counts once.
+    // `inputs()` counts once; each root reference also counts once, which
+    // is the sentinel that keeps a root's slot alive to be packed.
     let mut remaining: HashMap<LayerId, u32> = HashMap::new();
     for &id in &order {
         remaining.entry(id).or_insert(0);
@@ -270,7 +373,7 @@ pub fn schedule(graph: &Graph) -> Result<Schedule, ScheduleError> {
             *remaining.entry(input).or_insert(0) += 1;
         }
     }
-    for &root in &output_roots {
+    for &root in roots {
         *remaining.entry(root).or_insert(0) += 1;
     }
 
@@ -308,31 +411,15 @@ pub fn schedule(graph: &Graph) -> Result<Schedule, ScheduleError> {
         }
     }
 
-    // Resolve the four output channels against the final slot_of.
-    let output_slots = OutputSlots {
-        color: match graph.output.color {
-            Some(id) => Some(*slot_of.get(&id).ok_or(ScheduleError::UnknownLayer(id))?),
-            None => None,
-        },
-        roughness: scalar_to_slot(&graph.output.roughness, &slot_of)?,
-        metallic: scalar_to_slot(&graph.output.metallic, &slot_of)?,
-        normal: match graph.output.normal {
-            Some(id) => Some(
-                *slot_of.get(&id).ok_or(ScheduleError::UnknownLayer(id))?,
-            ),
-            None => None,
-        },
-    };
-
     let domain_of = compute_domains(graph, &order);
-    Ok(Schedule { order, slot_of, peak_slots, output_slots, domain_of })
+    Ok(Plan { order, slot_of, peak_slots, domain_of })
 }
 
 /// One texture per layer, no reuse — used for the per-layer preview pass
 /// where every intermediate must survive to the end so it can be read back
 /// into egui.
-pub fn schedule_no_reuse(graph: &Graph) -> Result<Schedule, ScheduleError> {
-    schedule_previews(graph, None)
+pub fn schedule_no_reuse(graph: &Graph, ctx: &EvalCtx) -> Result<Schedule, ScheduleError> {
+    schedule_previews(graph, None, ctx)
 }
 
 /// The preview schedule for `wanted` — those layers and everything they
@@ -352,7 +439,9 @@ pub fn schedule_no_reuse(graph: &Graph) -> Result<Schedule, ScheduleError> {
 pub fn schedule_previews(
     graph: &Graph,
     wanted: Option<&HashSet<LayerId>>,
+    ctx: &EvalCtx,
 ) -> Result<Schedule, ScheduleError> {
+    let ctx = &graph.resolve_params(ctx);
     // Everything, in dependency order — what the domains are computed from,
     // and the whole schedule when `wanted` is `None`.
     let everything: HashSet<LayerId> = graph.layers.iter().map(|l| l.id).collect();
@@ -374,8 +463,8 @@ pub fn schedule_previews(
     // layer's own slot — so a missing root is not an error here.
     let output_slots = OutputSlots {
         color: graph.output.color.and_then(|id| slot_of.get(&id).copied()),
-        roughness: scalar_slot_lenient(&graph.output.roughness, &slot_of),
-        metallic: scalar_slot_lenient(&graph.output.metallic, &slot_of),
+        roughness: scalar_slot_lenient(&graph.output.roughness, &slot_of, ctx),
+        metallic: scalar_slot_lenient(&graph.output.metallic, &slot_of, ctx),
         normal: graph.output.normal.and_then(|id| slot_of.get(&id).copied()),
     };
     Ok(Schedule { order, slot_of, peak_slots, output_slots, domain_of })
@@ -417,14 +506,18 @@ fn topo_over(graph: &Graph, required: &HashSet<LayerId>) -> Result<Vec<LayerId>,
 /// Like [`scalar_to_slot`], but a layer that isn't scheduled falls back to
 /// a constant instead of failing. Only for the preview pass, which doesn't
 /// read output slots.
-fn scalar_slot_lenient(s: &ScalarInput, slot_of: &HashMap<LayerId, u32>) -> ScalarSlot {
-    match *s {
-        ScalarInput::Const(v) => ScalarSlot::Const(v),
-        ScalarInput::Layer(id) => match slot_of.get(&id) {
+fn scalar_slot_lenient(
+    s: &ScalarInput,
+    slot_of: &HashMap<LayerId, u32>,
+    ctx: &EvalCtx,
+) -> ScalarSlot {
+    if let ScalarInput::Layer(id) = s {
+        return match slot_of.get(id) {
             Some(slot) => ScalarSlot::Slot(*slot),
             None => ScalarSlot::Const(0.0),
-        },
+        };
     }
+    ScalarSlot::Const(ctx.scalar_const(s).unwrap_or(0.0))
 }
 
 fn output_referenced(graph: &Graph) -> Vec<LayerId> {
@@ -442,16 +535,20 @@ fn output_referenced(graph: &Graph) -> Vec<LayerId> {
     out
 }
 
+/// A scalar output channel is either baked (it reads a layer) or a
+/// number. A parameter is a number — resolved here, once, rather than
+/// carried to the shader as a name.
 fn scalar_to_slot(
     s: &ScalarInput,
     slot_of: &HashMap<LayerId, u32>,
+    ctx: &EvalCtx,
 ) -> Result<ScalarSlot, ScheduleError> {
-    Ok(match *s {
-        ScalarInput::Const(v) => ScalarSlot::Const(v),
-        ScalarInput::Layer(id) => ScalarSlot::Slot(
-            *slot_of.get(&id).ok_or(ScheduleError::UnknownLayer(id))?,
-        ),
-    })
+    if let ScalarInput::Layer(id) = s {
+        return Ok(ScalarSlot::Slot(
+            *slot_of.get(id).ok_or(ScheduleError::UnknownLayer(*id))?,
+        ));
+    }
+    Ok(ScalarSlot::Const(ctx.scalar_const(s).unwrap_or(0.0)))
 }
 
 fn topo_dfs(
@@ -484,7 +581,7 @@ fn topo_dfs(
 mod tests {
     use super::*;
     use texture_graph_core::{
-        BlendMode, BlendSpace, Color, Graph, LayerKind, Mix, Output, ScalarInput,
+        BlendMode, BlendSpace, Color, EvalCtx, Graph, LayerKind, Mix, Output, ScalarInput,
     };
 
     fn base_graph() -> Graph {
@@ -577,7 +674,7 @@ mod tests {
             normal: None,
         })
         .unwrap();
-        let s = schedule(&g).unwrap();
+        let s = schedule(&g, &EvalCtx::default()).unwrap();
         assert_valid_allocation(&g, &s);
         // Peak here: at the moment `ab` dispatches, both `a` and `b` are
         // live plus `ab`'s new slot, but `a` and `b` are freed after `ab`
@@ -603,7 +700,7 @@ mod tests {
             normal: None,
         })
         .unwrap();
-        let s = schedule(&g).unwrap();
+        let s = schedule(&g, &EvalCtx::default()).unwrap();
         assert_valid_allocation(&g, &s);
         // At `bc` dispatch: bc, b, c all live => >= 3.
         assert!(s.peak_slots >= 3, "peak_slots was {}", s.peak_slots);
@@ -627,7 +724,7 @@ mod tests {
             normal: None,
         })
         .unwrap();
-        let s = schedule(&g).unwrap();
+        let s = schedule(&g, &EvalCtx::default()).unwrap();
         assert_valid_allocation(&g, &s);
     }
 
@@ -644,7 +741,7 @@ mod tests {
             normal: None,
         })
         .unwrap();
-        let s = schedule_no_reuse(&g).unwrap();
+        let s = schedule_no_reuse(&g, &EvalCtx::default()).unwrap();
         let mut slots: Vec<u32> = s.slot_of.values().copied().collect();
         slots.sort();
         slots.dedup();
@@ -686,7 +783,7 @@ mod tests {
             normal: None,
         })
         .unwrap();
-        let s = schedule(&g).unwrap();
+        let s = schedule(&g, &EvalCtx::default()).unwrap();
         let d = s.domain_of[&src];
         // Transform samples u in [0, 3]; unit baseline keeps v at [0, 1].
         assert_eq!(d.min, [0.0, 0.0]);
@@ -709,7 +806,7 @@ mod tests {
             normal: None,
         })
         .unwrap();
-        let s = schedule(&g).unwrap();
+        let s = schedule(&g, &EvalCtx::default()).unwrap();
         assert_eq!(s.domain_of[&src], Domain::UNIT);
     }
 
@@ -732,7 +829,7 @@ mod tests {
             normal: None,
         })
         .unwrap();
-        let s = schedule(&g).unwrap();
+        let s = schedule(&g, &EvalCtx::default()).unwrap();
         // t1's domain: widened by t2 to u in [0, 2].
         assert!((s.domain_of[&t1].max[0] - 2.0).abs() < 1e-6);
         // src: union of t1's request over its widened domain ([0, 4]) and
@@ -767,7 +864,7 @@ mod tests {
             normal: None,
         })
         .unwrap();
-        let s = schedule(&g).unwrap();
+        let s = schedule(&g, &EvalCtx::default()).unwrap();
         // r_max ~ 40 but the radial request is conservative, so it caps.
         let d = s.domain_of[&src];
         assert!((d.max[0] - (0.5 + EXTEND_LIMIT)).abs() < 1e-4, "u max {}", d.max[0]);
@@ -778,7 +875,7 @@ mod tests {
         let mut g = base_graph();
         let _dead = add_color(&mut g, "dead");
         // Output still points at the auto-created base color layer.
-        let s = schedule(&g).unwrap();
+        let s = schedule(&g, &EvalCtx::default()).unwrap();
         assert_eq!(s.order.len(), 1);
     }
 }

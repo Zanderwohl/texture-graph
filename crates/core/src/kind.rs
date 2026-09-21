@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::color::{BlendSpace, Color};
 use crate::id::LayerId;
+use crate::param::ParamUse;
 
 /// One of the discriminated node types in the graph.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -14,6 +15,8 @@ pub enum LayerKind {
     Map(Map),
     MinMax(MinMax),
     HeightToNormal(HeightToNormal),
+    Wave(Wave),
+    Warp(Warp),
 }
 
 impl LayerKind {
@@ -27,6 +30,8 @@ impl LayerKind {
             LayerKind::Map(_) => "Map",
             LayerKind::MinMax(_) => "MinMax",
             LayerKind::HeightToNormal(_) => "HeightToNormal",
+            LayerKind::Wave(_) => "Wave",
+            LayerKind::Warp(_) => "Warp",
         }
     }
 
@@ -35,28 +40,28 @@ impl LayerKind {
     /// ids and order.
     pub fn inputs(&self) -> Vec<LayerId> {
         let mut out = Vec::new();
-        let push_color = |out: &mut Vec<LayerId>, ci: ColorInput| {
+        let push_color = |out: &mut Vec<LayerId>, ci: &ColorInput| {
             if let ColorInput::Layer(id) = ci {
-                out.push(id);
+                out.push(*id);
             }
         };
-        let push_scalar = |out: &mut Vec<LayerId>, si: ScalarInput| {
+        let push_scalar = |out: &mut Vec<LayerId>, si: &ScalarInput| {
             if let ScalarInput::Layer(id) = si {
-                out.push(id);
+                out.push(*id);
             }
         };
         match self {
             LayerKind::Color(_) | LayerKind::Noise(_) => {}
             LayerKind::ColorRamp(r) => {
                 for s in &r.stops {
-                    push_color(&mut out, s.color);
+                    push_color(&mut out, &s.color);
                 }
             }
             LayerKind::Transform(t) => out.extend(t.source),
             LayerKind::Mix(m) => {
                 out.extend(m.a);
                 out.extend(m.b);
-                push_scalar(&mut out, m.factor);
+                push_scalar(&mut out, &m.factor);
             }
             LayerKind::Map(m) => {
                 out.extend(m.value);
@@ -67,6 +72,45 @@ impl LayerKind {
                 out.extend(mm.b);
             }
             LayerKind::HeightToNormal(h) => out.extend(h.source),
+            LayerKind::Wave(w) => push_scalar(&mut out, &w.input),
+            LayerKind::Warp(w) => {
+                out.extend(w.source);
+                out.extend(w.by);
+            }
+        }
+        out
+    }
+
+    /// Every parameter this node reads, with the sort of socket reading
+    /// it. Paired with [`LayerKind::inputs`]: one reports layer edges, the
+    /// other name edges, and [`crate::Graph`] validates both on the same
+    /// paths.
+    pub fn param_refs(&self) -> Vec<(&str, ParamUse)> {
+        let mut out = Vec::new();
+        match self {
+            LayerKind::Color(_) | LayerKind::Noise(_) => {}
+            LayerKind::ColorRamp(r) => {
+                for s in &r.stops {
+                    if let ColorInput::Param(name) = &s.color {
+                        out.push((name.as_str(), ParamUse::Color));
+                    }
+                }
+            }
+            LayerKind::Mix(m) => {
+                if let ScalarInput::Param(name) = &m.factor {
+                    out.push((name.as_str(), ParamUse::Scalar));
+                }
+            }
+            LayerKind::Wave(w) => {
+                if let ScalarInput::Param(name) = &w.input {
+                    out.push((name.as_str(), ParamUse::Scalar));
+                }
+            }
+            LayerKind::Transform(_)
+            | LayerKind::Map(_)
+            | LayerKind::MinMax(_)
+            | LayerKind::HeightToNormal(_)
+            | LayerKind::Warp(_) => {}
         }
         out
     }
@@ -74,26 +118,37 @@ impl LayerKind {
 
 // ---- Inputs -------------------------------------------------------------
 
-/// A color-valued input: either a constant chosen in the UI or another
-/// layer's output.
-#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+/// A color-valued input: a constant chosen in the UI, another layer's
+/// output, or a named parameter bound at bake time.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ColorInput {
     Const(Color),
     Layer(LayerId),
+    /// Reads [`crate::Graph::params`] by name, overridden per bake by
+    /// [`crate::EvalCtx::params`]. The name must be declared and must be a
+    /// [`crate::ParamKind::Color`]; the graph mutators reject anything
+    /// else, so neither backend has to decide what a stray name means.
+    ///
+    /// On the GPU this costs nothing per pixel — it resolves to the same
+    /// uniform a `Const` would.
+    Param(String),
 }
 
 /// A scalar-valued input. When a layer is referenced, its color's Oklch L
 /// (perceptual lightness) is used as the scalar.
-#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ScalarInput {
     Const(f32),
     Layer(LayerId),
+    /// Reads [`crate::Graph::params`] by name — see [`ColorInput::Param`].
+    /// The declared kind must be [`crate::ParamKind::Scalar`].
+    Param(String),
 }
 
 // ---- Node payloads ------------------------------------------------------
 
-/// Simplex noise at a chosen dimensionality, with a chosen numeric range
-/// and either grayscale or LCh-colorful output.
+/// Noise at a chosen dimensionality, with a chosen numeric range and
+/// either grayscale or LCh-colorful output.
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub struct Noise {
     pub dims: NoiseDims,
@@ -102,6 +157,113 @@ pub struct Noise {
     pub frequency: f32,
     pub range: NoiseRange,
     pub output: NoiseOutput,
+    /// Which kernel generates the field. A file without the field loads as
+    /// [`NoiseKernel::Simplex`], which is what every graph written before
+    /// this field existed contains.
+    #[serde(default)]
+    pub kernel: NoiseKernel,
+    /// Lattice period in cells, per axis; `0` = unbounded on that axis.
+    ///
+    /// With `frequency = f` and `period = p`, the lattice cell index is
+    /// taken `mod p`, so the field repeats every `p / f` units of sample
+    /// space. Seamless across the unit cube is exactly the case `p == f`
+    /// with `f` integral — anything else tiles, just not on the cube.
+    ///
+    /// Per-axis rather than one flag because periodicity is often wanted
+    /// on one axis alone: an animation that scrolls through w forever
+    /// wants `[0, 0, 64]` and nothing more.
+    ///
+    /// [`NoiseKernel::Value`] only — a nonzero period on `Simplex` is
+    /// rejected as [`crate::GraphError::PeriodicSimplex`] rather than
+    /// silently ignored, because tiled simplex needs a 6D kernel for 3D
+    /// and this crate does not have one.
+    #[serde(default)]
+    pub period: [u32; 3],
+    /// Octave stack. The default is one octave, which is the plain kernel.
+    #[serde(default)]
+    pub fractal: Fractal,
+}
+
+impl Default for Noise {
+    /// The node a fresh Noise layer starts as: one octave of aperiodic
+    /// simplex, grayscale, `[0, 1]`. Every other field is `..Default`'s
+    /// job at a call site that only cares about one of them.
+    fn default() -> Self {
+        Self {
+            dims: NoiseDims::D2,
+            seed_offset: 0,
+            frequency: 4.0,
+            range: NoiseRange::Unsigned,
+            output: NoiseOutput::Grayscale,
+            kernel: NoiseKernel::Simplex,
+            period: [0; 3],
+            fractal: Fractal::default(),
+        }
+    }
+}
+
+/// Which kernel generates a [`Noise`] field. The twin implementations are
+/// [`crate::noise`] (CPU) and `noise.wgsl` (GPU).
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum NoiseKernel {
+    /// Gustavson simplex. Aperiodic — it has no lattice to wrap — and the
+    /// default a file without the field loads as.
+    #[default]
+    Simplex,
+    /// Trilinear value noise on an integer lattice, smoothstep weights.
+    /// The only kernel that can tile, and the one a hand-written shader
+    /// most likely already uses.
+    Value,
+}
+
+/// Octave stack applied inside the kernel dispatch.
+///
+/// This lives on [`Noise`] rather than in an `Fbm { source }` node on
+/// purpose. The baker evaluates each layer once per pixel over a fixed
+/// domain, so a downstream node cannot re-sample its input at a different
+/// scale — the same constraint already documented on `bake_volume`.
+/// Octaves have to be where the coordinates are still live.
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Fractal {
+    /// `1..=`[`crate::noise::MAX_OCTAVES`]. 1 is a plain single-octave
+    /// sample, and is exactly the bare kernel.
+    pub octaves: u32,
+    /// Frequency multiplier per octave. A float, not a shift: 2.13 and 2.4
+    /// are as common as 2.0 in hand-tuned fbm. Only an integral value
+    /// keeps a `period` tiling exactly — see [`Noise::period`].
+    pub lacunarity: f32,
+    /// Amplitude multiplier per octave.
+    pub gain: f32,
+    pub mode: FractalMode,
+    /// Divide by the sum of amplitudes so the result stays in range.
+    pub normalize: bool,
+}
+
+impl Default for Fractal {
+    /// One octave: the plain kernel, and what a file written before
+    /// fractals existed means.
+    fn default() -> Self {
+        Self {
+            octaves: 1,
+            lacunarity: 2.0,
+            gain: 0.5,
+            mode: FractalMode::Standard,
+            normalize: true,
+        }
+    }
+}
+
+/// How each octave is shaped before it is summed. Written over the signed
+/// sample `r ∈ [-1, 1]`; `n` below is the unsigned `r * 0.5 + 0.5`.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum FractalMode {
+    /// `Σ aᵢ · n(fᵢx)` — ordinary fbm.
+    #[default]
+    Standard,
+    /// `Σ aᵢ · |n|` — creased at every zero crossing.
+    Turbulence,
+    /// `Σ aᵢ · (1 - |2n - 1|)²` — filaments, as a star corona wants.
+    Ridged,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -131,7 +293,7 @@ pub struct ColorRamp {
     pub space: BlendSpace,
 }
 
-#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ColorStop {
     pub t: f32,
     pub color: ColorInput,
@@ -204,7 +366,7 @@ pub enum RadialDim {
 }
 
 /// Blend two color layers.
-#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Mix {
     /// `None` renders as the missing-texture grid.
     pub a: Option<LayerId>,
@@ -241,6 +403,140 @@ pub struct HeightToNormal {
     /// `None` renders as the missing-texture grid.
     pub source: Option<LayerId>,
     pub strength: f32,
+}
+
+/// Displace the sample point by what another layer says, then read
+/// `source` there.
+///
+/// [`Transform::offset`] is a constant, so there was no way to express
+/// "move this sample by what that field says" — which is what a domain
+/// warp is, and what the banded-planet surface needs.
+///
+/// # What the displacement is
+///
+/// The field's value **as it stands**, times `amount`. It is not
+/// recentred: a [`NoiseRange::Signed`] driver gives a warp centred on
+/// zero, and an unsigned one pushes in one direction only. That is the
+/// same convention `Mix::Add` already follows, and it keeps the node from
+/// guessing what range its input meant.
+///
+/// # Where it stops
+///
+/// The driving field is *assumed* to lie in `[-1, 1]`, so the baker grows
+/// `source`'s bake domain by `|amount|` per axis — exactly as
+/// [`EdgeMode::Extend`] grows a Transform's — and a displacement that
+/// reaches further than that lands outside baked territory and shows the
+/// missing-texture grid. Past [`EXTEND_LIMIT`] it does so regardless.
+/// Both backends draw the line in the same place so a warp looks the same
+/// either side of it.
+///
+/// # The w axis
+///
+/// `amount[2]` displaces w on the CPU evaluator. The GPU baker cannot
+/// honour it: each slice only has its inputs baked at that slice's w, so
+/// nothing downstream can re-sample them at another — the same limitation
+/// `bake_volume` documents for a Transform's w offset. Leave it at zero
+/// unless the CPU evaluator is the only consumer.
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+pub struct Warp {
+    /// Sampled at the displaced coordinate. `None` renders as the
+    /// missing-texture grid.
+    pub source: Option<LayerId>,
+    /// The displacement field. `None` displaces by the missing-texture
+    /// grid's own values, which is visible nonsense rather than a silent
+    /// no-op.
+    pub by: Option<LayerId>,
+    pub mode: WarpMode,
+    /// Per-axis scale on the displacement, in sample-space units.
+    pub amount: [f32; 3],
+}
+
+impl Default for Warp {
+    fn default() -> Self {
+        Self {
+            source: None,
+            by: None,
+            mode: WarpMode::Scalar,
+            amount: [0.1, 0.1, 0.0],
+        }
+    }
+}
+
+/// How many of the displacement field's channels are read.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum WarpMode {
+    /// One scalar — the field's Oklch L — displaces all three axes.
+    #[default]
+    Scalar,
+    /// L, C and hue drive x, y and z independently. Hue is divided by 360
+    /// so a full turn is one unit.
+    ///
+    /// The three are not on the same scale: `Noise`'s Color output puts L
+    /// in `[0, 1]` but holds chroma to `[0, 0.15]`. That is the reason
+    /// `amount` is per-axis rather than one number.
+    Vector,
+}
+
+/// A periodic waveform over a scalar input — what `sin(...)` is, and what
+/// a ColorRamp with enough stops to fake one is not.
+///
+/// `input` is read as a scalar (a layer's Oklch L), scaled by `frequency`,
+/// shifted by `phase`, and shaped. The output drives L with C = 0, the
+/// same as grayscale [`Noise`].
+///
+/// **Outside the noise op-order contract.** [`WaveShape::Sine`] is
+/// transcendental, so the CPU and GPU implementations agree to within one
+/// sRGB step rather than bit-exactly, and the parity test asserts the
+/// looser bound rather than pretending otherwise.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Wave {
+    /// Scalar to run the wave over. A `Const` makes the whole layer one
+    /// flat value, which is valid and rarely what anybody wants.
+    pub input: ScalarInput,
+    pub shape: WaveShape,
+    /// Cycles per unit of `input`, matching [`Noise::frequency`]'s unit.
+    /// A hand-written shader's `sin(x * k)` counts radians, so it ports as
+    /// `k / 2π` cycles — `sin(x * 18)` is `frequency: 2.8648`.
+    pub frequency: f32,
+    /// Offset in cycles: `0.25` is a quarter turn, `1.0` is no shift at
+    /// all. In cycles rather than radians so the UI never shows a π.
+    pub phase: f32,
+    /// `Signed` is `[-1, 1]`, which composes with `Mix::Add`; `Unsigned`
+    /// is `[0, 1]`, which is what bands want.
+    pub range: NoiseRange,
+}
+
+impl Default for Wave {
+    fn default() -> Self {
+        Self {
+            input: ScalarInput::Const(0.5),
+            shape: WaveShape::Sine,
+            frequency: 4.0,
+            phase: 0.0,
+            range: NoiseRange::Unsigned,
+        }
+    }
+}
+
+/// Waveform shape. Every one is described over the phase `t ∈ [0, 1)`
+/// within a cycle and lands in `[-1, 1]` before [`Wave::range`] maps it.
+///
+/// Sine alone covers the known need; the other three came nearly free
+/// once the node existed.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum WaveShape {
+    /// `sin(2πt)`.
+    #[default]
+    Sine,
+    /// Phase-aligned with `Sine`: 0 at `t = 0`, peaking at `t = 0.25`.
+    Triangle,
+    /// `+1` for the first half of the cycle, `-1` for the second — the
+    /// sign of `Sine`.
+    Square,
+    /// A rising ramp from `-1` to `+1` across the cycle, resetting at each
+    /// period. Not phase-aligned with `Sine`; a sawtooth that started
+    /// mid-ramp would be the surprising one.
+    Sawtooth,
 }
 
 /// Per-pixel winner-take-all between two color layers. Whichever pixel

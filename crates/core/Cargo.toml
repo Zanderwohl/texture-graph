@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["std-fs"]
+# Filesystem helpers (`load_from_path` / `save_to_path`). Off for a wasm
+# consumer: `std::fs` compiles for `wasm32-unknown-unknown` but every call
+# fails at runtime, so a wasm host wants the string helpers and a compile
+# error if it reaches for a path by mistake.
+std-fs = []
+
 [dependencies]
 palette.workspace = true
 serde.workspace = true

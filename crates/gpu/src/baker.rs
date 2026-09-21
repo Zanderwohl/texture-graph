@@ -13,15 +13,18 @@ use std::collections::{HashMap, HashSet};
 
 use bytemuck::{Pod, Zeroable};
 use texture_graph_core::{
-    Axis, BlendMode, BlendSpace, ColorInput, ColorRamp, CoordMode, Criterion, EvalCtx, Graph,
-    HeightToNormal, LayerId, LayerKind, MinMax, MinMaxMode, Mix, Noise, NoiseDims, NoiseOutput,
-    NoiseRange, RadialDim, ScalarInput, Transform,
+    Axis, BlendMode, BlendSpace, ColorInput, ColorRamp, CoordMode, Criterion, EvalCtx,
+    FractalMode, Graph, HeightToNormal, LayerId, LayerKind, MinMax, MinMaxMode, Mix, Noise,
+    NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, RadialDim, ScalarInput, Transform,
+    Warp, WarpMode, Wave, WaveShape,
 };
 
 use texture_graph_core::EdgeMode;
 
 use crate::device::DeviceCtx;
-use crate::schedule::{Domain, OutputSlots, ScalarSlot, Schedule, schedule, schedule_previews};
+use crate::schedule::{
+    Domain, OutputSlots, ScalarSlot, Schedule, schedule, schedule_layer, schedule_previews,
+};
 
 /// Max stops per ColorRamp supported by the GPU baker.
 const MAX_RAMP_STOPS: usize = 16;
@@ -47,6 +50,52 @@ pub struct VolumeOutput {
     pub normal: wgpu::Texture,
     /// (width, height, depth) in texels.
     pub size: (u32, u32, u32),
+}
+
+/// Texel format for a single-channel bake.
+///
+/// All three are renderable in core WebGPU, which is why `bake_scalar`
+/// goes through a render pass — `R8Unorm` is not a core *storage* format.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum ScalarFormat {
+    /// One byte a texel, clamped to `[0, 1]` by the format. A quarter the
+    /// memory of `R16Float` and the usual choice for a baked field.
+    R8Unorm,
+    /// Half a float a texel, unclamped, and filterable on WebGPU.
+    R16Float,
+    /// Full precision, unclamped — but **not filterable** on WebGPU
+    /// without the `float32-filterable` feature, so a consumer sampling
+    /// this with a linear sampler gets a validation error. Useful for
+    /// tests and for a host that reads the values back rather than
+    /// sampling them.
+    R32Float,
+}
+
+impl ScalarFormat {
+    pub fn texture_format(self) -> wgpu::TextureFormat {
+        match self {
+            ScalarFormat::R8Unorm => wgpu::TextureFormat::R8Unorm,
+            ScalarFormat::R16Float => wgpu::TextureFormat::R16Float,
+            ScalarFormat::R32Float => wgpu::TextureFormat::R32Float,
+        }
+    }
+
+    pub fn bytes_per_texel(self) -> u32 {
+        match self {
+            ScalarFormat::R8Unorm => 1,
+            ScalarFormat::R16Float => 2,
+            ScalarFormat::R32Float => 4,
+        }
+    }
+}
+
+/// One scalar field over a whole `res × res × depth` volume, `w` at each
+/// slice centre — the volume counterpart of [`Baker::bake_scalar`].
+pub struct ScalarVolume {
+    pub texture: wgpu::Texture,
+    /// (width, height, depth) in texels.
+    pub size: (u32, u32, u32),
+    pub format: ScalarFormat,
 }
 
 #[derive(Debug)]
@@ -98,6 +147,10 @@ pub struct Baker {
     dummy_input: wgpu::Texture,
     dummy_input_view: wgpu::TextureView,
     h2n_pipeline: wgpu::ComputePipeline,
+    // wave reuses `transform_bgl` too — uniform + storage_out + input_2d.
+    wave_pipeline: wgpu::ComputePipeline,
+    // warp reuses `map_bgl` — uniform + storage_out + 2 input textures.
+    warp_pipeline: wgpu::ComputePipeline,
     // h2n reuses `transform_bgl` — same binding shape (uniform + storage_out + input_2d).
     // missing reuses `color_bgl`: same binding shape (uniform + storage_texture).
     missing_pipeline: wgpu::ComputePipeline,
@@ -109,6 +162,12 @@ pub struct Baker {
     pack_bgl: wgpu::BindGroupLayout,
     solid_pipeline: wgpu::ComputePipeline,
     solid_bgl: wgpu::BindGroupLayout,
+    /// One render pipeline per scalar format — a pipeline is bound to its
+    /// colour-target format, so they cannot share. Built on first use
+    /// rather than up front, because most sessions never bake a scalar.
+    scalar_shader: wgpu::ShaderModule,
+    scalar_bgl: wgpu::BindGroupLayout,
+    scalar_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
 }
 
 impl Baker {
@@ -121,6 +180,8 @@ impl Baker {
         let min_max_pipeline = make_min_max_pipeline(&ctx.device, &map_bgl);
         let (ramp_pipeline, ramp_bgl) = make_ramp_pipeline(&ctx.device);
         let h2n_pipeline = make_h2n_pipeline(&ctx.device, &transform_bgl);
+        let wave_pipeline = make_wave_pipeline(&ctx.device, &transform_bgl);
+        let warp_pipeline = make_warp_pipeline(&ctx.device, &map_bgl);
         let dummy_input = ctx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("tg-dummy-input"),
             size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
@@ -137,6 +198,7 @@ impl Baker {
         let missing_pipeline = make_missing_pipeline(&ctx.device, &color_bgl);
         let (pack_pipeline, pack_bgl) = make_pack_pipeline(&ctx.device);
         let (solid_pipeline, solid_bgl) = make_solid_pipeline(&ctx.device);
+        let (scalar_shader, scalar_bgl) = make_scalar_pack_shader(&ctx.device);
         Self {
             ctx,
             pool: Vec::new(),
@@ -160,10 +222,15 @@ impl Baker {
             dummy_input,
             dummy_input_view,
             h2n_pipeline,
+            wave_pipeline,
+            warp_pipeline,
             pack_pipeline,
             pack_bgl,
             solid_pipeline,
             solid_bgl,
+            scalar_shader,
+            scalar_bgl,
+            scalar_pipelines: HashMap::new(),
         }
     }
 
@@ -190,7 +257,8 @@ impl Baker {
         wanted: Option<&HashSet<LayerId>>,
     ) -> Result<HashMap<LayerId, wgpu::Texture>, BakeError> {
         const PREVIEW_SIZE: (u32, u32) = (128, 128);
-        let sched = schedule_previews(graph, wanted)?;
+        let eval_ctx = &graph.resolve_params(eval_ctx);
+        let sched = schedule_previews(graph, wanted, eval_ctx)?;
         let size = PREVIEW_SIZE;
         let device = self.ctx.device.clone();
 
@@ -371,11 +439,12 @@ impl Baker {
             }
             LayerKind::Mix(m) => {
                 let a_view = resolve(m.a);
-                let (factor_view, dom_factor) = match m.factor {
-                    ScalarInput::Layer(id) => (resolve(Some(id)), dom_opt(Some(id))),
+                let (factor_view, dom_factor) = match &m.factor {
+                    ScalarInput::Layer(id) => (resolve(Some(*id)), dom_opt(Some(*id))),
                     // Bind `a` as a placeholder for the factor texture; the
-                    // shader only samples it when factor_is_layer == 1.
-                    ScalarInput::Const(_) => (a_view, dom_opt(m.a)),
+                    // shader only samples it when factor_is_layer == 1. A
+                    // parameter is a number by now, so it takes this path.
+                    ScalarInput::Const(_) | ScalarInput::Param(_) => (a_view, dom_opt(m.a)),
                 };
                 dispatch_mix(
                     &self.ctx,
@@ -387,6 +456,7 @@ impl Baker {
                     resolve(m.b),
                     factor_view,
                     m,
+                    eval_ctx,
                     size,
                     own_dom,
                     dom_opt(m.a),
@@ -439,6 +509,46 @@ impl Baker {
                     dom_opt(h.source),
                 );
             }
+            LayerKind::Warp(wp) => {
+                dispatch_warp(
+                    &self.ctx,
+                    encoder,
+                    &self.warp_pipeline,
+                    &self.map_bgl,
+                    &pool_views[dst_slot],
+                    resolve(wp.source),
+                    resolve(wp.by),
+                    wp,
+                    size,
+                    own_dom,
+                    dom_opt(wp.source),
+                    dom_opt(wp.by),
+                );
+            }
+            LayerKind::Wave(wv) => {
+                // A const input never reads the texture; bind the output's
+                // own domain's placeholder rather than leave the slot
+                // unbound, as Mix does for its factor.
+                let (src_view, dom_input) = match &wv.input {
+                    ScalarInput::Layer(id) => (resolve(Some(*id)), dom_opt(Some(*id))),
+                    ScalarInput::Const(_) | ScalarInput::Param(_) => {
+                        (missing_view, Domain::UNIT.packed())
+                    }
+                };
+                dispatch_wave(
+                    &self.ctx,
+                    encoder,
+                    &self.wave_pipeline,
+                    &self.transform_bgl,
+                    &pool_views[dst_slot],
+                    src_view,
+                    wv,
+                    eval_ctx,
+                    size,
+                    own_dom,
+                    dom_input,
+                );
+            }
             LayerKind::ColorRamp(r) => {
                 if r.stops.len() > MAX_RAMP_STOPS {
                     return Err(BakeError::Unsupported("ColorRamp (>16 stops)"));
@@ -450,6 +560,7 @@ impl Baker {
                     &self.ramp_bgl,
                     &pool_views[dst_slot],
                     r,
+                    eval_ctx,
                     sched,
                     pool_views,
                     &self.dummy_input_view,
@@ -509,11 +620,15 @@ impl Baker {
         &mut self,
         graph: &Graph,
         size: (u32, u32),
-        _ctx: &EvalCtx,
+        eval_ctx: &EvalCtx,
         object_alpha: bool,
     ) -> Result<BakeOutput, BakeError> {
-        let t0 = std::time::Instant::now();
-        let sched = schedule(graph)?;
+        let t0 = BakeTimer::start();
+        // Bind the graph's named parameters once, here: from this point on
+        // a `Param` socket is the same number a `Const` one would be, and
+        // no shader has to know the difference.
+        let eval_ctx = &graph.resolve_params(eval_ctx);
+        let sched = schedule(graph, eval_ctx)?;
         self.ensure_pool(size, sched.peak_slots.max(1));
 
         let mut encoder = self
@@ -536,7 +651,7 @@ impl Baker {
             self.dispatch_kind(
                 &mut encoder,
                 layer,
-                _ctx,
+                eval_ctx,
                 &sched,
                 &self.pool_views,
                 size,
@@ -555,14 +670,12 @@ impl Baker {
             }
         };
         let color_dom = chan_dom(graph.output.color);
-        let rough_dom = match graph.output.roughness {
-            ScalarInput::Layer(id) => chan_dom(Some(id)),
-            ScalarInput::Const(_) => Domain::UNIT.packed(),
+        let scalar_chan_dom = |si: &ScalarInput| match si {
+            ScalarInput::Layer(id) => chan_dom(Some(*id)),
+            _ => Domain::UNIT.packed(),
         };
-        let metal_dom = match graph.output.metallic {
-            ScalarInput::Layer(id) => chan_dom(Some(id)),
-            ScalarInput::Const(_) => Domain::UNIT.packed(),
-        };
+        let rough_dom = scalar_chan_dom(&graph.output.roughness);
+        let metal_dom = scalar_chan_dom(&graph.output.metallic);
         let normal_dom = chan_dom(graph.output.normal);
         let color = make_output_texture(&self.ctx.device, size, "tg-color");
         let roughness = make_output_texture(&self.ctx.device, size, "tg-rough");
@@ -653,6 +766,187 @@ impl Baker {
         Ok(BakeOutput { color, roughness, metallic, normal, size })
     }
 
+    /// Bake one layer's scalar (its Oklch L) to a single-channel texture.
+    ///
+    /// The point is arithmetic, not taste: a consumer that wants one
+    /// grayscale field out of [`Baker::bake_output`] pays for four
+    /// `Rgba8Unorm` channels and four pack passes to throw three away.
+    /// At 256³ that is the difference between 268 MB and 16 MB.
+    ///
+    /// Only `layer` and what it transitively reads are dispatched — the
+    /// graph's Output is not consulted, so a graph can carry several
+    /// fields side by side and a consumer can bake each one on its own.
+    ///
+    /// The texel is the raw scalar, not a display-encoded gray. `R8Unorm`
+    /// clamps to `[0, 1]` as the format requires; the float formats keep
+    /// the value unclamped, so a signed field survives.
+    ///
+    /// The returned texture carries `TEXTURE_BINDING | COPY_SRC`, so a
+    /// consumer sharing this device can sample it directly and skip
+    /// readback entirely — which is the fast path, and the reason this
+    /// returns a texture rather than an image.
+    pub fn bake_scalar(
+        &mut self,
+        graph: &Graph,
+        layer: LayerId,
+        size: (u32, u32),
+        format: ScalarFormat,
+        eval_ctx: &EvalCtx,
+    ) -> Result<wgpu::Texture, BakeError> {
+        let eval_ctx = &graph.resolve_params(eval_ctx);
+        let sched = schedule_layer(graph, layer)?;
+        self.ensure_pool(size, sched.peak_slots.max(1));
+
+        let device = self.ctx.device.clone();
+        let dst = make_scalar_texture(&device, size, format, "tg-scalar");
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("tg-bake-scalar"),
+        });
+        self.record_scalar_slice(
+            &mut encoder,
+            graph,
+            &sched,
+            layer,
+            size,
+            texture_graph_core::FLAT_W,
+            format,
+            &dst.create_view(&wgpu::TextureViewDescriptor::default()),
+            eval_ctx,
+        )?;
+        self.ctx.queue.submit([encoder.finish()]);
+        Ok(dst)
+    }
+
+    /// [`Baker::bake_scalar`] over a volume: `res × res × depth` sampled at
+    /// slice centres, exactly as [`Baker::bake_volume`] does, and with the
+    /// same known limitation — a Transform's w offset/scale cannot
+    /// re-sample its input at a different w, because each slice only has
+    /// its inputs baked at that slice's w.
+    ///
+    /// One encoder and submit per slice, for the reason `bake_volume`
+    /// gives: recording every slice into one encoder blows wgpu-metal's
+    /// outstanding-command-buffer cap on a real graph.
+    pub fn bake_scalar_volume(
+        &mut self,
+        graph: &Graph,
+        layer: LayerId,
+        res: u32,
+        depth: u32,
+        format: ScalarFormat,
+        eval_ctx: &EvalCtx,
+    ) -> Result<ScalarVolume, BakeError> {
+        let t0 = BakeTimer::start();
+        let eval_ctx = &graph.resolve_params(eval_ctx);
+        let sched = schedule_layer(graph, layer)?;
+        let size = (res, res);
+        self.ensure_pool(size, sched.peak_slots.max(1));
+
+        let device = self.ctx.device.clone();
+        // One reusable 2D slice target, copied into the volume per slice —
+        // a 2D view of a 3D texture is not a thing WebGPU offers.
+        let slice = make_scalar_texture(&device, size, format, "tg-scalar-vol-slice");
+        let slice_view = slice.create_view(&wgpu::TextureViewDescriptor::default());
+        let texture = make_scalar_volume_texture(&device, res, depth, format, "tg-scalar-vol");
+
+        for z in 0..depth {
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("tg-bake-scalar-volume"),
+                });
+            let w = (z as f32 + 0.5) / depth as f32;
+            self.record_scalar_slice(
+                &mut encoder, graph, &sched, layer, size, w, format, &slice_view, eval_ctx,
+            )?;
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &slice,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d { width: res, height: res, depth_or_array_layers: 1 },
+            );
+            self.ctx.queue.submit([encoder.finish()]);
+        }
+
+        log::debug!(
+            "bake_scalar_volume {res}³ (depth={depth}, {format:?}): layers/slice={} \
+             record+submit={:?}",
+            sched.order.len(),
+            t0.elapsed(),
+        );
+        Ok(ScalarVolume { texture, size: (res, res, depth), format })
+    }
+
+    /// Dispatch every layer for one `w` slice, then pack `layer`'s slot
+    /// into `dst_view`. Shared by the flat and volume scalar bakes.
+    #[allow(clippy::too_many_arguments)]
+    fn record_scalar_slice(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        graph: &Graph,
+        sched: &Schedule,
+        layer: LayerId,
+        size: (u32, u32),
+        w: f32,
+        format: ScalarFormat,
+        dst_view: &wgpu::TextureView,
+        eval_ctx: &EvalCtx,
+    ) -> Result<(), BakeError> {
+        let missing_view = self.missing_view.clone().expect("ensure_pool made one");
+        dispatch_missing(
+            &self.ctx, encoder, &self.missing_pipeline, &self.color_bgl,
+            &missing_view, size, w,
+        );
+        for &id in &sched.order {
+            let slot = *sched.slot_of.get(&id).unwrap() as usize;
+            let l = graph.get(id).unwrap();
+            self.dispatch_kind(
+                encoder, l, eval_ctx, sched, &self.pool_views, size, slot, w, &missing_view,
+            )?;
+        }
+        let src_slot = *sched
+            .slot_of
+            .get(&layer)
+            .expect("schedule_layer always schedules its root") as usize;
+        let pipeline = self.scalar_pipeline(format);
+        draw_scalar_pack(
+            &self.ctx,
+            encoder,
+            &pipeline,
+            &self.scalar_bgl,
+            &self.pool_views[src_slot],
+            dst_view,
+            size,
+            domain_of(sched, layer),
+        );
+        Ok(())
+    }
+
+    /// The render pipeline for `format`, built on first use. Cloning a
+    /// `RenderPipeline` is an `Arc` bump, which is what lets this hand one
+    /// out without borrowing `self` for the rest of the call.
+    fn scalar_pipeline(&mut self, format: ScalarFormat) -> wgpu::RenderPipeline {
+        let tf = format.texture_format();
+        self.scalar_pipelines
+            .entry(tf)
+            .or_insert_with(|| {
+                make_scalar_pack_pipeline(
+                    &self.ctx.device,
+                    &self.scalar_shader,
+                    &self.scalar_bgl,
+                    tf,
+                )
+            })
+            .clone()
+    }
+
     /// Bake the graph as a solid 3D texture: run the whole per-slice 2D
     /// pipeline `depth` times with w advancing through the slice centers,
     /// packing each slice and copying it into layer `z` of four 3D
@@ -670,8 +964,9 @@ impl Baker {
         depth: u32,
         eval_ctx: &EvalCtx,
     ) -> Result<VolumeOutput, BakeError> {
-        let t0 = std::time::Instant::now();
-        let sched = schedule(graph)?;
+        let t0 = BakeTimer::start();
+        let eval_ctx = &graph.resolve_params(eval_ctx);
+        let sched = schedule(graph, eval_ctx)?;
         let size = (res, res);
         self.ensure_pool(size, sched.peak_slots.max(1));
 
@@ -704,13 +999,13 @@ impl Baker {
         };
         let chan_doms: [[f32; 4]; 4] = [
             chan_dom(graph.output.color),
-            match graph.output.roughness {
-                ScalarInput::Layer(id) => chan_dom(Some(id)),
-                ScalarInput::Const(_) => Domain::UNIT.packed(),
+            match &graph.output.roughness {
+                ScalarInput::Layer(id) => chan_dom(Some(*id)),
+                _ => Domain::UNIT.packed(),
             },
-            match graph.output.metallic {
-                ScalarInput::Layer(id) => chan_dom(Some(id)),
-                ScalarInput::Const(_) => Domain::UNIT.packed(),
+            match &graph.output.metallic {
+                ScalarInput::Layer(id) => chan_dom(Some(*id)),
+                _ => Domain::UNIT.packed(),
             },
             chan_dom(graph.output.normal),
         ];
@@ -830,6 +1125,17 @@ struct NoiseParams {
     w_coord: f32,
     /// Bake domain as (min_u, min_v, ext_u, ext_v).
     dom: [f32; 4],
+    /// Lattice period in cells; 0 = unbounded on that axis. `vec3<u32>` in
+    /// the shader, so it has to start 16-byte aligned — which offset 48
+    /// is, and the trailing `_pad` keeps the struct a multiple of 16.
+    period: [u32; 3],
+    octaves: u32,
+    lacunarity: f32,
+    gain: f32,
+    fractal_mode: u32,
+    normalize: u32,
+    kernel: u32,
+    _pad: [u32; 3],
 }
 
 #[repr(C)]
@@ -948,6 +1254,35 @@ struct H2NParams {
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
+struct WarpParams {
+    size: [u32; 2],
+    mode: u32,
+    _pad0: u32,
+    amount: [f32; 4],
+    /// Own bake domain, the source's (already grown by `|amount|` by the
+    /// scheduler), and the displacement field's.
+    dom: [f32; 4],
+    dom_src: [f32; 4],
+    dom_by: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct WaveParams {
+    size: [u32; 2],
+    shape: u32,
+    range: u32,
+    frequency: f32,
+    phase: f32,
+    input_const: f32,
+    input_is_layer: u32,
+    /// Own bake domain, then the input layer's.
+    dom: [f32; 4],
+    dom_input: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
 struct RampStopPacked {
     color: [f32; 4],   // Oklcha; used when kind == 0
     t: f32,
@@ -1025,6 +1360,129 @@ fn dispatch_h2n(
     });
     let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
         label: Some("h2n-cpass"),
+        timestamp_writes: None,
+    });
+    cpass.set_pipeline(pipeline);
+    cpass.set_bind_group(0, &bg, &[]);
+    let (wg_x, wg_y) = workgroup_counts(size);
+    cpass.dispatch_workgroups(wg_x, wg_y, 1);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_warp(
+    ctx: &DeviceCtx,
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::ComputePipeline,
+    bgl: &wgpu::BindGroupLayout,
+    dst_view: &wgpu::TextureView,
+    src_view: &wgpu::TextureView,
+    by_view: &wgpu::TextureView,
+    w: &Warp,
+    size: (u32, u32),
+    dom: [f32; 4],
+    dom_src: [f32; 4],
+    dom_by: [f32; 4],
+) {
+    let params = WarpParams {
+        size: [size.0, size.1],
+        mode: match w.mode {
+            WarpMode::Scalar => 0,
+            WarpMode::Vector => 1,
+        },
+        _pad0: 0,
+        // amount.z rides along for symmetry with the CPU struct; the
+        // shader cannot act on it — see warp.wgsl.
+        amount: [w.amount[0], w.amount[1], w.amount[2], 0.0],
+        dom,
+        dom_src,
+        dom_by,
+    };
+    let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "warp-params");
+    let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("warp-bg"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: ubo.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(dst_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(src_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(by_view),
+            },
+        ],
+    });
+    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("warp-cpass"),
+        timestamp_writes: None,
+    });
+    cpass.set_pipeline(pipeline);
+    cpass.set_bind_group(0, &bg, &[]);
+    let (wg_x, wg_y) = workgroup_counts(size);
+    cpass.dispatch_workgroups(wg_x, wg_y, 1);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_wave(
+    ctx: &DeviceCtx,
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::ComputePipeline,
+    bgl: &wgpu::BindGroupLayout,
+    dst_view: &wgpu::TextureView,
+    src_view: &wgpu::TextureView,
+    w: &Wave,
+    eval_ctx: &EvalCtx,
+    size: (u32, u32),
+    dom: [f32; 4],
+    dom_input: [f32; 4],
+) {
+    let shape = match w.shape {
+        WaveShape::Sine => 0u32,
+        WaveShape::Triangle => 1,
+        WaveShape::Square => 2,
+        WaveShape::Sawtooth => 3,
+    };
+    let (input_const, input_is_layer) = match eval_ctx.scalar_const(&w.input) {
+        Some(v) => (v, 0u32),
+        None => (0.0, 1u32),
+    };
+    let params = WaveParams {
+        size: [size.0, size.1],
+        shape,
+        range: match w.range {
+            NoiseRange::Unsigned => 0,
+            NoiseRange::Signed => 1,
+        },
+        frequency: w.frequency,
+        phase: w.phase,
+        input_const,
+        input_is_layer,
+        dom,
+        dom_input,
+    };
+    let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "wave-params");
+    let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("wave-bg"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: ubo.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(dst_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(src_view),
+            },
+        ],
+    });
+    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("wave-cpass"),
         timestamp_writes: None,
     });
     cpass.set_pipeline(pipeline);
@@ -1117,6 +1575,7 @@ fn dispatch_mix(
     b_view: &wgpu::TextureView,
     factor_view: &wgpu::TextureView,
     m: &Mix,
+    eval_ctx: &EvalCtx,
     size: (u32, u32),
     dom: [f32; 4],
     dom_a: [f32; 4],
@@ -1129,9 +1588,9 @@ fn dispatch_mix(
         BlendMode::Multiply => 2,
         BlendMode::Blend => 3,
     };
-    let (factor_const, factor_is_layer) = match m.factor {
-        ScalarInput::Const(v) => (v, 0u32),
-        ScalarInput::Layer(_) => (0.0, 1u32),
+    let (factor_const, factor_is_layer) = match eval_ctx.scalar_const(&m.factor) {
+        Some(v) => (v, 0u32),
+        None => (0.0, 1u32),
     };
     let params = MixParams {
         size: [size.0, size.1],
@@ -1289,6 +1748,7 @@ fn dispatch_ramp(
     bgl: &wgpu::BindGroupLayout,
     dst_view: &wgpu::TextureView,
     r: &ColorRamp,
+    eval_ctx: &EvalCtx,
     sched: &Schedule,
     pool_views: &[wgpu::TextureView],
     dummy_input_view: &wgpu::TextureView,
@@ -1303,7 +1763,8 @@ fn dispatch_ramp(
     let mut input_pool_slots: Vec<u32> = Vec::new();
     let mut input_doms = [Domain::UNIT.packed(); MAX_RAMP_INPUTS];
     for s in &r.stops {
-        if let ColorInput::Layer(id) = s.color {
+        if let ColorInput::Layer(id) = &s.color {
+            let id = *id;
             if !layer_to_input.contains_key(&id) {
                 if input_pool_slots.len() >= MAX_RAMP_INPUTS {
                     return Err(BakeError::Unsupported(
@@ -1328,17 +1789,23 @@ fn dispatch_ramp(
 
     let mut packed = Vec::with_capacity(r.stops.len());
     for s in &r.stops {
-        match s.color {
-            ColorInput::Const(c) => packed.push(RampStopPacked {
+        // A parameter is a colour by now, so it packs exactly as a
+        // constant does — which is the whole claim that a param costs
+        // nothing per pixel.
+        match eval_ctx.color_const(&s.color) {
+            Some(c) => packed.push(RampStopPacked {
                 color: [c.l, c.chroma, c.hue.into_degrees(), c.alpha],
                 t: s.t,
                 kind: 0,
                 input_index: 0,
                 _p0: 0.0,
             }),
-            ColorInput::Layer(id) => {
+            None => {
+                let ColorInput::Layer(id) = &s.color else {
+                    unreachable!("color_const covers everything but Layer")
+                };
                 let input_index = *layer_to_input
-                    .get(&id)
+                    .get(id)
                     .expect("layer resolved into input map above");
                 packed.push(RampStopPacked {
                     color: [0.0; 4],
@@ -1422,6 +1889,15 @@ fn dispatch_noise(
         NoiseOutput::Grayscale => 0u32,
         NoiseOutput::Color => 1u32,
     };
+    let kernel = match n.kernel {
+        NoiseKernel::Simplex => 0u32,
+        NoiseKernel::Value => 1u32,
+    };
+    let fractal_mode = match n.fractal.mode {
+        FractalMode::Standard => 0u32,
+        FractalMode::Turbulence => 1u32,
+        FractalMode::Ridged => 2u32,
+    };
     let params = NoiseParams {
         size: [size.0, size.1],
         dims,
@@ -1431,6 +1907,16 @@ fn dispatch_noise(
         frequency: n.frequency,
         w_coord: w,
         dom,
+        // `Graph` rejects a period on the simplex kernel, so the shader
+        // never has to decide which of the two the caller meant.
+        period: n.period,
+        octaves: n.fractal.octaves.clamp(1, texture_graph_core::noise::MAX_OCTAVES),
+        lacunarity: n.fractal.lacunarity,
+        gain: n.fractal.gain,
+        fractal_mode,
+        normalize: n.fractal.normalize as u32,
+        kernel,
+        _pad: [0; 3],
     };
     let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "noise-params");
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1694,6 +2180,38 @@ fn dispatch_solid(
     cpass.dispatch_workgroups(wg_x, wg_y, 1);
 }
 
+/// Wall-clock for the bake timing logs.
+///
+/// `std::time::Instant::now()` compiles for `wasm32-unknown-unknown` and
+/// then panics — there is no clock behind it. A consumer baking in the
+/// browser should not lose a texture to a `log::debug!` it never reads, so
+/// the timer is simply absent there and the log says `None`.
+#[derive(Copy, Clone)]
+struct BakeTimer {
+    #[cfg(not(target_arch = "wasm32"))]
+    start: std::time::Instant,
+}
+
+impl BakeTimer {
+    fn start() -> Self {
+        Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            start: std::time::Instant::now(),
+        }
+    }
+
+    fn elapsed(self) -> Option<std::time::Duration> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Some(self.start.elapsed())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            None
+        }
+    }
+}
+
 fn create_uniform(device: &wgpu::Device, bytes: &[u8], label: &str) -> wgpu::Buffer {
     use wgpu::util::DeviceExt;
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1756,6 +2274,190 @@ fn srgb_of_linear_component(x: f32) -> f32 {
     } else {
         1.055 * clamped.powf(1.0 / 2.4) - 0.055
     }
+}
+
+
+// ---- Single-channel pack ----------------------------------------------
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct ScalarPackParams {
+    size: [u32; 2],
+    _pad: [u32; 2],
+    /// Source layer's bake domain (min_u, min_v, ext_u, ext_v).
+    src_dom: [f32; 4],
+}
+
+/// Draw the fullscreen triangle that copies one intermediate's L into
+/// `dst_view`. A render pass, not a dispatch — see `pack_scalar.wgsl`.
+fn draw_scalar_pack(
+    ctx: &DeviceCtx,
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::RenderPipeline,
+    bgl: &wgpu::BindGroupLayout,
+    src_view: &wgpu::TextureView,
+    dst_view: &wgpu::TextureView,
+    size: (u32, u32),
+    src_dom: [f32; 4],
+) {
+    let params = ScalarPackParams { size: [size.0, size.1], _pad: [0; 2], src_dom };
+    let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "scalar-pack-params");
+    let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("scalar-pack-bg"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: ubo.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(src_view),
+            },
+        ],
+    });
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("scalar-pack-pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: dst_view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                // The triangle covers every pixel, so the clear is only
+                // there to satisfy the load op.
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, &bg, &[]);
+    pass.draw(0..3, 0..1);
+}
+
+fn make_scalar_texture(
+    device: &wgpu::Device,
+    size: (u32, u32),
+    format: ScalarFormat,
+    label: &str,
+) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: format.texture_format(),
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    })
+}
+
+fn make_scalar_volume_texture(
+    device: &wgpu::Device,
+    res: u32,
+    depth: u32,
+    format: ScalarFormat,
+    label: &str,
+) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: res,
+            height: res,
+            depth_or_array_layers: depth,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: format.texture_format(),
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    })
+}
+
+/// The shader module and bind-group layout every scalar-pack pipeline
+/// shares; only the colour-target format differs between them.
+fn make_scalar_pack_shader(
+    device: &wgpu::Device,
+) -> (wgpu::ShaderModule, wgpu::BindGroupLayout) {
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("scalar-pack-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+        ],
+    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("scalar-pack-shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/pack_scalar.wgsl").into()),
+    });
+    (shader, bgl)
+}
+
+fn make_scalar_pack_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    bgl: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("scalar-pack-pl"),
+        bind_group_layouts: &[Some(bgl)],
+        ..Default::default()
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("scalar-pack-pipeline"),
+        layout: Some(&pl),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 // ---- Pipeline factories ------------------------------------------------
@@ -1854,6 +2556,52 @@ fn make_h2n_pipeline(
     });
     device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("h2n-pipeline"),
+        layout: Some(&pl),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    })
+}
+
+fn make_warp_pipeline(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+) -> wgpu::ComputePipeline {
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("warp-pl"),
+        bind_group_layouts: &[Some(bgl)],
+        ..Default::default()
+    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("warp-shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/warp.wgsl").into()),
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("warp-pipeline"),
+        layout: Some(&pl),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    })
+}
+
+fn make_wave_pipeline(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+) -> wgpu::ComputePipeline {
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("wave-pl"),
+        bind_group_layouts: &[Some(bgl)],
+        ..Default::default()
+    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("wave-shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/wave.wgsl").into()),
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("wave-pipeline"),
         layout: Some(&pl),
         module: &shader,
         entry_point: Some("main"),

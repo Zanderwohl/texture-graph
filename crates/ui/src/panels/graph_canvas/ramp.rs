@@ -86,12 +86,20 @@ fn nearest_gap_mid(stops: &[ColorStop], t: f32) -> Option<f32> {
         .min_by(|a, b| (a - t).abs().total_cmp(&(b - t).abs()))
 }
 
-/// Display color of one stop: a `Const` passes through; a wired stop
-/// evaluates its source once at the stop's own position along the ramp.
+/// Display color of one stop: a `Const` passes through, a parameter shows
+/// whatever it is bound to, and a wired stop evaluates its source once at
+/// the stop's own position along the ramp.
 pub fn stop_display_color(graph: &Graph, stop: &ColorStop, ctx: &EvalCtx) -> Color {
-    match stop.color {
-        ColorInput::Const(c) => c,
-        ColorInput::Layer(id) => evaluate(graph, id, Sample::uv(stop.t, 0.5), ctx),
+    match &stop.color {
+        ColorInput::Const(c) => *c,
+        ColorInput::Layer(id) => evaluate(graph, *id, Sample::uv(stop.t, 0.5), ctx),
+        ColorInput::Param(name) => graph
+            .param_value(name, ctx)
+            .and_then(|v| v.as_color())
+            // Undeclared: the graph mutators reject that, so this is a
+            // hand-built file. Show the missing-texture magenta rather
+            // than a plausible gray.
+            .unwrap_or_else(|| texture_graph_core::color::oklcha(0.7017, 0.3223, 328.36, 1.0)),
     }
 }
 

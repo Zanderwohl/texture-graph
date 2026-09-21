@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use texture_graph_core::{
     Axis, BlendMode, BlendSpace, Color, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion,
-    EvalCtx, Graph, InputKey, LayerId, LayerKind, MinMaxMode, NoiseDims, NoiseOutput,
-    NoiseRange, RadialDim, ScalarInput,
+    EvalCtx, Graph, InputKey, LayerId, LayerKind, MinMaxMode, NoiseKernel, RadialDim,
+    ParamUse, ScalarInput, noise::MAX_OCTAVES,
 };
 
 use crate::app::GpuBits;
@@ -18,6 +18,9 @@ use crate::state::{
     EditCmd, NodeDrag, NodeRef, RampDrag, RampMenu, Renaming, UiState, WireDrag,
 };
 use crate::widgets::enum_combo::enum_combo;
+use texture_graph_core::color::oklcha;
+
+use crate::widgets::{node_labels, param_ref};
 
 use super::layout::{socket_label, NodeLayout, ParamRow, Row};
 use super::ramp;
@@ -463,7 +466,9 @@ fn layer_rows(
             }
             Row::Socket(key) => {
                 let mut r = row_ui(ui, *rect, z, canvas_rect, style, (layout.node, i));
-                changed |= socket_row(&mut r, &mut kind, key, state, layout.node);
+                changed |= socket_row(
+                    &mut r, graph, eval_ctx, &mut kind, key, state, layout.node,
+                );
             }
             Row::Param(p) => {
                 let mut r = row_ui(ui, *rect, z, canvas_rect, style, (layout.node, i));
@@ -479,16 +484,25 @@ fn layer_rows(
 // ---- Ramp stops ---------------------------------------------------------
 
 /// What a stop's right-click menu asked for.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum StopAction {
     Duplicate,
     Delete,
+    /// Read a declared color parameter instead of a constant.
+    BindParam(String),
+    /// Stop reading one, freezing the stop at what it currently shows.
+    Unbind,
 }
 
 /// The items themselves, for whichever menu is showing them. Delete greys
 /// out at the two-stop floor rather than vanishing, so the menu keeps its
 /// shape.
-fn stop_menu_items(ui: &mut egui::Ui, can_delete: bool) -> Option<StopAction> {
+fn stop_menu_items(
+    ui: &mut egui::Ui,
+    can_delete: bool,
+    graph: &Graph,
+    bound: bool,
+) -> Option<StopAction> {
     let mut action = None;
     if ui.button("Duplicate").clicked() {
         action = Some(StopAction::Duplicate);
@@ -501,15 +515,40 @@ fn stop_menu_items(ui: &mut egui::Ui, can_delete: bool) -> Option<StopAction> {
         action = Some(StopAction::Delete);
         ui.close();
     }
+    // A stop is the one ColorInput in the editor, so this menu is where
+    // a palette gets parameterised.
+    if bound {
+        if ui.button("Unbind parameter").clicked() {
+            action = Some(StopAction::Unbind);
+            ui.close();
+        }
+    } else {
+        let mut any = false;
+        for name in param_ref::usable(graph, ParamUse::Color) {
+            any = true;
+            if ui.button(format!("Read “{name}”")).clicked() {
+                action = Some(StopAction::BindParam(name.to_string()));
+                ui.close();
+            }
+        }
+        if !any {
+            ui.add_enabled(false, egui::Button::new("No color parameters"));
+        }
+    }
     action
 }
 
 /// The row's menu, hung on its number, its swatch or the bare stretch
 /// beside them.
-fn stop_menu(resp: &egui::Response, can_delete: bool) -> Option<StopAction> {
+fn stop_menu(
+    resp: &egui::Response,
+    can_delete: bool,
+    graph: &Graph,
+    bound: bool,
+) -> Option<StopAction> {
     let mut action = None;
     resp.context_menu(|ui| {
-        action = stop_menu_items(ui, can_delete);
+        action = stop_menu_items(ui, can_delete, graph, bound);
     });
     action
 }
@@ -522,10 +561,28 @@ fn apply_stop_action(
     action: StopAction,
     state: &mut UiState,
     node: NodeRef,
+    graph: &Graph,
+    eval_ctx: &EvalCtx,
 ) -> bool {
     match action {
+        StopAction::BindParam(name) => {
+            let Some(stop) = r.stops.get_mut(i) else { return false };
+            stop.color = ColorInput::Param(name);
+            true
+        }
+        StopAction::Unbind => {
+            let Some(stop) = r.stops.get_mut(i) else { return false };
+            let ColorInput::Param(name) = &stop.color else { return false };
+            // Freeze at what it shows, so unbinding is not also a repaint.
+            let frozen = graph
+                .param_value(name, eval_ctx)
+                .and_then(|v| v.as_color())
+                .unwrap_or_else(|| oklcha(0.5, 0.0, 0.0, 1.0));
+            stop.color = ColorInput::Const(frozen);
+            true
+        }
         StopAction::Duplicate => {
-            let Some(src) = r.stops.get(i).copied() else {
+            let Some(src) = r.stops.get(i).cloned() else {
                 return false;
             };
             let t = ramp::duplicate_t(&r.stops, i);
@@ -821,9 +878,20 @@ fn ramp_bar(
         egui::Popup::menu(&resp)
             .open_memory(open)
             .at_pointer_fixed()
-            .show(|ui| action = stop_menu_items(ui, ramp.stops.len() > 2));
+            .show(|ui| {
+                action = stop_menu_items(
+                    ui,
+                    ramp.stops.len() > 2,
+                    graph,
+                    ramp.stops
+                        .get(menu.stop)
+                        .is_some_and(|s| matches!(s.color, ColorInput::Param(_))),
+                )
+            });
         if let Some(a) = action {
-            changed |= apply_stop_action(ramp, menu.stop, a, state, NodeRef::Layer(id));
+            changed |= apply_stop_action(
+                ramp, menu.stop, a, state, NodeRef::Layer(id), graph, eval_ctx,
+            );
             // Both actions move the indices, and the menu closed on the
             // click, so don't leave it naming whatever slid into that slot.
             state.ramp_menu = None;
@@ -847,8 +915,11 @@ fn ramp_bar(
 }
 
 /// Label plus the const widget, if unconnected and the type has one.
+#[allow(clippy::too_many_arguments)]
 fn socket_row(
     ui: &mut egui::Ui,
+    graph: &Graph,
+    eval_ctx: &EvalCtx,
     kind: &mut LayerKind,
     key: InputKey,
     state: &mut UiState,
@@ -858,12 +929,32 @@ fn socket_row(
     match (&mut *kind, key) {
         (LayerKind::Mix(m), InputKey::MixFactor) => {
             ui.label(socket_label(key));
-            if let ScalarInput::Const(v) = &mut m.factor {
-                changed |= ui.add(egui::Slider::new(v, 0.0..=1.0)).changed();
-            }
+            changed |= param_ref::scalar_socket(
+                ui,
+                graph,
+                eval_ctx,
+                ("mix-factor", node),
+                &mut m.factor,
+                |ui, v| ui.add(egui::Slider::new(v, 0.0..=1.0)),
+            );
+        }
+        (LayerKind::Wave(w), InputKey::WaveInput) => {
+            ui.label(socket_label(key));
+            changed |= param_ref::scalar_socket(
+                ui,
+                graph,
+                eval_ctx,
+                ("wave-input", node),
+                &mut w.input,
+                |ui, v| ui.add(egui::DragValue::new(v).speed(0.01)),
+            );
         }
         (LayerKind::ColorRamp(r), InputKey::RampStop(i)) => {
             let can_delete = r.stops.len() > 2;
+            let bound = r
+                .stops
+                .get(i)
+                .is_some_and(|s| matches!(s.color, ColorInput::Param(_)));
             // egui doesn't bubble a secondary click from a child to its
             // parent, so the row's widgets carry the menu themselves and this
             // covers what they leave bare. Registered first, so they keep
@@ -875,19 +966,38 @@ fn socket_row(
                     egui::Sense::click(),
                 ),
                 can_delete,
+                graph,
+                bound,
             );
             if let Some(stop) = r.stops.get_mut(i) {
                 let t = crate::widgets::ramp_stop::stop_t(ui, &mut stop.t);
                 changed |= t.changed();
-                action = action.or_else(|| stop_menu(&t, can_delete));
-                if let ColorInput::Const(c) = &mut stop.color {
-                    let swatch = color_swatch(ui, c);
-                    changed |= swatch.changed();
-                    action = action.or_else(|| stop_menu(&swatch, can_delete));
+                action = action.or_else(|| stop_menu(&t, can_delete, graph, bound));
+                match &mut stop.color {
+                    ColorInput::Const(c) => {
+                        let swatch = color_swatch(ui, c);
+                        changed |= swatch.changed();
+                        action = action.or_else(|| stop_menu(&swatch, can_delete, graph, bound));
+                    }
+                    ColorInput::Param(name) => {
+                        // Read-only: the value belongs to the parameter,
+                        // and the panel on the left is where it is edited.
+                        let shown = graph
+                            .param_value(name, eval_ctx)
+                            .and_then(|v| v.as_color())
+                            .unwrap_or_else(|| oklcha(0.7017, 0.3223, 328.36, 1.0));
+                        let mut shown = shown;
+                        let swatch = color_swatch(ui, &mut shown);
+                        let label = ui.label(egui::RichText::new(name.as_str()).small());
+                        action = action
+                            .or_else(|| stop_menu(&swatch, can_delete, graph, bound))
+                            .or_else(|| stop_menu(&label, can_delete, graph, bound));
+                    }
+                    ColorInput::Layer(_) => {}
                 }
             }
             if let Some(a) = action {
-                changed |= apply_stop_action(r, i, a, state, node);
+                changed |= apply_stop_action(r, i, a, state, node, graph, eval_ctx);
             }
         }
         _ => {
@@ -904,39 +1014,32 @@ fn param_row(ui: &mut egui::Ui, id: LayerId, kind: &mut LayerKind, p: ParamRow) 
             ui.label("color");
             color_swatch(ui, c).changed()
         }
+        (LayerKind::Noise(n), ParamRow::NoiseKernel) => {
+            noise_kernel_combo(ui, salt("kernel"), n)
+        }
         (LayerKind::Noise(n), ParamRow::NoiseDims) => enum_combo(
             ui,
             salt("dims"),
             "dims",
             &mut n.dims,
-            &[NoiseDims::D1, NoiseDims::D2, NoiseDims::D3],
-            |d| match d {
-                NoiseDims::D1 => "1D",
-                NoiseDims::D2 => "2D",
-                NoiseDims::D3 => "3D",
-            },
+            node_labels::DIMS,
+            node_labels::dims,
         ),
         (LayerKind::Noise(n), ParamRow::NoiseOutput) => enum_combo(
             ui,
             salt("output"),
             "output",
             &mut n.output,
-            &[NoiseOutput::Grayscale, NoiseOutput::Color],
-            |o| match o {
-                NoiseOutput::Grayscale => "grayscale",
-                NoiseOutput::Color => "color (LCh)",
-            },
+            node_labels::OUTPUTS,
+            node_labels::output,
         ),
         (LayerKind::Noise(n), ParamRow::NoiseRange) => enum_combo(
             ui,
             salt("range"),
             "range",
             &mut n.range,
-            &[NoiseRange::Unsigned, NoiseRange::Signed],
-            |r| match r {
-                NoiseRange::Unsigned => "[0, 1]",
-                NoiseRange::Signed => "[-1, 1]",
-            },
+            node_labels::RANGES,
+            node_labels::range,
         ),
         (LayerKind::Noise(n), ParamRow::NoiseFrequency) => {
             ui.label("freq");
@@ -947,6 +1050,69 @@ fn param_row(ui: &mut egui::Ui, id: LayerId, kind: &mut LayerKind, p: ParamRow) 
             ui.label("seed");
             ui.add(egui::DragValue::new(&mut n.seed_offset)).changed()
         }
+        (LayerKind::Noise(n), ParamRow::NoisePeriod) => noise_period_row(ui, n),
+        (LayerKind::Noise(n), ParamRow::NoiseOctaves) => {
+            ui.label("octaves");
+            ui.add(egui::Slider::new(&mut n.fractal.octaves, 1..=MAX_OCTAVES))
+                .changed()
+        }
+        (LayerKind::Noise(n), ParamRow::NoiseFractalMode) => enum_combo(
+            ui,
+            salt("fractal-mode"),
+            "fbm",
+            &mut n.fractal.mode,
+            node_labels::FRACTAL_MODES,
+            node_labels::fractal_mode,
+        ),
+        (LayerKind::Noise(n), ParamRow::NoiseLacunarity) => {
+            ui.label("lacunarity");
+            ui.add(egui::Slider::new(&mut n.fractal.lacunarity, 1.0..=4.0))
+                .changed()
+        }
+        (LayerKind::Noise(n), ParamRow::NoiseGain) => {
+            ui.label("gain");
+            ui.add(egui::Slider::new(&mut n.fractal.gain, 0.0..=1.0)).changed()
+        }
+        (LayerKind::Noise(n), ParamRow::NoiseNormalize) => {
+            ui.label("normalize");
+            ui.checkbox(&mut n.fractal.normalize, "").changed()
+        }
+        (LayerKind::Warp(w), ParamRow::WarpMode) => enum_combo(
+            ui,
+            salt("warp-mode"),
+            "mode",
+            &mut w.mode,
+            node_labels::WARP_MODES,
+            node_labels::warp_mode,
+        ),
+        (LayerKind::Warp(w), ParamRow::WarpAmount) => {
+            vec3_row(ui, "amount", &mut w.amount, 0.005)
+        }
+        (LayerKind::Wave(w), ParamRow::WaveShape) => enum_combo(
+            ui,
+            salt("wave-shape"),
+            "shape",
+            &mut w.shape,
+            node_labels::SHAPES,
+            node_labels::shape,
+        ),
+        (LayerKind::Wave(w), ParamRow::WaveFrequency) => {
+            ui.label("freq");
+            ui.add(egui::Slider::new(&mut w.frequency, 0.1..=64.0).logarithmic(true))
+                .changed()
+        }
+        (LayerKind::Wave(w), ParamRow::WavePhase) => {
+            ui.label("phase");
+            ui.add(egui::Slider::new(&mut w.phase, 0.0..=1.0)).changed()
+        }
+        (LayerKind::Wave(w), ParamRow::WaveRange) => enum_combo(
+            ui,
+            salt("wave-range"),
+            "range",
+            &mut w.range,
+            node_labels::RANGES,
+            node_labels::range,
+        ),
         (LayerKind::ColorRamp(r), ParamRow::RampSpace) => {
             blend_space_combo(ui, salt("space"), &mut r.space)
         }
@@ -1108,6 +1274,42 @@ fn blend_space_combo(
             BlendSpace::Hsv => "Hsv",
         },
     )
+}
+
+/// Kernel picker. Moving off the value kernel clears the period rather
+/// than leaving one that `Graph::set_kind` would reject — the edit the user
+/// made is the kernel, and an error toast about a field they cannot see on
+/// simplex would be no help.
+fn noise_kernel_combo(
+    ui: &mut egui::Ui,
+    salt: (&'static str, u64, &'static str),
+    n: &mut texture_graph_core::Noise,
+) -> bool {
+    let changed = enum_combo(
+        ui,
+        salt,
+        "kernel",
+        &mut n.kernel,
+        node_labels::KERNELS,
+        node_labels::kernel,
+    );
+    if changed && n.kernel == NoiseKernel::Simplex {
+        n.period = [0; 3];
+    }
+    changed
+}
+
+/// Per-axis lattice period, `0` meaning "does not repeat on this axis".
+/// Hovering says what the current pair actually repeats at, because
+/// `period / frequency` is the number that matters and neither field is it.
+fn noise_period_row(ui: &mut egui::Ui, n: &mut texture_graph_core::Noise) -> bool {
+    let mut changed = false;
+    ui.label("period")
+        .on_hover_text(node_labels::period_hint(n.frequency, n.period));
+    for p in n.period.iter_mut() {
+        changed |= ui.add(egui::DragValue::new(p).speed(0.25)).changed();
+    }
+    changed
 }
 
 fn vec3_row(ui: &mut egui::Ui, label: &str, v: &mut [f32; 3], speed: f32) -> bool {

@@ -4,18 +4,24 @@
 use texture_graph_core::color::oklcha;
 use texture_graph_core::{
     Axis, BlendMode, BlendSpace, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion, Graph,
-    HeightToNormal, LayerId, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims,
-    NoiseOutput, NoiseRange, RadialDim, ScalarInput, Transform,
+    HeightToNormal, LayerId, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseKernel,
+    EvalCtx, ParamUse, RadialDim, ScalarInput, Transform, Warp, Wave, noise::MAX_OCTAVES,
 };
 
 use crate::catalog::{self, Kind};
 use crate::state::{EditCmd, UiState};
 use crate::widgets::enum_combo::enum_combo;
-use crate::widgets::{color_edit, layer_ref};
+use crate::widgets::{color_edit, layer_ref, node_labels, param_ref};
 
 /// Render the inspector for a single layer. Emits `EditCmd::SetKind` when
 /// any control changes.
-pub fn show(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, id: LayerId) {
+pub fn show(
+    ui: &mut egui::Ui,
+    graph: &Graph,
+    state: &mut UiState,
+    id: LayerId,
+    ctx: &EvalCtx,
+) {
     let Some(layer) = graph.get(id) else { return };
     let mut kind = layer.kind.clone();
     let mut changed = false;
@@ -47,13 +53,13 @@ pub fn show(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, id: LayerId) 
             changed |= noise_widgets(ui, id, n);
         }
         LayerKind::ColorRamp(r) => {
-            changed |= ramp_widgets(ui, graph, id, r);
+            changed |= ramp_widgets(ui, graph, id, r, ctx);
         }
         LayerKind::Transform(t) => {
             changed |= transform_widgets(ui, graph, id, t);
         }
         LayerKind::Mix(m) => {
-            changed |= mix_widgets(ui, graph, id, m);
+            changed |= mix_widgets(ui, graph, id, m, ctx);
         }
         LayerKind::Map(m) => {
             changed |= map_widgets(ui, graph, id, m);
@@ -63,6 +69,12 @@ pub fn show(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, id: LayerId) 
         }
         LayerKind::HeightToNormal(h) => {
             changed |= h2n_widgets(ui, graph, id, h);
+        }
+        LayerKind::Wave(w) => {
+            changed |= wave_widgets(ui, graph, id, w, ctx);
+        }
+        LayerKind::Warp(w) => {
+            changed |= warp_widgets(ui, graph, id, w);
         }
     }
 
@@ -75,39 +87,45 @@ pub fn show(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, id: LayerId) 
 
 fn noise_widgets(ui: &mut egui::Ui, id: LayerId, n: &mut Noise) -> bool {
     let mut changed = false;
+    if enum_combo(
+        ui,
+        (id.0, "noise-kernel"),
+        "kernel",
+        &mut n.kernel,
+        node_labels::KERNELS,
+        node_labels::kernel,
+    ) {
+        changed = true;
+        // Leaving a period behind on simplex would make `set_kind` reject
+        // the very edit the user just made, over a field the simplex UI
+        // does not even show.
+        if n.kernel == NoiseKernel::Simplex {
+            n.period = [0; 3];
+        }
+    }
     changed |= enum_combo(
         ui,
         (id.0, "noise-dims"),
         "dims",
         &mut n.dims,
-        &[NoiseDims::D1, NoiseDims::D2, NoiseDims::D3],
-        |d| match d {
-            NoiseDims::D1 => "1D",
-            NoiseDims::D2 => "2D",
-            NoiseDims::D3 => "3D",
-        },
+        node_labels::DIMS,
+        node_labels::dims,
     );
     changed |= enum_combo(
         ui,
         (id.0, "noise-output"),
         "output",
         &mut n.output,
-        &[NoiseOutput::Grayscale, NoiseOutput::Color],
-        |o| match o {
-            NoiseOutput::Grayscale => "grayscale",
-            NoiseOutput::Color => "color (LCh)",
-        },
+        node_labels::OUTPUTS,
+        node_labels::output,
     );
     changed |= enum_combo(
         ui,
         (id.0, "noise-range"),
         "range",
         &mut n.range,
-        &[NoiseRange::Unsigned, NoiseRange::Signed],
-        |r| match r {
-            NoiseRange::Unsigned => "[0, 1]",
-            NoiseRange::Signed => "[-1, 1]",
-        },
+        node_labels::RANGES,
+        node_labels::range,
     );
     changed |= ui
         .add(
@@ -119,10 +137,130 @@ fn noise_widgets(ui: &mut egui::Ui, id: LayerId, n: &mut Noise) -> bool {
     changed |= ui
         .add(egui::DragValue::new(&mut n.seed_offset).prefix("seed+"))
         .changed();
+
+    // Only the value kernel has a lattice to wrap; simplex would be
+    // rejected outright, so the control stays hidden rather than armed.
+    if n.kernel == NoiseKernel::Value {
+        ui.horizontal(|ui| {
+            ui.label("period");
+            for p in n.period.iter_mut() {
+                changed |= ui.add(egui::DragValue::new(p).speed(0.25)).changed();
+            }
+        });
+        ui.weak(node_labels::period_hint(n.frequency, n.period));
+    }
+
+    changed |= ui
+        .add(egui::Slider::new(&mut n.fractal.octaves, 1..=MAX_OCTAVES).text("octaves"))
+        .changed();
+    // At one octave the rest of the stack describes nothing.
+    if n.fractal.octaves > 1 {
+        changed |= enum_combo(
+            ui,
+            (id.0, "noise-fractal-mode"),
+            "fbm",
+            &mut n.fractal.mode,
+            node_labels::FRACTAL_MODES,
+            node_labels::fractal_mode,
+        );
+        changed |= ui
+            .add(egui::Slider::new(&mut n.fractal.lacunarity, 1.0..=4.0).text("lacunarity"))
+            .changed();
+        if n.period != [0; 3] && n.fractal.lacunarity.fract() != 0.0 {
+            ui.weak(
+                "a fractional lacunarity scales the period off the lattice — \
+                 the field stops tiling exactly",
+            );
+        }
+        changed |= ui
+            .add(egui::Slider::new(&mut n.fractal.gain, 0.0..=1.0).text("gain"))
+            .changed();
+        changed |= ui.checkbox(&mut n.fractal.normalize, "normalize").changed();
+    }
     changed
 }
 
-fn ramp_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, r: &mut ColorRamp) -> bool {
+fn warp_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, w: &mut Warp) -> bool {
+    let mut changed = false;
+    if let Some(new) =
+        layer_ref::layer_ref_opt(ui, ("warp-src", id.0), "source", w.source, graph, Some(id))
+    {
+        w.source = new;
+        changed = true;
+    }
+    if let Some(new) =
+        layer_ref::layer_ref_opt(ui, ("warp-by", id.0), "by", w.by, graph, Some(id))
+    {
+        w.by = new;
+        changed = true;
+    }
+    changed |= enum_combo(
+        ui,
+        (id.0, "warp-mode"),
+        "mode",
+        &mut w.mode,
+        node_labels::WARP_MODES,
+        node_labels::warp_mode,
+    );
+    changed |= vec3_drag(ui, "amount", &mut w.amount, 0.005);
+    // `amount` is what the baker grows the source's domain by, so it is
+    // also where the warp stops having data to read.
+    ui.weak(
+        "displacement is the driver's value × amount; a driver outside \
+         [-1, 1] reaches past what the source was baked over and shows \
+         the missing grid",
+    );
+    if w.amount[2] != 0.0 {
+        ui.weak("w displacement is CPU-only — the GPU baker cannot re-sample a slice at another w");
+    }
+    changed
+}
+
+fn wave_widgets(
+    ui: &mut egui::Ui,
+    graph: &Graph,
+    id: LayerId,
+    w: &mut Wave,
+    ctx: &EvalCtx,
+) -> bool {
+    let mut changed = false;
+    changed |= scalar_input_widget(ui, graph, id, "input", &mut w.input, ctx);
+    changed |= enum_combo(
+        ui,
+        (id.0, "wave-shape"),
+        "shape",
+        &mut w.shape,
+        node_labels::SHAPES,
+        node_labels::shape,
+    );
+    changed |= ui
+        .add(
+            egui::Slider::new(&mut w.frequency, 0.1..=64.0)
+                .logarithmic(true)
+                .text("frequency (cycles)"),
+        )
+        .changed();
+    changed |= ui
+        .add(egui::Slider::new(&mut w.phase, 0.0..=1.0).text("phase (cycles)"))
+        .changed();
+    changed |= enum_combo(
+        ui,
+        (id.0, "wave-range"),
+        "range",
+        &mut w.range,
+        node_labels::RANGES,
+        node_labels::range,
+    );
+    changed
+}
+
+fn ramp_widgets(
+    ui: &mut egui::Ui,
+    graph: &Graph,
+    id: LayerId,
+    r: &mut ColorRamp,
+    ctx: &EvalCtx,
+) -> bool {
     let mut changed = false;
     changed |= enum_combo(
         ui,
@@ -149,6 +287,7 @@ fn ramp_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, r: &mut ColorRamp
                 "stop",
                 &mut stop.color,
                 Some(id),
+                ctx,
             );
             if stop_count > 2 && ui.small_button("remove").clicked() {
                 remove_at = Some(i);
@@ -265,7 +404,13 @@ fn axis_label(a: Axis) -> &'static str {
     }
 }
 
-fn mix_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, m: &mut Mix) -> bool {
+fn mix_widgets(
+    ui: &mut egui::Ui,
+    graph: &Graph,
+    id: LayerId,
+    m: &mut Mix,
+    ctx: &EvalCtx,
+) -> bool {
     let mut changed = false;
     if let Some(new) = layer_ref::layer_ref_opt(ui, ("mix-a", id.0), "a", m.a, graph, Some(id)) {
         m.a = new;
@@ -301,7 +446,7 @@ fn mix_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, m: &mut Mix) -> bo
                 BlendSpace::Hsv => "Hsv",
             },
         );
-        changed |= scalar_input_widget(ui, graph, id, "factor", &mut m.factor);
+        changed |= scalar_input_widget(ui, graph, id, "factor", &mut m.factor, ctx);
     }
     changed
 }
@@ -383,14 +528,23 @@ fn h2n_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, h: &mut HeightToNo
 
 // ---- Small helpers ------------------------------------------------------
 
+/// A `ScalarInput` as a constant, a layer reference or a named parameter.
+///
+/// `ctx` carries the parameter bindings in force, so switching a bound
+/// socket back to a constant freezes it at what it currently reads rather
+/// than at an arbitrary 0.5.
 pub fn scalar_input_widget(
     ui: &mut egui::Ui,
     graph: &Graph,
     self_id: LayerId,
     label: &str,
     si: &mut ScalarInput,
+    ctx: &EvalCtx,
 ) -> bool {
     let mut changed = false;
+    // A mode switch replaces the whole enum, which would invalidate the
+    // borrow the arm below holds. Decide inside, assign after.
+    let mut swap_to: Option<ScalarInput> = None;
     ui.horizontal(|ui| {
         ui.label(label);
         match si {
@@ -399,10 +553,16 @@ pub fn scalar_input_widget(
                     .add(egui::Slider::new(v, 0.0..=1.0))
                     .changed();
                 if ui.small_button("use layer").clicked() {
-                    *si = ScalarInput::Layer(
+                    swap_to = Some(ScalarInput::Layer(
                         graph.layers.first().map(|l| l.id).unwrap_or(self_id),
-                    );
-                    changed = true;
+                    ));
+                }
+                // Only offered when a scalar parameter is declared; a
+                // button that can only fail is worse than none.
+                if let Some(first) = param_ref::first(graph, ParamUse::Scalar) {
+                    if ui.small_button("use param").clicked() {
+                        swap_to = Some(ScalarInput::Param(first));
+                    }
                 }
             }
             ScalarInput::Layer(lref) => {
@@ -418,12 +578,35 @@ pub fn scalar_input_widget(
                     changed = true;
                 }
                 if ui.small_button("use const").clicked() {
-                    *si = ScalarInput::Const(0.5);
+                    swap_to = Some(ScalarInput::Const(0.5));
+                }
+            }
+            ScalarInput::Param(name) => {
+                if let Some(new) = param_ref::param_ref(
+                    ui,
+                    ("scalar-param", self_id.0, label),
+                    label,
+                    name,
+                    graph,
+                    ParamUse::Scalar,
+                ) {
+                    *name = new;
                     changed = true;
+                }
+                if ui.small_button("use const").clicked() {
+                    let frozen = graph
+                        .param_value(name, ctx)
+                        .and_then(|v| v.as_scalar())
+                        .unwrap_or(0.5);
+                    swap_to = Some(ScalarInput::Const(frozen));
                 }
             }
         }
     });
+    if let Some(next) = swap_to {
+        *si = next;
+        changed = true;
+    }
     changed
 }
 

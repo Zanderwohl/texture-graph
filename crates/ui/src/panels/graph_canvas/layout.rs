@@ -28,6 +28,16 @@ pub enum ParamRow {
     NoiseRange,
     NoiseFrequency,
     NoiseSeed,
+    NoiseKernel,
+    /// Only shown for the value kernel — simplex has no lattice to wrap.
+    NoisePeriod,
+    NoiseOctaves,
+    /// The four rows below only appear once there is more than one octave;
+    /// at one they describe a stack that does not exist.
+    NoiseFractalMode,
+    NoiseLacunarity,
+    NoiseGain,
+    NoiseNormalize,
     RampSpace,
     /// Gradient bar with draggable indicators; taller than a standard row.
     RampBar,
@@ -44,6 +54,12 @@ pub enum ParamRow {
     MinMaxMode,
     MinMaxCriterion,
     H2nStrength,
+    WaveShape,
+    WaveFrequency,
+    WavePhase,
+    WaveRange,
+    WarpMode,
+    WarpAmount,
 }
 
 /// Row table for a layer node. Height follows the kind, conditional rows
@@ -53,13 +69,28 @@ pub fn rows_for(kind: &LayerKind) -> Vec<Row> {
     let mut rows = Vec::new();
     match kind {
         LayerKind::Color(_) => rows.push(Row::Param(ParamRow::ColorValue)),
-        LayerKind::Noise(_) => rows.extend([
-            Row::Param(ParamRow::NoiseDims),
-            Row::Param(ParamRow::NoiseOutput),
-            Row::Param(ParamRow::NoiseRange),
-            Row::Param(ParamRow::NoiseFrequency),
-            Row::Param(ParamRow::NoiseSeed),
-        ]),
+        LayerKind::Noise(n) => {
+            rows.extend([
+                Row::Param(ParamRow::NoiseKernel),
+                Row::Param(ParamRow::NoiseDims),
+                Row::Param(ParamRow::NoiseOutput),
+                Row::Param(ParamRow::NoiseRange),
+                Row::Param(ParamRow::NoiseFrequency),
+                Row::Param(ParamRow::NoiseSeed),
+            ]);
+            if n.kernel == texture_graph_core::NoiseKernel::Value {
+                rows.push(Row::Param(ParamRow::NoisePeriod));
+            }
+            rows.push(Row::Param(ParamRow::NoiseOctaves));
+            if n.fractal.octaves > 1 {
+                rows.extend([
+                    Row::Param(ParamRow::NoiseFractalMode),
+                    Row::Param(ParamRow::NoiseLacunarity),
+                    Row::Param(ParamRow::NoiseGain),
+                    Row::Param(ParamRow::NoiseNormalize),
+                ]);
+            }
+        }
         LayerKind::ColorRamp(r) => {
             rows.push(Row::Param(ParamRow::RampSpace));
             rows.push(Row::Param(ParamRow::RampBar));
@@ -118,6 +149,19 @@ pub fn rows_for(kind: &LayerKind) -> Vec<Row> {
             Row::Socket(InputKey::H2nSource),
             Row::Param(ParamRow::H2nStrength),
         ]),
+        LayerKind::Warp(_) => rows.extend([
+            Row::Socket(InputKey::WarpSource),
+            Row::Socket(InputKey::WarpBy),
+            Row::Param(ParamRow::WarpMode),
+            Row::Param(ParamRow::WarpAmount),
+        ]),
+        LayerKind::Wave(_) => rows.extend([
+            Row::Socket(InputKey::WaveInput),
+            Row::Param(ParamRow::WaveShape),
+            Row::Param(ParamRow::WaveFrequency),
+            Row::Param(ParamRow::WavePhase),
+            Row::Param(ParamRow::WaveRange),
+        ]),
     }
     rows
 }
@@ -135,10 +179,12 @@ pub fn rows_for_output() -> Vec<Row> {
 /// Display label next to a socket circle.
 pub fn socket_label(key: InputKey) -> &'static str {
     match key {
-        InputKey::TransformSource | InputKey::H2nSource => "source",
+        InputKey::TransformSource | InputKey::H2nSource | InputKey::WarpSource => "source",
         InputKey::MixA | InputKey::MinMaxA => "a",
         InputKey::MixB | InputKey::MinMaxB => "b",
         InputKey::MixFactor => "factor",
+        InputKey::WaveInput => "input",
+        InputKey::WarpBy => "by",
         InputKey::MapValue => "value",
         InputKey::MapPalette => "palette",
         InputKey::RampStop(_) => "stop",
@@ -264,7 +310,7 @@ fn build_layout(
         .zip(&row_rects)
         .filter_map(|(row, rrect)| {
             let Row::Socket(key) = *row else { return None };
-            let value = sockets.iter().find(|s| s.key == key)?.value;
+            let value = sockets.iter().find(|s| s.key == key)?.value.clone();
             Some(SocketLayout {
                 key,
                 center: egui::pos2(rect.left(), rrect.center().y),
@@ -389,7 +435,7 @@ mod tests {
         // Mix: Blend adds a space row and a factor socket.
         let LayerKind::Mix(mut m) = catalog::default_kind(Kind::Mix) else { panic!() };
         m.mode = BlendMode::Add;
-        let plain = node_height(&rows_for(&LayerKind::Mix(m)), true);
+        let plain = node_height(&rows_for(&LayerKind::Mix(m.clone())), true);
         m.mode = BlendMode::Blend;
         assert!(
             node_height(&rows_for(&LayerKind::Mix(m)), true) > plain,

@@ -21,6 +21,9 @@ pub enum InputKey {
     MinMaxA,
     MinMaxB,
     H2nSource,
+    WaveInput,
+    WarpSource,
+    WarpBy,
     RampStop(usize),
     OutColor,
     OutRoughness,
@@ -29,7 +32,7 @@ pub enum InputKey {
 }
 
 /// Current value of a socket, as read from the model.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub enum SocketValue {
     /// An `Option<LayerId>` field. `None` renders as the missing-texture
     /// grid.
@@ -41,18 +44,28 @@ pub enum SocketValue {
 impl SocketValue {
     /// The layer this socket is wired to, if any.
     pub fn connected_to(&self) -> Option<LayerId> {
-        match *self {
-            SocketValue::LayerOpt(opt) => opt,
-            SocketValue::Color(ColorInput::Layer(id)) => Some(id),
-            SocketValue::Color(ColorInput::Const(_)) => None,
-            SocketValue::Scalar(ScalarInput::Layer(id)) => Some(id),
-            SocketValue::Scalar(ScalarInput::Const(_)) => None,
+        match self {
+            SocketValue::LayerOpt(opt) => *opt,
+            SocketValue::Color(ColorInput::Layer(id)) => Some(*id),
+            SocketValue::Scalar(ScalarInput::Layer(id)) => Some(*id),
+            // A constant and a parameter are both "not wired to a layer".
+            SocketValue::Color(ColorInput::Const(_) | ColorInput::Param(_)) => None,
+            SocketValue::Scalar(ScalarInput::Const(_) | ScalarInput::Param(_)) => None,
+        }
+    }
+
+    /// The parameter this socket reads, if any.
+    pub fn bound_param(&self) -> Option<&str> {
+        match self {
+            SocketValue::Color(ColorInput::Param(name)) => Some(name),
+            SocketValue::Scalar(ScalarInput::Param(name)) => Some(name),
+            _ => None,
         }
     }
 }
 
 /// One connectable input on a node, in top-to-bottom display order.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct InputSocket {
     pub key: InputKey,
     pub label: &'static str,
@@ -112,7 +125,7 @@ impl LayerKind {
                 .iter()
                 .enumerate()
                 .map(|(i, s)| {
-                    sock(InputKey::RampStop(i), "stop", SocketValue::Color(s.color))
+                    sock(InputKey::RampStop(i), "stop", SocketValue::Color(s.color.clone()))
                 })
                 .collect(),
             LayerKind::Transform(t) => vec![sock(
@@ -123,7 +136,7 @@ impl LayerKind {
             LayerKind::Mix(m) => vec![
                 sock(InputKey::MixA, "a", SocketValue::LayerOpt(m.a)),
                 sock(InputKey::MixB, "b", SocketValue::LayerOpt(m.b)),
-                sock(InputKey::MixFactor, "factor", SocketValue::Scalar(m.factor)),
+                sock(InputKey::MixFactor, "factor", SocketValue::Scalar(m.factor.clone())),
             ],
             LayerKind::Map(m) => vec![
                 sock(InputKey::MapValue, "value", SocketValue::LayerOpt(m.value)),
@@ -142,6 +155,13 @@ impl LayerKind {
                 "source",
                 SocketValue::LayerOpt(h.source),
             )],
+            LayerKind::Wave(w) => {
+                vec![sock(InputKey::WaveInput, "input", SocketValue::Scalar(w.input.clone()))]
+            }
+            LayerKind::Warp(w) => vec![
+                sock(InputKey::WarpSource, "source", SocketValue::LayerOpt(w.source)),
+                sock(InputKey::WarpBy, "by", SocketValue::LayerOpt(w.by)),
+            ],
         }
     }
 
@@ -168,10 +188,41 @@ impl LayerKind {
             (LayerKind::HeightToNormal(h), InputKey::H2nSource) => {
                 Ok(set_opt(&mut h.source, target))
             }
+            (LayerKind::Wave(w), InputKey::WaveInput) => Ok(set_scalar(&mut w.input, target)),
+            (LayerKind::Warp(w), InputKey::WarpSource) => Ok(set_opt(&mut w.source, target)),
+            (LayerKind::Warp(w), InputKey::WarpBy) => Ok(set_opt(&mut w.by, target)),
             (LayerKind::ColorRamp(r), InputKey::RampStop(i)) => match r.stops.get_mut(i) {
                 // A stop can vanish between drag start and drop (removed in
                 // the inspector) — report it rather than panic.
                 Some(stop) => Ok(set_color(&mut stop.color, target)),
+                None => Err(SocketError::NoSuchSocket),
+            },
+            _ => Err(SocketError::NoSuchSocket),
+        }
+    }
+
+    /// Bind a `ColorInput`/`ScalarInput` socket to a named parameter.
+    /// Errors on plain-layer sockets.
+    ///
+    /// Whether `name` is declared, and whether its kind suits this socket,
+    /// is [`crate::Graph`]'s business — it holds the declarations, and it
+    /// is the one that has to refuse the edit.
+    pub fn set_param(&mut self, key: InputKey, name: impl Into<String>) -> Result<(), SocketError> {
+        let name = name.into();
+        match (self, key) {
+            (LayerKind::Mix(m), InputKey::MixFactor) => {
+                m.factor = ScalarInput::Param(name);
+                Ok(())
+            }
+            (LayerKind::Wave(w), InputKey::WaveInput) => {
+                w.input = ScalarInput::Param(name);
+                Ok(())
+            }
+            (LayerKind::ColorRamp(r), InputKey::RampStop(i)) => match r.stops.get_mut(i) {
+                Some(stop) => {
+                    stop.color = ColorInput::Param(name);
+                    Ok(())
+                }
                 None => Err(SocketError::NoSuchSocket),
             },
             _ => Err(SocketError::NoSuchSocket),
@@ -184,6 +235,10 @@ impl LayerKind {
         match (self, key, value) {
             (LayerKind::Mix(m), InputKey::MixFactor, ConstValue::Scalar(v)) => {
                 m.factor = ScalarInput::Const(v);
+                Ok(())
+            }
+            (LayerKind::Wave(w), InputKey::WaveInput, ConstValue::Scalar(v)) => {
+                w.input = ScalarInput::Const(v);
                 Ok(())
             }
             (LayerKind::ColorRamp(r), InputKey::RampStop(i), ConstValue::Color(c)) => {
@@ -212,12 +267,12 @@ impl Output {
             InputSocket {
                 key: InputKey::OutRoughness,
                 label: "roughness",
-                value: SocketValue::Scalar(self.roughness),
+                value: SocketValue::Scalar(self.roughness.clone()),
             },
             InputSocket {
                 key: InputKey::OutMetallic,
                 label: "metallic",
-                value: SocketValue::Scalar(self.metallic),
+                value: SocketValue::Scalar(self.metallic.clone()),
             },
             InputSocket {
                 key: InputKey::OutNormal,
@@ -238,6 +293,22 @@ impl Output {
             InputKey::OutRoughness => Ok(set_scalar(&mut self.roughness, target)),
             InputKey::OutMetallic => Ok(set_scalar(&mut self.metallic, target)),
             InputKey::OutNormal => Ok(set_opt(&mut self.normal, target)),
+            _ => Err(SocketError::NoSuchSocket),
+        }
+    }
+
+    /// Bind `roughness`/`metallic` to a named parameter. Errors elsewhere.
+    pub fn set_param(&mut self, key: InputKey, name: impl Into<String>) -> Result<(), SocketError> {
+        let name = name.into();
+        match key {
+            InputKey::OutRoughness => {
+                self.roughness = ScalarInput::Param(name);
+                Ok(())
+            }
+            InputKey::OutMetallic => {
+                self.metallic = ScalarInput::Param(name);
+                Ok(())
+            }
             _ => Err(SocketError::NoSuchSocket),
         }
     }
@@ -304,6 +375,15 @@ mod tests {
                 criterion: Criterion::Luma,
             }),
             LayerKind::HeightToNormal(HeightToNormal { source: Some(id(12)), strength: 1.0 }),
+            LayerKind::Wave(crate::kind::Wave {
+                input: ScalarInput::Layer(id(13)),
+                ..crate::kind::Wave::default()
+            }),
+            LayerKind::Warp(crate::kind::Warp {
+                source: Some(id(14)),
+                by: Some(id(15)),
+                ..crate::kind::Warp::default()
+            }),
         ]
     }
 

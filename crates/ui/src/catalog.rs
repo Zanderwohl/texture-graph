@@ -10,8 +10,8 @@
 use texture_graph_core::color::oklcha;
 use texture_graph_core::{
     BlendMode, BlendSpace, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion, EdgeMode,
-    Graph, HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims,
-    NoiseOutput, NoiseRange, ScalarInput, Transform,
+    Graph, HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, ScalarInput,
+    Transform, Warp, Wave,
 };
 
 /// One entry in the add-node menu and the variant switcher.
@@ -34,6 +34,8 @@ pub enum Kind {
     Map,
     MinMax,
     HeightToNormal,
+    Wave,
+    Warp,
 }
 
 impl Kind {
@@ -51,13 +53,15 @@ impl Kind {
             LayerKind::Map(_) => Kind::Map,
             LayerKind::MinMax(_) => Kind::MinMax,
             LayerKind::HeightToNormal(_) => Kind::HeightToNormal,
+            LayerKind::Wave(_) => Kind::Wave,
+            LayerKind::Warp(_) => Kind::Warp,
         }
     }
 }
 
 /// Every node the editor offers, in menu order.
 ///
-/// Flat rather than grouped: eight entries fit in one menu, and four
+/// Flat rather than grouped: ten entries still fit in one menu, and five
 /// submenus of two would cost a hover and a pointer trip to reach any of
 /// them. Group them when the catalog outgrows a single list.
 pub const VARIANTS: &[Variant] = &[
@@ -69,6 +73,8 @@ pub const VARIANTS: &[Variant] = &[
     Variant { label: "Map", kind: Kind::Map },
     Variant { label: "MinMax", kind: Kind::MinMax },
     Variant { label: "HeightToNormal", kind: Kind::HeightToNormal },
+    Variant { label: "Wave", kind: Kind::Wave },
+    Variant { label: "Warp", kind: Kind::Warp },
 ];
 
 /// What a node of this variant looks like the moment it is added.
@@ -79,13 +85,7 @@ pub const VARIANTS: &[Variant] = &[
 pub fn default_kind(kind: Kind) -> LayerKind {
     match kind {
         Kind::Color => LayerKind::Color(oklcha(0.5, 0.0, 0.0, 1.0)),
-        Kind::Noise => LayerKind::Noise(Noise {
-            dims: NoiseDims::D2,
-            seed_offset: 0,
-            frequency: 4.0,
-            range: NoiseRange::Unsigned,
-            output: NoiseOutput::Grayscale,
-        }),
+        Kind::Noise => LayerKind::Noise(Noise::default()),
         Kind::ColorRamp => LayerKind::ColorRamp(ColorRamp {
             stops: vec![
                 ColorStop { t: 0.0, color: ColorInput::Const(oklcha(0.0, 0.0, 0.0, 1.0)) },
@@ -118,6 +118,8 @@ pub fn default_kind(kind: Kind) -> LayerKind {
         Kind::HeightToNormal => {
             LayerKind::HeightToNormal(HeightToNormal { source: None, strength: 1.0 })
         }
+        Kind::Wave => LayerKind::Wave(Wave::default()),
+        Kind::Warp => LayerKind::Warp(Warp::default()),
     }
 }
 
@@ -169,6 +171,8 @@ mod tests {
             Kind::Map,
             Kind::MinMax,
             Kind::HeightToNormal,
+            Kind::Wave,
+            Kind::Warp,
         ];
         for kind in ALL {
             assert!(

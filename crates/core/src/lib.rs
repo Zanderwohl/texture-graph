@@ -14,19 +14,24 @@ pub mod graph;
 pub mod id;
 pub mod kind;
 pub mod noise;
+pub mod param;
 pub mod socket;
 
 pub use color::{BlendSpace, Color};
 pub use eval::{EvalCtx, FLAT_W, Material, Sample, evaluate, evaluate_material};
 pub use file::{
     CURRENT_FORMAT_VERSION, FILE_EXTENSION, FileMetadata, LoadError, SaveError, TextureGraphFile,
-    load_from_path, load_from_str, save_to_path, save_to_string,
+    load_from_str, save_to_string,
 };
+#[cfg(feature = "std-fs")]
+pub use file::{load_from_path, save_to_path};
 pub use graph::{Canvas, Graph, GraphError, Layer, Output};
 pub use id::LayerId;
 pub use kind::{
     Axis, BlendMode, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion, EXTEND_LIMIT,
-    EdgeMode, HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims,
-    NoiseOutput, NoiseRange, RadialDim, ScalarInput, Transform,
+    EdgeMode, Fractal, FractalMode, HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix,
+    Noise, NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, RadialDim, ScalarInput,
+    Transform, Warp, WarpMode, Wave, WaveShape,
 };
+pub use param::{ParamDecl, ParamKind, ParamUse, ParamValue};
 pub use socket::{ConstValue, InputKey, InputSocket, SocketError, SocketValue};

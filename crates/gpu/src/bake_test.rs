@@ -5,11 +5,13 @@ use std::collections::HashSet;
 
 use texture_graph_core::{
     BlendMode, BlendSpace, Color, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion,
-    EdgeMode, EvalCtx, Graph, HeightToNormal, LayerId, LayerKind, Map, MinMax, MinMaxMode, Mix,
-    Noise, NoiseDims, NoiseOutput, NoiseRange, Output, ScalarInput, Transform, color::to_srgb8,
+    EdgeMode, EvalCtx, Fractal, FractalMode, Graph, HeightToNormal, LayerId, LayerKind, Map,
+    MinMax, MinMaxMode, Mix, Noise, NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, Output,
+    ParamDecl, ParamValue, ScalarInput, Transform, Warp, WarpMode, Wave, WaveShape,
+    color::to_srgb8,
 };
 
-use crate::{Baker, DeviceCtx};
+use crate::{Baker, DeviceCtx, ScalarFormat};
 
 const SIZE: (u32, u32) = (8, 8);
 
@@ -183,6 +185,7 @@ fn noise_layer_has_variance_and_is_deterministic() {
                 frequency: 4.0,
                 range: NoiseRange::Unsigned,
                 output: NoiseOutput::Grayscale,
+                ..Noise::default()
             }),
         )
         .unwrap();
@@ -477,6 +480,7 @@ fn perf_fractal_stack_1024() {
                 frequency: 1.0,
                 range: NoiseRange::Signed,
                 output: NoiseOutput::Grayscale,
+                ..Noise::default()
             }),
         )
         .unwrap();
@@ -493,6 +497,7 @@ fn perf_fractal_stack_1024() {
                     frequency: freq,
                     range: NoiseRange::Signed,
                     output: NoiseOutput::Grayscale,
+                    ..Noise::default()
                 }),
             )
             .unwrap();
@@ -872,6 +877,7 @@ fn a_subset_bake_gives_the_same_picture_as_a_full_one() {
                 frequency: 8.0,
                 range: NoiseRange::Unsigned,
                 output: NoiseOutput::Grayscale,
+                ..Noise::default()
             }),
         )
         .unwrap();
@@ -977,6 +983,7 @@ fn noise_signed_range_lifts_grays_around_50pct() {
                 frequency: 2.0,
                 range: NoiseRange::Signed,
                 output: NoiseOutput::Grayscale,
+                ..Noise::default()
             }),
         )
         .unwrap();
@@ -1337,27 +1344,12 @@ fn radial_extend_past_limit_shows_missing_grid_like_cpu() {
 /// checker. That is a display choice, and this is about the field under it.
 ///
 /// Returns `(histogram, worst, compared, skipped)`.
-fn noise_parity_histogram(
-    dims: NoiseDims,
-    range: NoiseRange,
-    frequency: f32,
-) -> (Vec<u32>, u32, u32, u32) {
+fn noise_parity_histogram(n: Noise) -> (Vec<u32>, u32, u32, u32) {
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
     let mut baker = Baker::new(ctx.clone());
     let mut graph = Graph::new();
     let id = graph.output.color.unwrap();
-    graph
-        .set_kind(
-            id,
-            LayerKind::Noise(Noise {
-                dims,
-                seed_offset: 3,
-                frequency,
-                range,
-                output: NoiseOutput::Grayscale,
-            }),
-        )
-        .unwrap();
+    graph.set_kind(id, LayerKind::Noise(n)).unwrap();
 
     const RES: u32 = 64;
     let eval = EvalCtx::default();
@@ -1398,28 +1390,854 @@ fn noise_parity_histogram(
 
 #[test]
 fn cpu_and_gpu_noise_agree() {
-    for (dims, range, freq) in [
-        (NoiseDims::D2, NoiseRange::Unsigned, 4.0),
-        (NoiseDims::D2, NoiseRange::Signed, 9.0),
-        (NoiseDims::D1, NoiseRange::Unsigned, 6.0),
-        (NoiseDims::D3, NoiseRange::Unsigned, 5.0),
-        (NoiseDims::D3, NoiseRange::Signed, 2.0),
-    ] {
-        let (hist, worst, compared, skipped) = noise_parity_histogram(dims, range, freq);
+    let plain = |dims, range, frequency| Noise {
+        dims,
+        seed_offset: 3,
+        frequency,
+        range,
+        output: NoiseOutput::Grayscale,
+        ..Noise::default()
+    };
+    let value = |dims, range, frequency, period| Noise {
+        kernel: NoiseKernel::Value,
+        period,
+        ..plain(dims, range, frequency)
+    };
+    let cases: [(&str, Noise); 12] = [
+        // Simplex, the pre-existing coverage.
+        ("simplex D2 unsigned", plain(NoiseDims::D2, NoiseRange::Unsigned, 4.0)),
+        ("simplex D2 signed", plain(NoiseDims::D2, NoiseRange::Signed, 9.0)),
+        ("simplex D1 unsigned", plain(NoiseDims::D1, NoiseRange::Unsigned, 6.0)),
+        ("simplex D3 unsigned", plain(NoiseDims::D3, NoiseRange::Unsigned, 5.0)),
+        ("simplex D3 signed", plain(NoiseDims::D3, NoiseRange::Signed, 2.0)),
+        // Value, aperiodic and periodic, every dimensionality.
+        ("value D1 unsigned", value(NoiseDims::D1, NoiseRange::Unsigned, 6.0, [0; 3])),
+        ("value D2 unsigned", value(NoiseDims::D2, NoiseRange::Unsigned, 4.0, [0; 3])),
+        ("value D2 signed", value(NoiseDims::D2, NoiseRange::Signed, 9.0, [0; 3])),
+        ("value D3 unsigned", value(NoiseDims::D3, NoiseRange::Unsigned, 5.0, [0; 3])),
+        ("value D2 tiling", value(NoiseDims::D2, NoiseRange::Unsigned, 8.0, [8, 8, 0])),
+        // Octaves, on both kernels and a shaping mode each.
+        (
+            "value ridged x4",
+            Noise {
+                fractal: Fractal {
+                    octaves: 4,
+                    lacunarity: 2.0,
+                    gain: 0.5,
+                    mode: FractalMode::Ridged,
+                    normalize: true,
+                },
+                ..value(NoiseDims::D3, NoiseRange::Unsigned, 3.0, [0; 3])
+            },
+        ),
+        (
+            "simplex turbulence x5",
+            Noise {
+                fractal: Fractal {
+                    octaves: 5,
+                    lacunarity: 2.13,
+                    gain: 0.55,
+                    mode: FractalMode::Turbulence,
+                    normalize: true,
+                },
+                ..plain(NoiseDims::D2, NoiseRange::Unsigned, 3.0)
+            },
+        ),
+    ];
+    for (label, n) in cases {
+        let (hist, worst, compared, skipped) = noise_parity_histogram(n);
         println!(
-            "{dims:?} {range:?} f={freq}: worst={worst} hist={hist:?} \
-             compared={compared} skipped={skipped}"
+            "{label}: worst={worst} hist={hist:?} compared={compared} skipped={skipped}"
         );
         // A test that skipped everything would pass on an empty
         // comparison. Signed noise spends a good third of its range below
         // zero, so the floor is a quarter of the image rather than half.
-        assert!(
-            compared * 4 > 64 * 64,
-            "{dims:?} {range:?}: only {compared} samples were in range"
-        );
-        assert!(
-            worst <= 1,
-            "{dims:?} {range:?} f={freq}: worst sRGB delta {worst}, histogram {hist:?}"
-        );
+        assert!(compared * 4 > 64 * 64, "{label}: only {compared} samples were in range");
+        assert!(worst <= 1, "{label}: worst sRGB delta {worst}, histogram {hist:?}");
     }
+}
+
+/// The claim §1 of the consumer doc is built on, checked where it matters:
+/// on the GPU, in a real bake, not only in the CPU kernel.
+///
+/// `period / frequency` is the repeat length in sample space. At
+/// `period = 4`, `frequency = 16` that is a quarter of a unit, so a bake of
+/// the unit square is four identical tiles across and down. Exact pixel
+/// equality is the right bar: same shader, same lattice cells, same integer
+/// corner hashes.
+const TILE_PERIOD: u32 = 4;
+const TILES_ACROSS: u32 = 4;
+const TILE_RES: u32 = 64;
+
+fn tiling_noise(kernel: NoiseKernel, period: [u32; 3]) -> Noise {
+    Noise {
+        dims: NoiseDims::D2,
+        seed_offset: 1,
+        frequency: (TILE_PERIOD * TILES_ACROSS) as f32,
+        range: NoiseRange::Unsigned,
+        output: NoiseOutput::Grayscale,
+        kernel,
+        period,
+        fractal: Fractal::default(),
+    }
+}
+
+fn bake_noise_pixels(n: Noise) -> Vec<[u8; 4]> {
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let id = graph.output.color.unwrap();
+    graph.set_kind(id, LayerKind::Noise(n)).unwrap();
+    let size = (TILE_RES, TILE_RES);
+    let out = baker.bake_output(&graph, size, &EvalCtx::default(), false).expect("bake");
+    readback_all_pixels(&ctx, &out.color, size)
+}
+
+#[test]
+fn a_periodic_value_bake_tiles_exactly_on_the_gpu() {
+    let px = bake_noise_pixels(tiling_noise(
+        NoiseKernel::Value,
+        [TILE_PERIOD, TILE_PERIOD, 0],
+    ));
+    let tile = TILE_RES / TILES_ACROSS;
+    let mut varied = false;
+    for y in 0..tile {
+        for x in 0..tile {
+            let first = px[(y * TILE_RES + x) as usize];
+            if first != px[0] {
+                varied = true;
+            }
+            for ty in 0..TILES_ACROSS {
+                for tx in 0..TILES_ACROSS {
+                    let (sx, sy) = (x + tx * tile, y + ty * tile);
+                    assert_eq!(
+                        first,
+                        px[(sy * TILE_RES + sx) as usize],
+                        "tile ({tx},{ty}) differs at ({x},{y})"
+                    );
+                }
+            }
+        }
+    }
+    assert!(varied, "the field is constant, so tiling proves nothing");
+}
+
+/// The same bake without a period must *not* repeat — otherwise the field
+/// tiles for some reason of its own and the test above proves nothing.
+#[test]
+fn an_aperiodic_bake_does_not_tile() {
+    let tile = TILE_RES / TILES_ACROSS;
+    let repeats = |px: &[[u8; 4]]| {
+        (0..tile).all(|y| {
+            (0..tile).all(|x| {
+                px[(y * TILE_RES + x) as usize] == px[(y * TILE_RES + x + tile) as usize]
+            })
+        })
+    };
+    for kernel in [NoiseKernel::Simplex, NoiseKernel::Value] {
+        let px = bake_noise_pixels(tiling_noise(kernel, [0; 3]));
+        assert!(!repeats(&px), "{kernel:?} repeated across a tile boundary");
+    }
+}
+
+// ---- Single-channel output (§5) ----------------------------------------
+
+/// A graph whose Output is a plain gray, plus an unrelated noise layer.
+/// The noise is deliberately *not* wired to the Output: `bake_scalar` is
+/// supposed to bake the layer it is asked for, so a graph can carry
+/// several fields side by side.
+fn scalar_fixture(kernel: NoiseKernel) -> (Graph, LayerId) {
+    let mut graph = Graph::new();
+    let field = graph
+        .add_layer(
+            "field",
+            LayerKind::Noise(Noise {
+                dims: NoiseDims::D3,
+                seed_offset: 7,
+                frequency: 5.0,
+                range: NoiseRange::Unsigned,
+                output: NoiseOutput::Grayscale,
+                kernel,
+                period: [0; 3],
+                fractal: Fractal { octaves: 3, ..Fractal::default() },
+            }),
+        )
+        .unwrap();
+    (graph, field)
+}
+
+fn cpu_scalar(graph: &Graph, layer: LayerId, u: f32, v: f32, w: f32) -> f32 {
+    texture_graph_core::color::scalar_of(texture_graph_core::evaluate(
+        graph,
+        layer,
+        texture_graph_core::Sample::new(u, v, w),
+        &EvalCtx::default(),
+    ))
+}
+
+/// Every format reproduces the CPU field to its own precision, and the
+/// layer baked is the one asked for rather than whatever the Output
+/// happens to point at.
+#[test]
+fn scalar_bake_matches_the_cpu_field_in_every_format() {
+    const RES: u32 = 32;
+    let (graph, field) = scalar_fixture(NoiseKernel::Value);
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+
+    for (format, tol) in [
+        // 1/255 of quantization, plus the CPU/GPU kernel difference.
+        (ScalarFormat::R8Unorm, 1.0 / 255.0 + 2e-3),
+        // Half has ~3 decimal digits over [0, 1].
+        (ScalarFormat::R16Float, 1e-3 + 2e-3),
+        (ScalarFormat::R32Float, 2e-3),
+    ] {
+        let tex = baker
+            .bake_scalar(&graph, field, (RES, RES), format, &EvalCtx::default())
+            .expect("bake_scalar");
+        let img = crate::readback::read_scalar(&ctx, &tex, (RES, RES), format);
+        assert_eq!((img.width, img.height, img.depth), (RES, RES, 1));
+        assert_eq!(
+            img.bytes.len() as u32,
+            RES * RES * format.bytes_per_texel(),
+            "{format:?}: one texel per pixel, no row padding"
+        );
+
+        let mut worst = 0.0f32;
+        for y in 0..RES {
+            for x in 0..RES {
+                let u = (x as f32 + 0.5) / RES as f32;
+                let v = (y as f32 + 0.5) / RES as f32;
+                let expected = cpu_scalar(&graph, field, u, v, texture_graph_core::FLAT_W);
+                let got = img.value(x, y, 0).unwrap();
+                worst = worst.max((expected - got).abs());
+            }
+        }
+        assert!(worst <= tol, "{format:?}: worst scalar delta {worst} > {tol}");
+    }
+}
+
+/// `R8Unorm` clamps as the format requires; the float formats keep a
+/// signed field intact, which is the reason to pay for them.
+#[test]
+fn scalar_formats_differ_on_out_of_range_values() {
+    const RES: u32 = 16;
+    let mut graph = Graph::new();
+    let signed = graph
+        .add_layer(
+            "signed",
+            LayerKind::Noise(Noise {
+                dims: NoiseDims::D2,
+                seed_offset: 2,
+                frequency: 6.0,
+                range: NoiseRange::Signed,
+                output: NoiseOutput::Grayscale,
+                kernel: NoiseKernel::Value,
+                ..Noise::default()
+            }),
+        )
+        .unwrap();
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let read = |baker: &mut Baker, format| {
+        let tex = baker
+            .bake_scalar(&graph, signed, (RES, RES), format, &EvalCtx::default())
+            .expect("bake_scalar");
+        crate::readback::read_scalar(&ctx, &tex, (RES, RES), format)
+    };
+
+    let unorm = read(&mut baker, ScalarFormat::R8Unorm);
+    let float = read(&mut baker, ScalarFormat::R32Float);
+    let mut saw_negative = false;
+    for y in 0..RES {
+        for x in 0..RES {
+            let f = float.value(x, y, 0).unwrap();
+            if f < -1e-3 {
+                saw_negative = true;
+                assert_eq!(
+                    unorm.value(x, y, 0).unwrap(),
+                    0.0,
+                    "R8Unorm should have clamped {f} at ({x},{y})"
+                );
+            }
+        }
+    }
+    assert!(saw_negative, "signed noise produced nothing below zero to clamp");
+}
+
+/// The volume path: `res³` at slice centres, matching the CPU field and
+/// actually varying along w.
+#[test]
+fn scalar_volume_matches_the_cpu_field_through_w() {
+    const RES: u32 = 16;
+    const DEPTH: u32 = 8;
+    let (graph, field) = scalar_fixture(NoiseKernel::Value);
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let vol = baker
+        .bake_scalar_volume(
+            &graph, field, RES, DEPTH, ScalarFormat::R32Float, &EvalCtx::default(),
+        )
+        .expect("bake_scalar_volume");
+    assert_eq!(vol.size, (RES, RES, DEPTH));
+    let img = crate::readback::read_scalar_volume(&ctx, &vol.texture, vol.size, vol.format);
+
+    let mut worst = 0.0f32;
+    let mut varies_through_w = false;
+    for z in 0..DEPTH {
+        let w = (z as f32 + 0.5) / DEPTH as f32;
+        for y in 0..RES {
+            for x in 0..RES {
+                let u = (x as f32 + 0.5) / RES as f32;
+                let v = (y as f32 + 0.5) / RES as f32;
+                let expected = cpu_scalar(&graph, field, u, v, w);
+                let got = img.value(x, y, z).unwrap();
+                worst = worst.max((expected - got).abs());
+            }
+        }
+        if z > 0 && img.value(0, 0, z) != img.value(0, 0, 0) {
+            varies_through_w = true;
+        }
+    }
+    assert!(worst <= 2e-3, "worst scalar delta through the volume: {worst}");
+    assert!(varies_through_w, "the volume is the same slice repeated");
+}
+
+/// `bake_scalar` schedules only what its layer reads. A graph with a big
+/// unrelated Output branch must not pay for it.
+#[test]
+fn scalar_bake_ignores_layers_its_field_does_not_read() {
+    let (mut graph, field) = scalar_fixture(NoiseKernel::Simplex);
+    let mut chain = graph.output.color.unwrap();
+    for i in 0..4 {
+        chain = add_mix(&mut graph, &format!("unrelated-{i}"), chain, chain);
+    }
+    graph
+        .set_output(Output {
+            color: Some(chain),
+            roughness: ScalarInput::Const(0.5),
+            metallic: ScalarInput::Const(0.0),
+            normal: None,
+        })
+        .unwrap();
+    let sched = crate::schedule::schedule_layer(&graph, field).expect("schedule");
+    assert_eq!(sched.order, vec![field], "only the field should be dispatched");
+    // And the ordinary Output schedule still covers the branch, so the two
+    // are genuinely different plans rather than one that lost layers.
+    assert!(crate::schedule::schedule(&graph, &EvalCtx::default()).unwrap().order.len() > 1);
+}
+
+/// The async readers have to produce the same bytes as the blocking ones —
+/// they are the only path a wasm host has, so a difference would be a bug
+/// nobody native ever hits.
+#[test]
+fn async_readback_agrees_with_the_blocking_one() {
+    const RES: u32 = 16;
+    let (graph, field) = scalar_fixture(NoiseKernel::Value);
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+
+    let tex = baker
+        .bake_scalar(&graph, field, (RES, RES), ScalarFormat::R16Float, &EvalCtx::default())
+        .expect("bake_scalar");
+    let blocking =
+        crate::readback::read_scalar(&ctx, &tex, (RES, RES), ScalarFormat::R16Float);
+    let asynced = drive(
+        &ctx,
+        crate::readback::read_scalar_async(&ctx, &tex, (RES, RES), ScalarFormat::R16Float),
+    );
+    assert_eq!(blocking.bytes, asynced.bytes);
+
+    let color = baker
+        .bake_output(&graph, (RES, RES), &EvalCtx::default(), false)
+        .expect("bake")
+        .color;
+    let blocking_rgba = crate::readback::read_rgba8(&ctx, &color, (RES, RES));
+    let async_rgba = drive(&ctx, crate::readback::read_rgba8_async(&ctx, &color, (RES, RES)));
+    assert_eq!(blocking_rgba.pixels, async_rgba.pixels);
+}
+
+/// Run a readback future to completion on native, the way a host with a
+/// frame loop would: poll the future, then give the device a chance to
+/// resolve the buffer map, and repeat.
+///
+/// `pollster::block_on` alone deadlocks here — it parks the only thread
+/// that could call `Device::poll`. On wasm neither is needed; the browser
+/// resolves the map on its own event loop, which is the whole reason the
+/// async readers exist.
+fn drive<F: std::future::Future>(ctx: &DeviceCtx, fut: F) -> F::Output {
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct Noop;
+    impl Wake for Noop {
+        fn wake(self: Arc<Self>) {}
+    }
+    let waker = Waker::from(Arc::new(Noop));
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = Box::pin(fut);
+    loop {
+        if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+            return v;
+        }
+        let _ = ctx.device.poll(wgpu::PollType::Poll);
+    }
+}
+
+// ---- Wave (§4) ----------------------------------------------------------
+
+/// CPU/GPU parity for the waveform node, at the looser bound its doc
+/// comment promises.
+///
+/// `Sine` is transcendental, so this is explicitly *not* the noise
+/// op-order contract: within one sRGB step, not bit-exact. Asserting the
+/// bound honestly is the point — a test that demanded equality here would
+/// either be disabled or force a lie in the doc comment.
+#[test]
+fn cpu_and_gpu_wave_agree_within_one_srgb_step() {
+    const RES: u32 = 64;
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+
+    for shape in [WaveShape::Sine, WaveShape::Triangle, WaveShape::Square, WaveShape::Sawtooth] {
+        for range in [NoiseRange::Unsigned, NoiseRange::Signed] {
+            // A ramp along U gives the wave a coordinate to run over —
+            // the shape the banded-planet surface needs.
+            let mut graph = Graph::new();
+            let ramp = graph.output.color.unwrap();
+            graph
+                .set_kind(
+                    ramp,
+                    LayerKind::ColorRamp(ColorRamp {
+                        stops: vec![
+                            ColorStop {
+                                t: 0.0,
+                                color: ColorInput::Const(Color::new(0.0, 0.0, 0.0, 1.0)),
+                            },
+                            ColorStop {
+                                t: 1.0,
+                                color: ColorInput::Const(Color::new(1.0, 0.0, 0.0, 1.0)),
+                            },
+                        ],
+                        space: BlendSpace::Oklch,
+                    }),
+                )
+                .unwrap();
+            let wave = graph
+                .add_layer(
+                    "wave",
+                    LayerKind::Wave(Wave {
+                        input: ScalarInput::Layer(ramp),
+                        shape,
+                        frequency: 5.0,
+                        phase: 0.125,
+                        range,
+                    }),
+                )
+                .unwrap();
+            graph
+                .set_output(Output {
+                    color: Some(wave),
+                    roughness: ScalarInput::Const(0.5),
+                    metallic: ScalarInput::Const(0.0),
+                    normal: None,
+                })
+                .unwrap();
+
+            let eval = EvalCtx::default();
+            let out = baker.bake_output(&graph, (RES, RES), &eval, false).expect("bake");
+            let px = readback_all_pixels(&ctx, &out.color, (RES, RES));
+            let (mut worst, mut compared) = (0u32, 0u32);
+            for y in 0..RES {
+                for x in 0..RES {
+                    let u = (x as f32 + 0.5) / RES as f32;
+                    let v = (y as f32 + 0.5) / RES as f32;
+                    let m = texture_graph_core::evaluate_material(
+                        &graph,
+                        texture_graph_core::Sample::new(u, v, texture_graph_core::FLAT_W),
+                        &eval,
+                    );
+                    // Signed output spends half its range below zero,
+                    // where the two backends differ on purpose — `to_srgb8`
+                    // clamps and `pack_srgb8` paints the checker.
+                    if !(0.0..=1.0).contains(&m.color.l) {
+                        continue;
+                    }
+                    compared += 1;
+                    let expected = to_srgb8(m.color);
+                    let got = px[(y * RES + x) as usize];
+                    for i in 0..3 {
+                        worst = worst
+                            .max((expected[i] as i32 - got[i] as i32).unsigned_abs());
+                    }
+                }
+            }
+            assert!(compared * 4 > RES * RES, "{shape:?} {range:?}: only {compared} in range");
+            assert!(worst <= 1, "{shape:?} {range:?}: worst sRGB delta {worst}");
+        }
+    }
+}
+
+/// A `Const` input never reads the bound texture — the shader's
+/// placeholder path. The result must be one flat value, not whatever
+/// happened to be in the slot.
+#[test]
+fn a_const_input_wave_bakes_flat() {
+    const RES: u32 = 16;
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let id = graph.output.color.unwrap();
+    graph
+        .set_kind(
+            id,
+            LayerKind::Wave(Wave {
+                input: ScalarInput::Const(0.125),
+                shape: WaveShape::Sine,
+                frequency: 2.0,
+                phase: 0.0,
+                range: NoiseRange::Unsigned,
+            }),
+        )
+        .unwrap();
+    let out = baker.bake_output(&graph, (RES, RES), &EvalCtx::default(), false).expect("bake");
+    let px = readback_all_pixels(&ctx, &out.color, (RES, RES));
+    assert!(px.iter().all(|p| *p == px[0]), "a constant input gave a varying field");
+    // 0.125 × 2 cycles is sine's peak, so L = 1 — white.
+    assert!(px[0][0] > 250, "expected the peak of the wave, got {:?}", px[0]);
+}
+
+// ---- Warp (§3) ----------------------------------------------------------
+
+/// The banded-planet shape, end to end: a ramp warped by a noise field,
+/// run through a wave. CPU against GPU over the whole frame.
+///
+/// The warp fetch is a texture read at a displaced UV, so this is really
+/// a test that the scheduler grew the source's bake domain far enough —
+/// a domain one texel short shows up here as the missing grid where the
+/// CPU has data.
+#[test]
+fn cpu_and_gpu_warp_agree() {
+    const RES: u32 = 64;
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+
+    for mode in [WarpMode::Scalar, WarpMode::Vector] {
+        let mut graph = Graph::new();
+        let ramp = graph.output.color.unwrap();
+        graph
+            .set_kind(
+                ramp,
+                LayerKind::ColorRamp(ColorRamp {
+                    stops: vec![
+                        ColorStop {
+                            t: 0.0,
+                            color: ColorInput::Const(Color::new(0.05, 0.0, 0.0, 1.0)),
+                        },
+                        ColorStop {
+                            t: 1.0,
+                            color: ColorInput::Const(Color::new(0.95, 0.0, 0.0, 1.0)),
+                        },
+                    ],
+                    space: BlendSpace::Oklch,
+                }),
+            )
+            .unwrap();
+        let driver = graph
+            .add_layer(
+                "driver",
+                LayerKind::Noise(Noise {
+                    dims: NoiseDims::D2,
+                    seed_offset: 4,
+                    frequency: 5.0,
+                    range: NoiseRange::Signed,
+                    // Vector mode wants three channels to read.
+                    output: match mode {
+                        WarpMode::Scalar => NoiseOutput::Grayscale,
+                        WarpMode::Vector => NoiseOutput::Color,
+                    },
+                    kernel: NoiseKernel::Value,
+                    ..Noise::default()
+                }),
+            )
+            .unwrap();
+        let warp = graph
+            .add_layer(
+                "warp",
+                LayerKind::Warp(Warp {
+                    source: Some(ramp),
+                    by: Some(driver),
+                    mode,
+                    // Only u and v: the GPU baker cannot displace w, and
+                    // `Warp`'s doc comment says so.
+                    amount: [0.15, 0.15, 0.0],
+                }),
+            )
+            .unwrap();
+        graph
+            .set_output(Output {
+                color: Some(warp),
+                roughness: ScalarInput::Const(0.5),
+                metallic: ScalarInput::Const(0.0),
+                normal: None,
+            })
+            .unwrap();
+
+        let eval = EvalCtx::default();
+        let out = baker.bake_output(&graph, (RES, RES), &eval, false).expect("bake");
+        let px = readback_all_pixels(&ctx, &out.color, (RES, RES));
+        let mut worst = 0u32;
+        for y in 0..RES {
+            for x in 0..RES {
+                let u = (x as f32 + 0.5) / RES as f32;
+                let v = (y as f32 + 0.5) / RES as f32;
+                let m = texture_graph_core::evaluate_material(
+                    &graph,
+                    texture_graph_core::Sample::new(u, v, texture_graph_core::FLAT_W),
+                    &eval,
+                );
+                let expected = to_srgb8(m.color);
+                let got = px[(y * RES + x) as usize];
+                for i in 0..3 {
+                    worst = worst.max((expected[i] as i32 - got[i] as i32).unsigned_abs());
+                }
+            }
+        }
+        // Looser than the noise contract: the GPU reads the source at the
+        // nearest texel of the displaced UV while the CPU evaluates it
+        // exactly there, so a warp across a steep gradient lands up to
+        // half a texel apart. Over a ramp this frame that is a few steps,
+        // not a different picture.
+        assert!(worst <= 6, "{mode:?}: worst sRGB delta {worst}");
+    }
+}
+
+/// The scheduler has to grow the warped source's bake domain by
+/// `|amount|`, or the fetch lands outside baked territory and the whole
+/// frame turns into the missing grid at the edges.
+#[test]
+fn a_warp_widens_its_sources_bake_domain() {
+    let mut graph = Graph::new();
+    let src = graph.output.color.unwrap();
+    let driver = add_mix(&mut graph, "driver", src, src);
+    let warp = graph
+        .add_layer(
+            "warp",
+            LayerKind::Warp(Warp {
+                source: Some(src),
+                by: Some(driver),
+                mode: WarpMode::Scalar,
+                amount: [0.3, 0.2, 0.0],
+            }),
+        )
+        .unwrap();
+    graph
+        .set_output(Output {
+            color: Some(warp),
+            roughness: ScalarInput::Const(0.5),
+            metallic: ScalarInput::Const(0.0),
+            normal: None,
+        })
+        .unwrap();
+    let sched = crate::schedule::schedule(&graph, &EvalCtx::default()).expect("schedule");
+    let d = sched.domain_of[&src];
+    assert!((d.min[0] + 0.3).abs() < 1e-6, "u min {}", d.min[0]);
+    assert!((d.max[0] - 1.3).abs() < 1e-6, "u max {}", d.max[0]);
+    assert!((d.min[1] + 0.2).abs() < 1e-6, "v min {}", d.min[1]);
+    assert!((d.max[1] - 1.2).abs() < 1e-6, "v max {}", d.max[1]);
+    // The driver is read at the warp's own coordinates, so it stays put.
+    assert_eq!(sched.domain_of[&driver], crate::schedule::Domain::UNIT);
+    assert_eq!(sched.domain_of[&warp], crate::schedule::Domain::UNIT);
+}
+
+// ---- Named parameters (§6) ----------------------------------------------
+
+/// One graph, several bakes, different pictures — and each of them still
+/// matching the CPU evaluator under the same bindings.
+///
+/// This is the claim that makes a graph worth transmitting: the wire
+/// carries it once and per-instance variation is a small block of values.
+#[test]
+fn one_graph_bakes_differently_under_different_bindings() {
+    const RES: u32 = 32;
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+
+    // A ramp whose far stop is a color parameter, mixed toward black by a
+    // scalar parameter: palette and contrast, the consumer's two axes.
+    let mut graph = Graph::new();
+    graph
+        .declare_param(ParamDecl::color("tint", Color::new(0.2, 0.0, 0.0, 1.0)))
+        .unwrap();
+    graph
+        .declare_param(ParamDecl::scalar("contrast", 0.0, 1.0, 0.25))
+        .unwrap();
+    let ramp = graph.output.color.unwrap();
+    graph
+        .set_kind(
+            ramp,
+            LayerKind::ColorRamp(ColorRamp {
+                stops: vec![
+                    ColorStop {
+                        t: 0.0,
+                        color: ColorInput::Const(Color::new(0.05, 0.0, 0.0, 1.0)),
+                    },
+                    ColorStop { t: 1.0, color: ColorInput::Param("tint".into()) },
+                ],
+                space: BlendSpace::Oklch,
+            }),
+        )
+        .unwrap();
+    let dark = graph
+        .add_layer("dark", LayerKind::Color(Color::new(0.0, 0.0, 0.0, 1.0)))
+        .unwrap();
+    let mixed = graph
+        .add_layer(
+            "mixed",
+            LayerKind::Mix(Mix {
+                a: Some(dark),
+                b: Some(ramp),
+                mode: BlendMode::Blend,
+                factor: ScalarInput::Param("contrast".into()),
+                space: BlendSpace::Oklch,
+            }),
+        )
+        .unwrap();
+    graph
+        .set_output(Output {
+            color: Some(mixed),
+            // A parameter on an output scalar channel goes through the
+            // scheduler rather than a dispatch, so it is worth covering.
+            roughness: ScalarInput::Param("contrast".into()),
+            metallic: ScalarInput::Const(0.0),
+            normal: None,
+        })
+        .unwrap();
+
+    let bindings: [(&str, EvalCtx); 3] = [
+        ("defaults", EvalCtx::default()),
+        (
+            "bright teal",
+            EvalCtx::default()
+                .with_param("tint", ParamValue::Color(Color::new(0.85, 0.1, 190.0, 1.0)))
+                .with_param("contrast", ParamValue::Scalar(1.0)),
+        ),
+        (
+            "dim rust",
+            EvalCtx::default()
+                .with_param("tint", ParamValue::Color(Color::new(0.45, 0.12, 40.0, 1.0)))
+                .with_param("contrast", ParamValue::Scalar(0.6)),
+        ),
+    ];
+
+    let mut frames = Vec::new();
+    for (label, eval) in &bindings {
+        let out = baker.bake_output(&graph, (RES, RES), eval, false).expect("bake");
+        let px = readback_all_pixels(&ctx, &out.color, (RES, RES));
+        // Same bindings, same picture as the CPU evaluator.
+        let mut worst = 0u32;
+        for y in 0..RES {
+            for x in 0..RES {
+                let u = (x as f32 + 0.5) / RES as f32;
+                let v = (y as f32 + 0.5) / RES as f32;
+                let m = texture_graph_core::evaluate_material(
+                    &graph,
+                    texture_graph_core::Sample::new(u, v, texture_graph_core::FLAT_W),
+                    eval,
+                );
+                let expected = to_srgb8(m.color);
+                let got = px[(y * RES + x) as usize];
+                for i in 0..3 {
+                    worst = worst.max((expected[i] as i32 - got[i] as i32).unsigned_abs());
+                }
+            }
+        }
+        assert!(worst <= 1, "{label}: worst sRGB delta {worst}");
+
+        // And the roughness channel, which the scheduler resolved.
+        let rough = readback_all_pixels(&ctx, &out.roughness, (RES, RES));
+        let want = texture_graph_core::evaluate_material(
+            &graph,
+            texture_graph_core::Sample::flat(0.5, 0.5),
+            eval,
+        )
+        .roughness;
+        let got = rough[0][0] as f32 / 255.0;
+        // The channel is sRGB-encoded for display, so compare in that space.
+        let want_srgb = if want <= 0.0031308 {
+            12.92 * want
+        } else {
+            1.055 * want.powf(1.0 / 2.4) - 0.055
+        };
+        assert!(
+            (got - want_srgb).abs() <= 2.0 / 255.0,
+            "{label}: roughness {got} vs {want_srgb}"
+        );
+        frames.push((label, px));
+    }
+
+    // Different bindings have to give different pictures, or the test
+    // above would pass on three identical bakes.
+    for i in 0..frames.len() {
+        for j in (i + 1)..frames.len() {
+            assert_ne!(
+                frames[i].1, frames[j].1,
+                "{} and {} baked the same picture",
+                frames[i].0, frames[j].0
+            );
+        }
+    }
+}
+
+/// A parameter is resolved before any dispatch is recorded, so a bake of a
+/// parameterised graph costs exactly what the equivalent constant graph
+/// does: same schedule, same slots, same dispatches.
+#[test]
+fn a_parameter_costs_the_same_as_the_constant_it_stands_in_for() {
+    let mut param_graph = Graph::new();
+    param_graph
+        .declare_param(ParamDecl::scalar("k", 0.0, 1.0, 0.3))
+        .unwrap();
+    let base = param_graph.output.color.unwrap();
+    let other = param_graph
+        .add_layer("other", LayerKind::Color(Color::new(0.9, 0.0, 0.0, 1.0)))
+        .unwrap();
+    let mix = |factor: ScalarInput| {
+        LayerKind::Mix(Mix {
+            a: Some(base),
+            b: Some(other),
+            mode: BlendMode::Blend,
+            factor,
+            space: BlendSpace::Oklch,
+        })
+    };
+    let m = param_graph
+        .add_layer("m", mix(ScalarInput::Param("k".into())))
+        .unwrap();
+    param_graph
+        .set_output(Output {
+            color: Some(m),
+            roughness: ScalarInput::Param("k".into()),
+            metallic: ScalarInput::Const(0.0),
+            normal: None,
+        })
+        .unwrap();
+
+    let mut const_graph = param_graph.clone();
+    const_graph.remove_param("k").unwrap();
+
+    let eval = EvalCtx::default();
+    let a = crate::schedule::schedule(&param_graph, &eval).expect("schedule");
+    let b = crate::schedule::schedule(&const_graph, &eval).expect("schedule");
+    assert_eq!(a.order, b.order);
+    assert_eq!(a.peak_slots, b.peak_slots);
+    // `remove_param` froze the channel at the declared 0.3, and the
+    // parameterised graph resolves to the same number.
+    let (crate::ScalarSlot::Const(x), crate::ScalarSlot::Const(y)) =
+        (a.output_slots.roughness, b.output_slots.roughness)
+    else {
+        panic!("both should have resolved to a constant")
+    };
+    assert_eq!(x, y);
+    assert_eq!(x, 0.3);
 }
