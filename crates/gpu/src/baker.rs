@@ -257,7 +257,8 @@ impl Baker {
         wanted: Option<&HashSet<LayerId>>,
     ) -> Result<HashMap<LayerId, wgpu::Texture>, BakeError> {
         const PREVIEW_SIZE: (u32, u32) = (128, 128);
-        let sched = schedule_previews(graph, wanted)?;
+        let eval_ctx = &graph.resolve_params(eval_ctx);
+        let sched = schedule_previews(graph, wanted, eval_ctx)?;
         let size = PREVIEW_SIZE;
         let device = self.ctx.device.clone();
 
@@ -438,11 +439,12 @@ impl Baker {
             }
             LayerKind::Mix(m) => {
                 let a_view = resolve(m.a);
-                let (factor_view, dom_factor) = match m.factor {
-                    ScalarInput::Layer(id) => (resolve(Some(id)), dom_opt(Some(id))),
+                let (factor_view, dom_factor) = match &m.factor {
+                    ScalarInput::Layer(id) => (resolve(Some(*id)), dom_opt(Some(*id))),
                     // Bind `a` as a placeholder for the factor texture; the
-                    // shader only samples it when factor_is_layer == 1.
-                    ScalarInput::Const(_) => (a_view, dom_opt(m.a)),
+                    // shader only samples it when factor_is_layer == 1. A
+                    // parameter is a number by now, so it takes this path.
+                    ScalarInput::Const(_) | ScalarInput::Param(_) => (a_view, dom_opt(m.a)),
                 };
                 dispatch_mix(
                     &self.ctx,
@@ -454,6 +456,7 @@ impl Baker {
                     resolve(m.b),
                     factor_view,
                     m,
+                    eval_ctx,
                     size,
                     own_dom,
                     dom_opt(m.a),
@@ -526,9 +529,11 @@ impl Baker {
                 // A const input never reads the texture; bind the output's
                 // own domain's placeholder rather than leave the slot
                 // unbound, as Mix does for its factor.
-                let (src_view, dom_input) = match wv.input {
-                    ScalarInput::Layer(id) => (resolve(Some(id)), dom_opt(Some(id))),
-                    ScalarInput::Const(_) => (missing_view, Domain::UNIT.packed()),
+                let (src_view, dom_input) = match &wv.input {
+                    ScalarInput::Layer(id) => (resolve(Some(*id)), dom_opt(Some(*id))),
+                    ScalarInput::Const(_) | ScalarInput::Param(_) => {
+                        (missing_view, Domain::UNIT.packed())
+                    }
                 };
                 dispatch_wave(
                     &self.ctx,
@@ -538,6 +543,7 @@ impl Baker {
                     &pool_views[dst_slot],
                     src_view,
                     wv,
+                    eval_ctx,
                     size,
                     own_dom,
                     dom_input,
@@ -554,6 +560,7 @@ impl Baker {
                     &self.ramp_bgl,
                     &pool_views[dst_slot],
                     r,
+                    eval_ctx,
                     sched,
                     pool_views,
                     &self.dummy_input_view,
@@ -617,7 +624,11 @@ impl Baker {
         object_alpha: bool,
     ) -> Result<BakeOutput, BakeError> {
         let t0 = BakeTimer::start();
-        let sched = schedule(graph)?;
+        // Bind the graph's named parameters once, here: from this point on
+        // a `Param` socket is the same number a `Const` one would be, and
+        // no shader has to know the difference.
+        let eval_ctx = &graph.resolve_params(eval_ctx);
+        let sched = schedule(graph, eval_ctx)?;
         self.ensure_pool(size, sched.peak_slots.max(1));
 
         let mut encoder = self
@@ -659,14 +670,12 @@ impl Baker {
             }
         };
         let color_dom = chan_dom(graph.output.color);
-        let rough_dom = match graph.output.roughness {
-            ScalarInput::Layer(id) => chan_dom(Some(id)),
-            ScalarInput::Const(_) => Domain::UNIT.packed(),
+        let scalar_chan_dom = |si: &ScalarInput| match si {
+            ScalarInput::Layer(id) => chan_dom(Some(*id)),
+            _ => Domain::UNIT.packed(),
         };
-        let metal_dom = match graph.output.metallic {
-            ScalarInput::Layer(id) => chan_dom(Some(id)),
-            ScalarInput::Const(_) => Domain::UNIT.packed(),
-        };
+        let rough_dom = scalar_chan_dom(&graph.output.roughness);
+        let metal_dom = scalar_chan_dom(&graph.output.metallic);
         let normal_dom = chan_dom(graph.output.normal);
         let color = make_output_texture(&self.ctx.device, size, "tg-color");
         let roughness = make_output_texture(&self.ctx.device, size, "tg-rough");
@@ -784,6 +793,7 @@ impl Baker {
         format: ScalarFormat,
         eval_ctx: &EvalCtx,
     ) -> Result<wgpu::Texture, BakeError> {
+        let eval_ctx = &graph.resolve_params(eval_ctx);
         let sched = schedule_layer(graph, layer)?;
         self.ensure_pool(size, sched.peak_slots.max(1));
 
@@ -826,6 +836,7 @@ impl Baker {
         eval_ctx: &EvalCtx,
     ) -> Result<ScalarVolume, BakeError> {
         let t0 = BakeTimer::start();
+        let eval_ctx = &graph.resolve_params(eval_ctx);
         let sched = schedule_layer(graph, layer)?;
         let size = (res, res);
         self.ensure_pool(size, sched.peak_slots.max(1));
@@ -954,7 +965,8 @@ impl Baker {
         eval_ctx: &EvalCtx,
     ) -> Result<VolumeOutput, BakeError> {
         let t0 = BakeTimer::start();
-        let sched = schedule(graph)?;
+        let eval_ctx = &graph.resolve_params(eval_ctx);
+        let sched = schedule(graph, eval_ctx)?;
         let size = (res, res);
         self.ensure_pool(size, sched.peak_slots.max(1));
 
@@ -987,13 +999,13 @@ impl Baker {
         };
         let chan_doms: [[f32; 4]; 4] = [
             chan_dom(graph.output.color),
-            match graph.output.roughness {
-                ScalarInput::Layer(id) => chan_dom(Some(id)),
-                ScalarInput::Const(_) => Domain::UNIT.packed(),
+            match &graph.output.roughness {
+                ScalarInput::Layer(id) => chan_dom(Some(*id)),
+                _ => Domain::UNIT.packed(),
             },
-            match graph.output.metallic {
-                ScalarInput::Layer(id) => chan_dom(Some(id)),
-                ScalarInput::Const(_) => Domain::UNIT.packed(),
+            match &graph.output.metallic {
+                ScalarInput::Layer(id) => chan_dom(Some(*id)),
+                _ => Domain::UNIT.packed(),
             },
             chan_dom(graph.output.normal),
         ];
@@ -1424,6 +1436,7 @@ fn dispatch_wave(
     dst_view: &wgpu::TextureView,
     src_view: &wgpu::TextureView,
     w: &Wave,
+    eval_ctx: &EvalCtx,
     size: (u32, u32),
     dom: [f32; 4],
     dom_input: [f32; 4],
@@ -1434,9 +1447,9 @@ fn dispatch_wave(
         WaveShape::Square => 2,
         WaveShape::Sawtooth => 3,
     };
-    let (input_const, input_is_layer) = match w.input {
-        ScalarInput::Const(v) => (v, 0u32),
-        ScalarInput::Layer(_) => (0.0, 1u32),
+    let (input_const, input_is_layer) = match eval_ctx.scalar_const(&w.input) {
+        Some(v) => (v, 0u32),
+        None => (0.0, 1u32),
     };
     let params = WaveParams {
         size: [size.0, size.1],
@@ -1562,6 +1575,7 @@ fn dispatch_mix(
     b_view: &wgpu::TextureView,
     factor_view: &wgpu::TextureView,
     m: &Mix,
+    eval_ctx: &EvalCtx,
     size: (u32, u32),
     dom: [f32; 4],
     dom_a: [f32; 4],
@@ -1574,9 +1588,9 @@ fn dispatch_mix(
         BlendMode::Multiply => 2,
         BlendMode::Blend => 3,
     };
-    let (factor_const, factor_is_layer) = match m.factor {
-        ScalarInput::Const(v) => (v, 0u32),
-        ScalarInput::Layer(_) => (0.0, 1u32),
+    let (factor_const, factor_is_layer) = match eval_ctx.scalar_const(&m.factor) {
+        Some(v) => (v, 0u32),
+        None => (0.0, 1u32),
     };
     let params = MixParams {
         size: [size.0, size.1],
@@ -1734,6 +1748,7 @@ fn dispatch_ramp(
     bgl: &wgpu::BindGroupLayout,
     dst_view: &wgpu::TextureView,
     r: &ColorRamp,
+    eval_ctx: &EvalCtx,
     sched: &Schedule,
     pool_views: &[wgpu::TextureView],
     dummy_input_view: &wgpu::TextureView,
@@ -1748,7 +1763,8 @@ fn dispatch_ramp(
     let mut input_pool_slots: Vec<u32> = Vec::new();
     let mut input_doms = [Domain::UNIT.packed(); MAX_RAMP_INPUTS];
     for s in &r.stops {
-        if let ColorInput::Layer(id) = s.color {
+        if let ColorInput::Layer(id) = &s.color {
+            let id = *id;
             if !layer_to_input.contains_key(&id) {
                 if input_pool_slots.len() >= MAX_RAMP_INPUTS {
                     return Err(BakeError::Unsupported(
@@ -1773,17 +1789,23 @@ fn dispatch_ramp(
 
     let mut packed = Vec::with_capacity(r.stops.len());
     for s in &r.stops {
-        match s.color {
-            ColorInput::Const(c) => packed.push(RampStopPacked {
+        // A parameter is a colour by now, so it packs exactly as a
+        // constant does — which is the whole claim that a param costs
+        // nothing per pixel.
+        match eval_ctx.color_const(&s.color) {
+            Some(c) => packed.push(RampStopPacked {
                 color: [c.l, c.chroma, c.hue.into_degrees(), c.alpha],
                 t: s.t,
                 kind: 0,
                 input_index: 0,
                 _p0: 0.0,
             }),
-            ColorInput::Layer(id) => {
+            None => {
+                let ColorInput::Layer(id) = &s.color else {
+                    unreachable!("color_const covers everything but Layer")
+                };
                 let input_index = *layer_to_input
-                    .get(&id)
+                    .get(id)
                     .expect("layer resolved into input map above");
                 packed.push(RampStopPacked {
                     color: [0.0; 4],

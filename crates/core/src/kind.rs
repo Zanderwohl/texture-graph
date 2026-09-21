@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::color::{BlendSpace, Color};
 use crate::id::LayerId;
+use crate::param::ParamUse;
 
 /// One of the discriminated node types in the graph.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39,28 +40,28 @@ impl LayerKind {
     /// ids and order.
     pub fn inputs(&self) -> Vec<LayerId> {
         let mut out = Vec::new();
-        let push_color = |out: &mut Vec<LayerId>, ci: ColorInput| {
+        let push_color = |out: &mut Vec<LayerId>, ci: &ColorInput| {
             if let ColorInput::Layer(id) = ci {
-                out.push(id);
+                out.push(*id);
             }
         };
-        let push_scalar = |out: &mut Vec<LayerId>, si: ScalarInput| {
+        let push_scalar = |out: &mut Vec<LayerId>, si: &ScalarInput| {
             if let ScalarInput::Layer(id) = si {
-                out.push(id);
+                out.push(*id);
             }
         };
         match self {
             LayerKind::Color(_) | LayerKind::Noise(_) => {}
             LayerKind::ColorRamp(r) => {
                 for s in &r.stops {
-                    push_color(&mut out, s.color);
+                    push_color(&mut out, &s.color);
                 }
             }
             LayerKind::Transform(t) => out.extend(t.source),
             LayerKind::Mix(m) => {
                 out.extend(m.a);
                 out.extend(m.b);
-                push_scalar(&mut out, m.factor);
+                push_scalar(&mut out, &m.factor);
             }
             LayerKind::Map(m) => {
                 out.extend(m.value);
@@ -71,7 +72,7 @@ impl LayerKind {
                 out.extend(mm.b);
             }
             LayerKind::HeightToNormal(h) => out.extend(h.source),
-            LayerKind::Wave(w) => push_scalar(&mut out, w.input),
+            LayerKind::Wave(w) => push_scalar(&mut out, &w.input),
             LayerKind::Warp(w) => {
                 out.extend(w.source);
                 out.extend(w.by);
@@ -79,24 +80,69 @@ impl LayerKind {
         }
         out
     }
+
+    /// Every parameter this node reads, with the sort of socket reading
+    /// it. Paired with [`LayerKind::inputs`]: one reports layer edges, the
+    /// other name edges, and [`crate::Graph`] validates both on the same
+    /// paths.
+    pub fn param_refs(&self) -> Vec<(&str, ParamUse)> {
+        let mut out = Vec::new();
+        match self {
+            LayerKind::Color(_) | LayerKind::Noise(_) => {}
+            LayerKind::ColorRamp(r) => {
+                for s in &r.stops {
+                    if let ColorInput::Param(name) = &s.color {
+                        out.push((name.as_str(), ParamUse::Color));
+                    }
+                }
+            }
+            LayerKind::Mix(m) => {
+                if let ScalarInput::Param(name) = &m.factor {
+                    out.push((name.as_str(), ParamUse::Scalar));
+                }
+            }
+            LayerKind::Wave(w) => {
+                if let ScalarInput::Param(name) = &w.input {
+                    out.push((name.as_str(), ParamUse::Scalar));
+                }
+            }
+            LayerKind::Transform(_)
+            | LayerKind::Map(_)
+            | LayerKind::MinMax(_)
+            | LayerKind::HeightToNormal(_)
+            | LayerKind::Warp(_) => {}
+        }
+        out
+    }
 }
 
 // ---- Inputs -------------------------------------------------------------
 
-/// A color-valued input: either a constant chosen in the UI or another
-/// layer's output.
-#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+/// A color-valued input: a constant chosen in the UI, another layer's
+/// output, or a named parameter bound at bake time.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ColorInput {
     Const(Color),
     Layer(LayerId),
+    /// Reads [`crate::Graph::params`] by name, overridden per bake by
+    /// [`crate::EvalCtx::params`]. The name must be declared and must be a
+    /// [`crate::ParamKind::Color`]; the graph mutators reject anything
+    /// else, so neither backend has to decide what a stray name means.
+    ///
+    /// On the GPU this costs nothing per pixel — it resolves to the same
+    /// uniform a `Const` would.
+    Param(String),
 }
 
 /// A scalar-valued input. When a layer is referenced, its color's Oklch L
 /// (perceptual lightness) is used as the scalar.
-#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ScalarInput {
     Const(f32),
     Layer(LayerId),
+    /// Reads [`crate::Graph::params`] by name — see [`ColorInput::Param`].
+    /// The declared kind must be [`crate::ParamKind::Scalar`].
+    Param(String),
 }
 
 // ---- Node payloads ------------------------------------------------------
@@ -247,7 +293,7 @@ pub struct ColorRamp {
     pub space: BlendSpace,
 }
 
-#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ColorStop {
     pub t: f32,
     pub color: ColorInput,
@@ -320,7 +366,7 @@ pub enum RadialDim {
 }
 
 /// Blend two color layers.
-#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Mix {
     /// `None` renders as the missing-texture grid.
     pub a: Option<LayerId>,
@@ -442,7 +488,7 @@ pub enum WarpMode {
 /// transcendental, so the CPU and GPU implementations agree to within one
 /// sRGB step rather than bit-exactly, and the parity test asserts the
 /// looser bound rather than pretending otherwise.
-#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Wave {
     /// Scalar to run the wave over. A `Const` makes the whole layer one
     /// flat value, which is valid and rarely what anybody wants.

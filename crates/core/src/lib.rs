@@ -14,6 +14,7 @@ pub mod graph;
 pub mod id;
 pub mod kind;
 pub mod noise;
+pub mod param;
 pub mod socket;
 
 pub use color::{BlendSpace, Color};
@@ -32,4 +33,5 @@ pub use kind::{
     Noise, NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, RadialDim, ScalarInput,
     Transform, Warp, WarpMode, Wave, WaveShape,
 };
+pub use param::{ParamDecl, ParamKind, ParamUse, ParamValue};
 pub use socket::{ConstValue, InputKey, InputSocket, SocketError, SocketValue};

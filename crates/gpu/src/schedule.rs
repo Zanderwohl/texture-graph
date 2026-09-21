@@ -18,8 +18,8 @@
 use std::collections::{HashMap, HashSet};
 
 use texture_graph_core::{
-    Axis, CoordMode, EXTEND_LIMIT, EdgeMode, Graph, LayerId, LayerKind, RadialDim, ScalarInput,
-    Transform, Warp,
+    Axis, CoordMode, EXTEND_LIMIT, EdgeMode, EvalCtx, Graph, LayerId, LayerKind, RadialDim,
+    ScalarInput, Transform, Warp,
 };
 
 /// Fully-resolved dispatch plan for one bake.
@@ -265,7 +265,8 @@ impl std::error::Error for ScheduleError {}
 
 /// Build a `Schedule` for `graph`. Only layers reachable from `Output` are
 /// included; unreachable layers cost neither dispatches nor slots.
-pub fn schedule(graph: &Graph) -> Result<Schedule, ScheduleError> {
+pub fn schedule(graph: &Graph, ctx: &EvalCtx) -> Result<Schedule, ScheduleError> {
+    let ctx = &graph.resolve_params(ctx);
     let output_roots = output_referenced(graph);
     let plan = plan_from(graph, &output_roots)?;
 
@@ -275,8 +276,8 @@ pub fn schedule(graph: &Graph) -> Result<Schedule, ScheduleError> {
             Some(id) => Some(*plan.slot_of.get(&id).ok_or(ScheduleError::UnknownLayer(id))?),
             None => None,
         },
-        roughness: scalar_to_slot(&graph.output.roughness, &plan.slot_of)?,
-        metallic: scalar_to_slot(&graph.output.metallic, &plan.slot_of)?,
+        roughness: scalar_to_slot(&graph.output.roughness, &plan.slot_of, ctx)?,
+        metallic: scalar_to_slot(&graph.output.metallic, &plan.slot_of, ctx)?,
         normal: match graph.output.normal {
             Some(id) => Some(
                 *plan.slot_of.get(&id).ok_or(ScheduleError::UnknownLayer(id))?,
@@ -417,8 +418,8 @@ fn plan_from(graph: &Graph, roots: &[LayerId]) -> Result<Plan, ScheduleError> {
 /// One texture per layer, no reuse — used for the per-layer preview pass
 /// where every intermediate must survive to the end so it can be read back
 /// into egui.
-pub fn schedule_no_reuse(graph: &Graph) -> Result<Schedule, ScheduleError> {
-    schedule_previews(graph, None)
+pub fn schedule_no_reuse(graph: &Graph, ctx: &EvalCtx) -> Result<Schedule, ScheduleError> {
+    schedule_previews(graph, None, ctx)
 }
 
 /// The preview schedule for `wanted` — those layers and everything they
@@ -438,7 +439,9 @@ pub fn schedule_no_reuse(graph: &Graph) -> Result<Schedule, ScheduleError> {
 pub fn schedule_previews(
     graph: &Graph,
     wanted: Option<&HashSet<LayerId>>,
+    ctx: &EvalCtx,
 ) -> Result<Schedule, ScheduleError> {
+    let ctx = &graph.resolve_params(ctx);
     // Everything, in dependency order — what the domains are computed from,
     // and the whole schedule when `wanted` is `None`.
     let everything: HashSet<LayerId> = graph.layers.iter().map(|l| l.id).collect();
@@ -460,8 +463,8 @@ pub fn schedule_previews(
     // layer's own slot — so a missing root is not an error here.
     let output_slots = OutputSlots {
         color: graph.output.color.and_then(|id| slot_of.get(&id).copied()),
-        roughness: scalar_slot_lenient(&graph.output.roughness, &slot_of),
-        metallic: scalar_slot_lenient(&graph.output.metallic, &slot_of),
+        roughness: scalar_slot_lenient(&graph.output.roughness, &slot_of, ctx),
+        metallic: scalar_slot_lenient(&graph.output.metallic, &slot_of, ctx),
         normal: graph.output.normal.and_then(|id| slot_of.get(&id).copied()),
     };
     Ok(Schedule { order, slot_of, peak_slots, output_slots, domain_of })
@@ -503,14 +506,18 @@ fn topo_over(graph: &Graph, required: &HashSet<LayerId>) -> Result<Vec<LayerId>,
 /// Like [`scalar_to_slot`], but a layer that isn't scheduled falls back to
 /// a constant instead of failing. Only for the preview pass, which doesn't
 /// read output slots.
-fn scalar_slot_lenient(s: &ScalarInput, slot_of: &HashMap<LayerId, u32>) -> ScalarSlot {
-    match *s {
-        ScalarInput::Const(v) => ScalarSlot::Const(v),
-        ScalarInput::Layer(id) => match slot_of.get(&id) {
+fn scalar_slot_lenient(
+    s: &ScalarInput,
+    slot_of: &HashMap<LayerId, u32>,
+    ctx: &EvalCtx,
+) -> ScalarSlot {
+    if let ScalarInput::Layer(id) = s {
+        return match slot_of.get(id) {
             Some(slot) => ScalarSlot::Slot(*slot),
             None => ScalarSlot::Const(0.0),
-        },
+        };
     }
+    ScalarSlot::Const(ctx.scalar_const(s).unwrap_or(0.0))
 }
 
 fn output_referenced(graph: &Graph) -> Vec<LayerId> {
@@ -528,16 +535,20 @@ fn output_referenced(graph: &Graph) -> Vec<LayerId> {
     out
 }
 
+/// A scalar output channel is either baked (it reads a layer) or a
+/// number. A parameter is a number — resolved here, once, rather than
+/// carried to the shader as a name.
 fn scalar_to_slot(
     s: &ScalarInput,
     slot_of: &HashMap<LayerId, u32>,
+    ctx: &EvalCtx,
 ) -> Result<ScalarSlot, ScheduleError> {
-    Ok(match *s {
-        ScalarInput::Const(v) => ScalarSlot::Const(v),
-        ScalarInput::Layer(id) => ScalarSlot::Slot(
-            *slot_of.get(&id).ok_or(ScheduleError::UnknownLayer(id))?,
-        ),
-    })
+    if let ScalarInput::Layer(id) = s {
+        return Ok(ScalarSlot::Slot(
+            *slot_of.get(id).ok_or(ScheduleError::UnknownLayer(*id))?,
+        ));
+    }
+    Ok(ScalarSlot::Const(ctx.scalar_const(s).unwrap_or(0.0)))
 }
 
 fn topo_dfs(
@@ -570,7 +581,7 @@ fn topo_dfs(
 mod tests {
     use super::*;
     use texture_graph_core::{
-        BlendMode, BlendSpace, Color, Graph, LayerKind, Mix, Output, ScalarInput,
+        BlendMode, BlendSpace, Color, EvalCtx, Graph, LayerKind, Mix, Output, ScalarInput,
     };
 
     fn base_graph() -> Graph {
@@ -663,7 +674,7 @@ mod tests {
             normal: None,
         })
         .unwrap();
-        let s = schedule(&g).unwrap();
+        let s = schedule(&g, &EvalCtx::default()).unwrap();
         assert_valid_allocation(&g, &s);
         // Peak here: at the moment `ab` dispatches, both `a` and `b` are
         // live plus `ab`'s new slot, but `a` and `b` are freed after `ab`
@@ -689,7 +700,7 @@ mod tests {
             normal: None,
         })
         .unwrap();
-        let s = schedule(&g).unwrap();
+        let s = schedule(&g, &EvalCtx::default()).unwrap();
         assert_valid_allocation(&g, &s);
         // At `bc` dispatch: bc, b, c all live => >= 3.
         assert!(s.peak_slots >= 3, "peak_slots was {}", s.peak_slots);
@@ -713,7 +724,7 @@ mod tests {
             normal: None,
         })
         .unwrap();
-        let s = schedule(&g).unwrap();
+        let s = schedule(&g, &EvalCtx::default()).unwrap();
         assert_valid_allocation(&g, &s);
     }
 
@@ -730,7 +741,7 @@ mod tests {
             normal: None,
         })
         .unwrap();
-        let s = schedule_no_reuse(&g).unwrap();
+        let s = schedule_no_reuse(&g, &EvalCtx::default()).unwrap();
         let mut slots: Vec<u32> = s.slot_of.values().copied().collect();
         slots.sort();
         slots.dedup();
@@ -772,7 +783,7 @@ mod tests {
             normal: None,
         })
         .unwrap();
-        let s = schedule(&g).unwrap();
+        let s = schedule(&g, &EvalCtx::default()).unwrap();
         let d = s.domain_of[&src];
         // Transform samples u in [0, 3]; unit baseline keeps v at [0, 1].
         assert_eq!(d.min, [0.0, 0.0]);
@@ -795,7 +806,7 @@ mod tests {
             normal: None,
         })
         .unwrap();
-        let s = schedule(&g).unwrap();
+        let s = schedule(&g, &EvalCtx::default()).unwrap();
         assert_eq!(s.domain_of[&src], Domain::UNIT);
     }
 
@@ -818,7 +829,7 @@ mod tests {
             normal: None,
         })
         .unwrap();
-        let s = schedule(&g).unwrap();
+        let s = schedule(&g, &EvalCtx::default()).unwrap();
         // t1's domain: widened by t2 to u in [0, 2].
         assert!((s.domain_of[&t1].max[0] - 2.0).abs() < 1e-6);
         // src: union of t1's request over its widened domain ([0, 4]) and
@@ -853,7 +864,7 @@ mod tests {
             normal: None,
         })
         .unwrap();
-        let s = schedule(&g).unwrap();
+        let s = schedule(&g, &EvalCtx::default()).unwrap();
         // r_max ~ 40 but the radial request is conservative, so it caps.
         let d = s.domain_of[&src];
         assert!((d.max[0] - (0.5 + EXTEND_LIMIT)).abs() < 1e-4, "u max {}", d.max[0]);
@@ -864,7 +875,7 @@ mod tests {
         let mut g = base_graph();
         let _dead = add_color(&mut g, "dead");
         // Output still points at the auto-created base color layer.
-        let s = schedule(&g).unwrap();
+        let s = schedule(&g, &EvalCtx::default()).unwrap();
         assert_eq!(s.order.len(), 1);
     }
 }

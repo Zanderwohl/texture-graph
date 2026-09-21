@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::color::{Color, blend, normal_to_color, scalar_of};
 use crate::graph::{Graph, Layer};
 use crate::id::LayerId;
+use crate::param::ParamValue;
 use crate::kind::{
     Axis, BlendMode, ColorInput, ColorRamp, CoordMode, Criterion, EXTEND_LIMIT, EdgeMode,
     FractalMode, HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims,
@@ -43,16 +44,68 @@ impl Sample {
 }
 
 /// Ambient parameters that stay constant across a whole bake — the global
-/// noise seed, and finite-difference step used by `HeightToNormal`.
-#[derive(Copy, Clone, Debug)]
+/// noise seed, the finite-difference step `HeightToNormal` uses, and the
+/// bindings for the graph's named parameters.
+///
+/// No longer `Copy`: `params` owns its names. Clone it, or pass it by
+/// reference as every entry point here does.
+#[derive(Clone, Debug)]
 pub struct EvalCtx {
     pub seed: u32,
     pub normal_epsilon: f32,
+    /// Bindings for [`Graph::params`], by name. A parameter left out here
+    /// takes its declared default — see [`Graph::resolve_params`], which
+    /// every entry point runs before evaluating.
+    pub params: BTreeMap<String, ParamValue>,
+}
+
+impl EvalCtx {
+    /// The constant this scalar socket reads, or `None` when it reads a
+    /// layer and so has to be baked rather than supplied as a uniform.
+    ///
+    /// `self` must already be resolved — see [`Graph::resolve_params`].
+    /// That is what makes a parameter cost nothing on the GPU: by the time
+    /// a dispatch is recorded it is the same number a `Const` would be.
+    pub fn scalar_const(&self, si: &ScalarInput) -> Option<f32> {
+        match si {
+            ScalarInput::Const(v) => Some(*v),
+            ScalarInput::Layer(_) => None,
+            ScalarInput::Param(name) => {
+                Some(self.params.get(name.as_str()).and_then(ParamValue::as_scalar).unwrap_or(UNBOUND_SCALAR))
+            }
+        }
+    }
+
+    /// The constant this color socket reads, or `None` when it reads a
+    /// layer. See [`EvalCtx::scalar_const`].
+    pub fn color_const(&self, ci: &ColorInput) -> Option<Color> {
+        match ci {
+            ColorInput::Const(c) => Some(*c),
+            ColorInput::Layer(_) => None,
+            ColorInput::Param(name) => Some(
+                self.params
+                    .get(name.as_str())
+                    .and_then(ParamValue::as_color)
+                    .unwrap_or_else(unbound_color),
+            ),
+        }
+    }
+
+    /// This context with one parameter bound. Chainable, for the common
+    /// case of baking N instances of one graph.
+    pub fn with_param(mut self, name: impl Into<String>, value: ParamValue) -> Self {
+        self.params.insert(name.into(), value);
+        self
+    }
 }
 
 impl Default for EvalCtx {
     fn default() -> Self {
-        Self { seed: 0xC0DED00D, normal_epsilon: 1.0 / 512.0 }
+        Self {
+            seed: 0xC0DED00D,
+            normal_epsilon: 1.0 / 512.0,
+            params: BTreeMap::new(),
+        }
     }
 }
 
@@ -65,8 +118,19 @@ pub struct Material {
     pub normal: Color,
 }
 
+/// What an undeclared parameter reads as. Unreachable for a graph the
+/// mutators built — they reject a kind that names one — so this is the
+/// answer for a hand-assembled `Graph`, not a design decision anybody is
+/// meant to rely on.
+const UNBOUND_SCALAR: f32 = 0.0;
+
+fn unbound_color() -> Color {
+    Color::new(0.0, 0.0, 0.0, 1.0)
+}
+
 /// Evaluate the graph's `Output` at `s` and return every material channel.
 pub fn evaluate_material(g: &Graph, s: Sample, ctx: &EvalCtx) -> Material {
+    let ctx = &g.resolve_params(ctx);
     let by_id: HashMap<LayerId, &Layer> = g.layers.iter().map(|l| (l.id, l)).collect();
     let out = &g.output;
     let color = eval_opt(out.color, s, &by_id, ctx);
@@ -81,6 +145,7 @@ pub fn evaluate_material(g: &Graph, s: Sample, ctx: &EvalCtx) -> Material {
 
 /// Evaluate any single layer's color at `s` — useful for per-layer previews.
 pub fn evaluate(g: &Graph, id: LayerId, s: Sample, ctx: &EvalCtx) -> Color {
+    let ctx = &g.resolve_params(ctx);
     let by_id: HashMap<LayerId, &Layer> = g.layers.iter().map(|l| (l.id, l)).collect();
     eval_layer(id, s, &by_id, ctx)
 }
@@ -138,6 +203,14 @@ fn eval_color_input(ci: &ColorInput, s: Sample, by_id: &HashMap<LayerId, &Layer>
     match ci {
         ColorInput::Const(c) => *c,
         ColorInput::Layer(id) => eval_layer(*id, s, by_id, ctx),
+        // `ctx` has already been resolved against the graph's declarations
+        // by `evaluate`/`evaluate_material`, so a declared name is always
+        // present. A miss means a hand-built graph the mutators never saw.
+        ColorInput::Param(name) => ctx
+            .params
+            .get(name.as_str())
+            .and_then(ParamValue::as_color)
+            .unwrap_or_else(unbound_color),
     }
 }
 
@@ -145,6 +218,11 @@ fn eval_scalar(si: &ScalarInput, s: Sample, by_id: &HashMap<LayerId, &Layer>, ct
     match si {
         ScalarInput::Const(v) => *v,
         ScalarInput::Layer(id) => scalar_of(eval_layer(*id, s, by_id, ctx)),
+        ScalarInput::Param(name) => ctx
+            .params
+            .get(name.as_str())
+            .and_then(ParamValue::as_scalar)
+            .unwrap_or(UNBOUND_SCALAR),
     }
 }
 
@@ -499,6 +577,97 @@ fn eval_h2n(h: &HeightToNormal, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx
     n[1] /= mag;
     n[2] /= mag;
     normal_to_color(n)
+}
+
+#[cfg(test)]
+mod param_tests {
+    use super::*;
+    use crate::color::oklcha;
+    use crate::kind::{BlendMode, ColorRamp, ColorStop, Mix};
+    use crate::param::{ParamDecl, ParamValue};
+
+    /// A graph whose whole look is one scalar parameter — the shape §6
+    /// exists for.
+    fn parameterised() -> (Graph, LayerId) {
+        let mut g = Graph::new();
+        g.declare_param(ParamDecl::scalar("contrast", 0.0, 1.0, 0.25)).unwrap();
+        let dark = g.output.color.unwrap();
+        g.set_kind(dark, LayerKind::Color(oklcha(0.0, 0.0, 0.0, 1.0))).unwrap();
+        let light = g
+            .add_layer("light", LayerKind::Color(oklcha(1.0, 0.0, 0.0, 1.0)))
+            .unwrap();
+        let mix = g
+            .add_layer(
+                "mix",
+                LayerKind::Mix(Mix {
+                    a: Some(dark),
+                    b: Some(light),
+                    mode: BlendMode::Blend,
+                    factor: ScalarInput::Param("contrast".into()),
+                    space: crate::color::BlendSpace::Oklch,
+                }),
+            )
+            .unwrap();
+        (g, mix)
+    }
+
+    /// The whole point: one graph, N bakes, different pictures.
+    #[test]
+    fn one_graph_reads_differently_under_different_bindings() {
+        let (g, mix) = parameterised();
+        let at = |ctx: &EvalCtx| scalar_of(evaluate(&g, mix, Sample::uv(0.5, 0.5), ctx));
+
+        // Unbound: the declared default.
+        let default = at(&EvalCtx::default());
+        assert!((default - 0.25).abs() < 1e-5, "default gave {default}");
+
+        for want in [0.0f32, 0.5, 1.0] {
+            let ctx = EvalCtx::default().with_param("contrast", ParamValue::Scalar(want));
+            let got = at(&ctx);
+            assert!((got - want).abs() < 1e-5, "bound {want} read as {got}");
+        }
+    }
+
+    /// A color parameter drives a ramp stop, which is the palette half of
+    /// "six planet classes differ by palette and contrast".
+    #[test]
+    fn a_color_parameter_drives_a_ramp_stop() {
+        let mut g = Graph::new();
+        g.declare_param(ParamDecl::color("tint", oklcha(0.2, 0.0, 0.0, 1.0))).unwrap();
+        let ramp = g.output.color.unwrap();
+        g.set_kind(
+            ramp,
+            LayerKind::ColorRamp(ColorRamp {
+                stops: vec![
+                    ColorStop { t: 0.0, color: ColorInput::Param("tint".into()) },
+                    ColorStop { t: 1.0, color: ColorInput::Param("tint".into()) },
+                ],
+                space: crate::color::BlendSpace::Oklch,
+            }),
+        )
+        .unwrap();
+        let at = |ctx: &EvalCtx| evaluate(&g, ramp, Sample::uv(0.5, 0.5), ctx);
+
+        assert!((at(&EvalCtx::default()).l - 0.2).abs() < 1e-5);
+        let bound = EvalCtx::default()
+            .with_param("tint", ParamValue::Color(oklcha(0.8, 0.1, 210.0, 1.0)));
+        let got = at(&bound);
+        assert!((got.l - 0.8).abs() < 1e-5, "L was {}", got.l);
+        assert!((got.chroma - 0.1).abs() < 1e-5, "C was {}", got.chroma);
+    }
+
+    /// Entry points resolve for themselves, so a caller never has to know
+    /// that resolution is a step.
+    #[test]
+    fn the_caller_does_not_have_to_resolve_first() {
+        let (g, mix) = parameterised();
+        let raw = EvalCtx::default().with_param("contrast", ParamValue::Scalar(0.9));
+        let pre_resolved = g.resolve_params(&raw);
+        assert_eq!(
+            scalar_of(evaluate(&g, mix, Sample::uv(0.5, 0.5), &raw)),
+            scalar_of(evaluate(&g, mix, Sample::uv(0.5, 0.5), &pre_resolved)),
+        );
+    }
 }
 
 #[cfg(test)]

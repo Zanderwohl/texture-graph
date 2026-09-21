@@ -5,7 +5,9 @@ use thiserror::Error;
 
 use crate::color::Color;
 use crate::id::LayerId;
-use crate::kind::{ColorRamp, LayerKind, NoiseKernel, ScalarInput};
+use crate::eval::EvalCtx;
+use crate::kind::{ColorInput, ColorRamp, LayerKind, NoiseKernel, ScalarInput};
+use crate::param::{ParamDecl, ParamUse, ParamValue};
 
 /// Named node in the graph. Canvas position lives in [`Graph::canvases`], so
 /// identity, display and layout stay independent.
@@ -32,6 +34,18 @@ pub struct Output {
 }
 
 impl Output {
+    /// Every parameter the output's scalar channels read. The twin of
+    /// [`LayerKind::param_refs`].
+    pub fn param_refs(&self) -> Vec<(&str, ParamUse)> {
+        let mut out = Vec::new();
+        for si in [&self.roughness, &self.metallic] {
+            if let ScalarInput::Param(name) = si {
+                out.push((name.as_str(), ParamUse::Scalar));
+            }
+        }
+        out
+    }
+
     fn referenced(&self) -> Vec<LayerId> {
         let mut out = Vec::new();
         out.extend(self.color);
@@ -75,6 +89,11 @@ pub struct Graph {
     /// Named workspace canvases. Empty by default.
     pub canvases: BTreeMap<String, Canvas>,
     pub output: Output,
+    /// Named parameters this graph exposes, keyed by
+    /// [`ParamDecl::name`]. A file without the field loads as empty, which
+    /// is what every graph written before parameters existed means.
+    #[serde(default)]
+    pub params: BTreeMap<String, ParamDecl>,
     next_id: u64,
 }
 
@@ -90,6 +109,14 @@ pub enum GraphError {
     RampTooFewStops,
     #[error("a periodic lattice needs the Value kernel; simplex has none to wrap")]
     PeriodicSimplex,
+    #[error("no parameter named {0:?} is declared")]
+    UnknownParam(String),
+    #[error("parameter {name:?} is a {declared}, but a {wanted} socket reads it")]
+    ParamTypeMismatch { name: String, declared: &'static str, wanted: &'static str },
+    #[error("duplicate parameter name: {0}")]
+    DuplicateParam(String),
+    #[error("parameter {name:?} defaults to a value its own kind ({declared}) does not describe")]
+    ParamDefaultMismatch { name: String, declared: &'static str },
     #[error("canvas {0:?} does not exist")]
     UnknownCanvas(String),
     #[error("canvas {0:?} already exists")]
@@ -109,6 +136,7 @@ impl Graph {
                 metallic: ScalarInput::Const(0.0),
                 normal: None,
             },
+            params: BTreeMap::new(),
             next_id: 1,
         };
         let id = g
@@ -215,6 +243,7 @@ impl Graph {
             }
         }
         validate_kind(&kind)?;
+        self.validate_param_refs(kind.param_refs())?;
         let id = LayerId(self.next_id);
         self.next_id += 1;
         self.layers.push(Layer { id, name, kind });
@@ -286,6 +315,7 @@ impl Graph {
             }
         }
         validate_kind(&kind)?;
+        self.validate_param_refs(kind.param_refs())?;
         let old = std::mem::replace(&mut self.get_mut(id).unwrap().kind, kind);
         if self.has_cycle_from(id) {
             self.get_mut(id).unwrap().kind = old;
@@ -301,8 +331,165 @@ impl Graph {
                 return Err(GraphError::UnknownId(id));
             }
         }
+        self.validate_param_refs(output.param_refs())?;
         self.output = output;
         Ok(())
+    }
+
+    /// Every parameter a kind reads must be declared, and declared as the
+    /// sort of thing the socket reading it can use. Checked here, at edit
+    /// time, for the same reason a `LayerId` is: the evaluator and the
+    /// baker then never have to decide what a stray name means.
+    fn validate_param_refs(&self, refs: Vec<(&str, ParamUse)>) -> Result<(), GraphError> {
+        for (name, use_) in refs {
+            let Some(decl) = self.params.get(name) else {
+                return Err(GraphError::UnknownParam(name.to_string()));
+            };
+            if !use_.accepts(&decl.kind) {
+                return Err(GraphError::ParamTypeMismatch {
+                    name: name.to_string(),
+                    declared: decl.kind.label(),
+                    wanted: use_.label(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    // ---- Parameters -----------------------------------------------------
+
+    /// Declare a new parameter. The name must be unused, and the default
+    /// must be the kind the declaration says it is.
+    pub fn declare_param(&mut self, decl: ParamDecl) -> Result<(), GraphError> {
+        if self.params.contains_key(&decl.name) {
+            return Err(GraphError::DuplicateParam(decl.name));
+        }
+        validate_decl(&decl)?;
+        self.params.insert(decl.name.clone(), decl);
+        Ok(())
+    }
+
+    /// Replace an existing declaration, keeping its name.
+    ///
+    /// Changing the *kind* is rejected while anything reads it — a socket
+    /// bound to a scalar cannot survive it becoming a color, and silently
+    /// unbinding every reader would lose work the user cannot see from
+    /// here. Rebind or remove the readers first.
+    pub fn set_param_decl(&mut self, name: &str, decl: ParamDecl) -> Result<(), GraphError> {
+        let Some(old) = self.params.get(name) else {
+            return Err(GraphError::UnknownParam(name.to_string()));
+        };
+        if decl.name != name && self.params.contains_key(&decl.name) {
+            return Err(GraphError::DuplicateParam(decl.name));
+        }
+        validate_decl(&decl)?;
+        let kind_changed = std::mem::discriminant(&old.kind) != std::mem::discriminant(&decl.kind);
+        if (kind_changed || decl.name != name) && self.param_readers(name).next().is_some() {
+            // A rename is the same problem: every reader holds the old
+            // string. `rename_param` exists to do it properly.
+            return Err(GraphError::ParamTypeMismatch {
+                name: name.to_string(),
+                declared: old.kind.label(),
+                wanted: decl.kind.label(),
+            });
+        }
+        self.params.remove(name);
+        self.params.insert(decl.name.clone(), decl);
+        Ok(())
+    }
+
+    /// Rename a parameter, rewriting every socket that reads it.
+    pub fn rename_param(&mut self, name: &str, new_name: &str) -> Result<(), GraphError> {
+        if !self.params.contains_key(name) {
+            return Err(GraphError::UnknownParam(name.to_string()));
+        }
+        if name == new_name {
+            return Ok(());
+        }
+        if self.params.contains_key(new_name) {
+            return Err(GraphError::DuplicateParam(new_name.to_string()));
+        }
+        let mut decl = self.params.remove(name).unwrap();
+        decl.name = new_name.to_string();
+        self.params.insert(new_name.to_string(), decl);
+        for l in &mut self.layers {
+            rewrite_param(&mut l.kind, name, Some(new_name));
+        }
+        rewrite_output_param(&mut self.output, name, Some(new_name));
+        Ok(())
+    }
+
+    /// Remove a parameter. Every socket reading it falls back to the
+    /// declaration's default *as a constant*, so the graph keeps looking
+    /// the way it did — the same courtesy [`Graph::remove`] does not get
+    /// to offer a layer, because there is no constant that stands in for
+    /// one.
+    pub fn remove_param(&mut self, name: &str) -> Result<(), GraphError> {
+        let Some(decl) = self.params.remove(name) else {
+            return Err(GraphError::UnknownParam(name.to_string()));
+        };
+        let fallback = decl.default;
+        for l in &mut self.layers {
+            freeze_param(&mut l.kind, name, fallback);
+        }
+        freeze_output_param(&mut self.output, name, fallback);
+        Ok(())
+    }
+
+    /// Every layer with a socket reading `name`. The Output is not a
+    /// layer and is checked separately by the callers that care.
+    pub fn param_readers<'a>(&'a self, name: &'a str) -> impl Iterator<Item = LayerId> + 'a {
+        self.layers
+            .iter()
+            .filter(move |l| l.kind.param_refs().iter().any(|(n, _)| *n == name))
+            .map(|l| l.id)
+            .chain(
+                self.output
+                    .param_refs()
+                    .iter()
+                    .any(|(n, _)| *n == name)
+                    // The Output has no id; report the color root so a
+                    // caller has something to point at. `None` when it is
+                    // unconnected, which is fine — the iterator is only
+                    // ever asked whether it is empty.
+                    .then_some(self.output.color)
+                    .flatten(),
+            )
+    }
+
+    /// The value a parameter carries under `ctx`: the binding it holds,
+    /// or the declaration's default where it holds none or one of the
+    /// wrong kind. `None` when the name is not declared at all.
+    ///
+    /// Unlike [`EvalCtx::scalar_const`] this works on an *unresolved*
+    /// context, so a UI can ask about one parameter without building the
+    /// whole map.
+    pub fn param_value(&self, name: &str, ctx: &EvalCtx) -> Option<ParamValue> {
+        let decl = self.params.get(name)?;
+        Some(
+            ctx.params
+                .get(name)
+                .copied()
+                .filter(|v| v.matches(&decl.kind))
+                .unwrap_or(decl.default),
+        )
+    }
+
+    /// `ctx` with every declared parameter present: the binding it
+    /// carries, or the declaration's default where it carries none or
+    /// carries one of the wrong kind.
+    ///
+    /// Every entry point runs this before evaluating, so the readers
+    /// downstream are a map lookup and nothing else.
+    pub fn resolve_params(&self, ctx: &EvalCtx) -> EvalCtx {
+        let mut out = ctx.clone();
+        for (name, decl) in &self.params {
+            let bound = out.params.get(name).filter(|v| v.matches(&decl.kind));
+            if bound.is_none() {
+                out.params.insert(name.clone(), decl.default);
+            }
+        }
+        out
     }
 
     // ---- List order -----------------------------------------------------
@@ -441,6 +628,80 @@ impl Default for Graph {
     }
 }
 
+fn validate_decl(decl: &ParamDecl) -> Result<(), GraphError> {
+    if !decl.default.matches(&decl.kind) {
+        return Err(GraphError::ParamDefaultMismatch {
+            name: decl.name.clone(),
+            declared: decl.kind.label(),
+        });
+    }
+    Ok(())
+}
+
+/// Point every socket reading `name` at `to`, or — with `None` — leave
+/// them alone. Used by `rename_param`.
+fn rewrite_param(kind: &mut LayerKind, name: &str, to: Option<&str>) {
+    let Some(to) = to else { return };
+    let scalar = |si: &mut ScalarInput| {
+        if matches!(si, ScalarInput::Param(n) if n == name) {
+            *si = ScalarInput::Param(to.to_string());
+        }
+    };
+    match kind {
+        LayerKind::Mix(m) => scalar(&mut m.factor),
+        LayerKind::Wave(w) => scalar(&mut w.input),
+        LayerKind::ColorRamp(r) => {
+            for stop in &mut r.stops {
+                if matches!(&stop.color, ColorInput::Param(n) if n == name) {
+                    stop.color = ColorInput::Param(to.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_output_param(output: &mut Output, name: &str, to: Option<&str>) {
+    let Some(to) = to else { return };
+    for si in [&mut output.roughness, &mut output.metallic] {
+        if matches!(si, ScalarInput::Param(n) if n == name) {
+            *si = ScalarInput::Param(to.to_string());
+        }
+    }
+}
+
+/// Replace every read of `name` with `value` as a constant, so removing a
+/// parameter does not change what the graph renders.
+fn freeze_param(kind: &mut LayerKind, name: &str, value: ParamValue) {
+    let scalar = |si: &mut ScalarInput| {
+        if matches!(si, ScalarInput::Param(n) if n == name) {
+            *si = ScalarInput::Const(value.as_scalar().unwrap_or(0.0));
+        }
+    };
+    match kind {
+        LayerKind::Mix(m) => scalar(&mut m.factor),
+        LayerKind::Wave(w) => scalar(&mut w.input),
+        LayerKind::ColorRamp(r) => {
+            for stop in &mut r.stops {
+                if matches!(&stop.color, ColorInput::Param(n) if n == name) {
+                    stop.color = ColorInput::Const(
+                        value.as_color().unwrap_or(crate::color::oklcha(0.5, 0.0, 0.0, 1.0)),
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn freeze_output_param(output: &mut Output, name: &str, value: ParamValue) {
+    for si in [&mut output.roughness, &mut output.metallic] {
+        if matches!(si, ScalarInput::Param(n) if n == name) {
+            *si = ScalarInput::Const(value.as_scalar().unwrap_or(0.0));
+        }
+    }
+}
+
 fn validate_ramp(r: &ColorRamp) -> Result<(), GraphError> {
     if r.stops.len() < 2 {
         return Err(GraphError::RampTooFewStops);
@@ -471,6 +732,7 @@ fn validate_kind(kind: &LayerKind) -> Result<(), GraphError> {
 mod tests {
     use super::*;
     use crate::kind::{Map, Mix, BlendMode};
+    use crate::param::{ParamDecl, ParamKind, ParamValue};
     use crate::color::BlendSpace;
 
     /// a depends on b, b depends on c: a → b → c.
@@ -617,6 +879,215 @@ mod tests {
         n.kernel = NoiseKernel::Simplex;
         let _ = g.set_kind(id, periodic_simplex);
         assert!(matches!(g.get(id).unwrap().kind, LayerKind::Color(_)));
+    }
+
+    // ---- Parameters ----------------------------------------------------
+
+    fn mix_with_factor(a: LayerId, factor: ScalarInput) -> LayerKind {
+        LayerKind::Mix(crate::kind::Mix {
+            a: Some(a),
+            b: Some(a),
+            mode: crate::kind::BlendMode::Blend,
+            factor,
+            space: crate::color::BlendSpace::Oklch,
+        })
+    }
+
+    fn ramp_with_stop(color: ColorInput) -> LayerKind {
+        LayerKind::ColorRamp(ColorRamp {
+            stops: vec![
+                crate::kind::ColorStop {
+                    t: 0.0,
+                    color: ColorInput::Const(crate::color::oklcha(0.0, 0.0, 0.0, 1.0)),
+                },
+                crate::kind::ColorStop { t: 1.0, color },
+            ],
+            space: crate::color::BlendSpace::Oklch,
+        })
+    }
+
+    /// A name is checked at edit time exactly the way a `LayerId` is, so
+    /// neither backend ever has to decide what a stray one means.
+    #[test]
+    fn an_undeclared_parameter_is_rejected_like_an_unknown_layer() {
+        let mut g = Graph::new();
+        let base = g.output.color.unwrap();
+        assert!(matches!(
+            g.add_layer("m", mix_with_factor(base, ScalarInput::Param("nope".into()))),
+            Err(GraphError::UnknownParam(n)) if n == "nope"
+        ));
+
+        g.declare_param(ParamDecl::scalar("contrast", 0.0, 2.0, 1.0)).unwrap();
+        assert!(g
+            .add_layer("m", mix_with_factor(base, ScalarInput::Param("contrast".into())))
+            .is_ok());
+    }
+
+    /// A scalar socket cannot read a color parameter, and the error says
+    /// which way round it went wrong.
+    #[test]
+    fn a_socket_cannot_read_the_wrong_kind_of_parameter() {
+        let mut g = Graph::new();
+        let base = g.output.color.unwrap();
+        g.declare_param(ParamDecl::color("tint", crate::color::oklcha(0.5, 0.1, 30.0, 1.0)))
+            .unwrap();
+        let err = g
+            .add_layer("m", mix_with_factor(base, ScalarInput::Param("tint".into())))
+            .unwrap_err();
+        assert!(
+            matches!(&err, GraphError::ParamTypeMismatch { name, declared, wanted }
+                if name == "tint" && *declared == "color" && *wanted == "scalar"),
+            "unexpected error: {err}"
+        );
+        // The same name in a color socket is fine.
+        assert!(g.add_layer("r", ramp_with_stop(ColorInput::Param("tint".into()))).is_ok());
+    }
+
+    /// The Output's scalar channels are validated on the same path.
+    #[test]
+    fn the_output_validates_its_parameters_too() {
+        let mut g = Graph::new();
+        let color = g.output.color;
+        let bad = Output {
+            color,
+            roughness: ScalarInput::Param("nope".into()),
+            metallic: ScalarInput::Const(0.0),
+            normal: None,
+        };
+        assert!(matches!(g.set_output(bad), Err(GraphError::UnknownParam(_))));
+    }
+
+    #[test]
+    fn a_declarations_default_must_match_its_own_kind() {
+        let mut g = Graph::new();
+        let bogus = ParamDecl {
+            name: "x".into(),
+            kind: ParamKind::Scalar { min: 0.0, max: 1.0 },
+            default: ParamValue::Color(crate::color::oklcha(0.5, 0.0, 0.0, 1.0)),
+            description: None,
+        };
+        assert!(matches!(
+            g.declare_param(bogus),
+            Err(GraphError::ParamDefaultMismatch { .. })
+        ));
+        g.declare_param(ParamDecl::scalar("x", 0.0, 1.0, 0.5)).unwrap();
+        assert!(matches!(
+            g.declare_param(ParamDecl::scalar("x", 0.0, 1.0, 0.5)),
+            Err(GraphError::DuplicateParam(_))
+        ));
+    }
+
+    /// Removing a parameter freezes its readers at the declared default,
+    /// so the graph goes on rendering what it rendered.
+    #[test]
+    fn removing_a_parameter_freezes_its_readers() {
+        let mut g = Graph::new();
+        let base = g.output.color.unwrap();
+        g.declare_param(ParamDecl::scalar("contrast", 0.0, 2.0, 0.75)).unwrap();
+        g.declare_param(ParamDecl::color("tint", crate::color::oklcha(0.4, 0.2, 90.0, 1.0)))
+            .unwrap();
+        let m = g
+            .add_layer("m", mix_with_factor(base, ScalarInput::Param("contrast".into())))
+            .unwrap();
+        let r = g.add_layer("r", ramp_with_stop(ColorInput::Param("tint".into()))).unwrap();
+        g.set_output(Output {
+            color: g.output.color,
+            roughness: ScalarInput::Param("contrast".into()),
+            metallic: ScalarInput::Const(0.0),
+            normal: None,
+        })
+        .unwrap();
+
+        g.remove_param("contrast").unwrap();
+        let LayerKind::Mix(mix) = &g.get(m).unwrap().kind else { panic!() };
+        assert!(matches!(mix.factor, ScalarInput::Const(v) if v == 0.75));
+        assert!(matches!(g.output.roughness, ScalarInput::Const(v) if v == 0.75));
+        // The other parameter is untouched.
+        let LayerKind::ColorRamp(ramp) = &g.get(r).unwrap().kind else { panic!() };
+        assert!(matches!(ramp.stops[1].color, ColorInput::Param(ref n) if n == "tint"));
+
+        g.remove_param("tint").unwrap();
+        let LayerKind::ColorRamp(ramp) = &g.get(r).unwrap().kind else { panic!() };
+        let ColorInput::Const(c) = ramp.stops[1].color else { panic!("expected a const") };
+        assert!((c.l - 0.4).abs() < 1e-6);
+
+        assert!(matches!(g.remove_param("tint"), Err(GraphError::UnknownParam(_))));
+    }
+
+    /// A rename has to rewrite every reader, or the graph stops validating
+    /// against itself.
+    #[test]
+    fn renaming_a_parameter_rewrites_its_readers() {
+        let mut g = Graph::new();
+        let base = g.output.color.unwrap();
+        g.declare_param(ParamDecl::scalar("contrast", 0.0, 2.0, 1.0)).unwrap();
+        let m = g
+            .add_layer("m", mix_with_factor(base, ScalarInput::Param("contrast".into())))
+            .unwrap();
+        g.set_output(Output {
+            color: g.output.color,
+            roughness: ScalarInput::Param("contrast".into()),
+            metallic: ScalarInput::Const(0.0),
+            normal: None,
+        })
+        .unwrap();
+
+        g.rename_param("contrast", "punch").unwrap();
+        assert!(g.params.contains_key("punch"));
+        assert!(!g.params.contains_key("contrast"));
+        assert_eq!(g.params["punch"].name, "punch");
+        let LayerKind::Mix(mix) = &g.get(m).unwrap().kind else { panic!() };
+        assert!(matches!(mix.factor, ScalarInput::Param(ref n) if n == "punch"));
+        assert!(matches!(g.output.roughness, ScalarInput::Param(ref n) if n == "punch"));
+
+        // And the graph still validates: re-setting the same kind passes.
+        let kind = g.get(m).unwrap().kind.clone();
+        assert!(g.set_kind(m, kind).is_ok());
+    }
+
+    /// Changing a declared kind under a live reader would strand it, so it
+    /// is refused rather than silently unbinding.
+    #[test]
+    fn a_kind_change_is_refused_while_something_reads_it() {
+        let mut g = Graph::new();
+        let base = g.output.color.unwrap();
+        g.declare_param(ParamDecl::scalar("contrast", 0.0, 2.0, 1.0)).unwrap();
+        g.add_layer("m", mix_with_factor(base, ScalarInput::Param("contrast".into())))
+            .unwrap();
+        let to_color =
+            ParamDecl::color("contrast", crate::color::oklcha(0.5, 0.0, 0.0, 1.0));
+        assert!(matches!(
+            g.set_param_decl("contrast", to_color.clone()),
+            Err(GraphError::ParamTypeMismatch { .. })
+        ));
+        // Editing the range and default in place is fine.
+        assert!(g
+            .set_param_decl("contrast", ParamDecl::scalar("contrast", -1.0, 3.0, 2.0))
+            .is_ok());
+        assert_eq!(g.params["contrast"].default, ParamValue::Scalar(2.0));
+    }
+
+    /// Resolution is "the binding, else the default" — including when the
+    /// binding is the wrong kind, which a host supplying values by name
+    /// can easily get wrong.
+    #[test]
+    fn resolution_prefers_the_binding_and_falls_back_to_the_default() {
+        let mut g = Graph::new();
+        g.declare_param(ParamDecl::scalar("contrast", 0.0, 2.0, 0.75)).unwrap();
+
+        let bare = g.resolve_params(&crate::eval::EvalCtx::default());
+        assert_eq!(bare.params["contrast"], ParamValue::Scalar(0.75));
+
+        let bound = crate::eval::EvalCtx::default()
+            .with_param("contrast", ParamValue::Scalar(1.5));
+        assert_eq!(g.resolve_params(&bound).params["contrast"], ParamValue::Scalar(1.5));
+
+        // Wrong kind: ignored in favour of the declared default.
+        let wrong = crate::eval::EvalCtx::default().with_param(
+            "contrast",
+            ParamValue::Color(crate::color::oklcha(0.5, 0.0, 0.0, 1.0)),
+        );
+        assert_eq!(g.resolve_params(&wrong).params["contrast"], ParamValue::Scalar(0.75));
     }
 
     #[test]

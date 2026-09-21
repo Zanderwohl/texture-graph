@@ -310,7 +310,7 @@ fn build_layout(
         .zip(&row_rects)
         .filter_map(|(row, rrect)| {
             let Row::Socket(key) = *row else { return None };
-            let value = sockets.iter().find(|s| s.key == key)?.value;
+            let value = sockets.iter().find(|s| s.key == key)?.value.clone();
             Some(SocketLayout {
                 key,
                 center: egui::pos2(rect.left(), rrect.center().y),
@@ -435,7 +435,7 @@ mod tests {
         // Mix: Blend adds a space row and a factor socket.
         let LayerKind::Mix(mut m) = catalog::default_kind(Kind::Mix) else { panic!() };
         m.mode = BlendMode::Add;
-        let plain = node_height(&rows_for(&LayerKind::Mix(m)), true);
+        let plain = node_height(&rows_for(&LayerKind::Mix(m.clone())), true);
         m.mode = BlendMode::Blend;
         assert!(
             node_height(&rows_for(&LayerKind::Mix(m)), true) > plain,

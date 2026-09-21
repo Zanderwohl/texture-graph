@@ -204,6 +204,34 @@ mod tests {
 
     /// The other direction is what the version is for: a file from a
     /// newer build is refused rather than half-read.
+    /// A graph written before parameters existed loads with none, and a
+    /// graph with them round-trips its declarations and its bindings by
+    /// name.
+    #[test]
+    fn parameters_round_trip_and_are_optional_on_disk() {
+        let mut g = Graph::new();
+        assert!(g.params.is_empty(), "a fresh graph declares none");
+
+        g.declare_param(crate::param::ParamDecl::scalar("contrast", -1.0, 3.0, 0.75))
+            .unwrap();
+        let mut tint = crate::param::ParamDecl::color("tint", oklcha(0.4, 0.2, 90.0, 1.0));
+        tint.description = Some("body colour".into());
+        g.declare_param(tint).unwrap();
+
+        let s = save_to_string(&TextureGraphFile::new(sample_metadata(), g)).unwrap();
+        let back = load_from_str(&s).unwrap().graph;
+        assert_eq!(back.params.len(), 2);
+        assert_eq!(
+            back.params["contrast"].default,
+            crate::param::ParamValue::Scalar(0.75)
+        );
+        assert_eq!(
+            back.params["contrast"].kind,
+            crate::param::ParamKind::Scalar { min: -1.0, max: 3.0 }
+        );
+        assert_eq!(back.params["tint"].description.as_deref(), Some("body colour"));
+    }
+
     #[test]
     fn a_future_version_is_refused() {
         let s = save_to_string(&TextureGraphFile {

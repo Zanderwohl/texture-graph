@@ -100,6 +100,18 @@ impl eframe::App for TextureGraphApp {
                 );
             });
 
+        // Left, because a parameter is an input to the whole graph rather
+        // than a property of any node; the right panel is what the graph
+        // produces.
+        egui::Panel::left("params")
+            .resizable(true)
+            .default_size(220.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    panels::params::show(ui, &self.graph, &mut self.ui, &mut self.eval_ctx);
+                });
+            });
+
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(err) = &self.ui.last_error {
                 ui.colored_label(egui::Color32::LIGHT_RED, err);

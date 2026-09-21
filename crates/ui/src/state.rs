@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use texture_graph_core::{ConstValue, Graph, InputKey, LayerId, LayerKind, Output};
+use texture_graph_core::{ConstValue, Graph, InputKey, LayerId, LayerKind, Output, ParamDecl};
 
 /// UI-only state (not persisted with the graph).
 #[derive(Debug)]
@@ -307,6 +307,18 @@ impl UiState {
                 self.reset_for_new_graph();
                 Ok(())
             }
+            EditCmd::DeclareParam(decl) => {
+                graph.declare_param(decl).map_err(|e| e.to_string())
+            }
+            EditCmd::SetParamDecl(name, decl) => {
+                graph.set_param_decl(&name, decl).map_err(|e| e.to_string())
+            }
+            EditCmd::RenameParam { from, to } => {
+                graph.rename_param(&from, &to).map_err(|e| e.to_string())
+            }
+            EditCmd::RemoveParam(name) => {
+                graph.remove_param(&name).map_err(|e| e.to_string())
+            }
         }
     }
 }
@@ -332,6 +344,13 @@ fn dirty_roots(cmd: &EditCmd) -> Option<Vec<LayerId>> {
         | EditCmd::RemoveCanvas(_) => Some(Vec::new()),
         // The ids either side of this aren't about the same layers.
         EditCmd::Replace(_) => None,
+        // A parameter can be read anywhere, and `remove_param` rewrites
+        // sockets across the graph. Cheaper to rebake than to work out
+        // which layers were touched.
+        EditCmd::DeclareParam(_)
+        | EditCmd::SetParamDecl(_, _)
+        | EditCmd::RenameParam { .. }
+        | EditCmd::RemoveParam(_) => None,
     }
 }
 
@@ -374,6 +393,11 @@ pub enum EditCmd {
     RemoveCanvas(String),
     /// File > New and File > Open.
     Replace(Graph),
+    DeclareParam(ParamDecl),
+    /// Replace a declaration in place, keeping its name.
+    SetParamDecl(String, ParamDecl),
+    RenameParam { from: String, to: String },
+    RemoveParam(String),
 }
 
 impl EditCmd {
@@ -386,7 +410,13 @@ impl EditCmd {
             | EditCmd::Remove(_)
             | EditCmd::SetKind(_, _)
             | EditCmd::SetOutput(_)
-            | EditCmd::Replace(_) => true,
+            | EditCmd::Replace(_)
+            // A declaration's default is what an unbound parameter reads,
+            // so any of these can move the picture.
+            | EditCmd::DeclareParam(_)
+            | EditCmd::SetParamDecl(_, _)
+            | EditCmd::RenameParam { .. }
+            | EditCmd::RemoveParam(_) => true,
             EditCmd::Rename(_, _)
             | EditCmd::SetListPos(_, _)
             | EditCmd::SetPos { .. }

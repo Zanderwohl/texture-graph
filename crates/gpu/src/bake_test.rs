@@ -7,7 +7,8 @@ use texture_graph_core::{
     BlendMode, BlendSpace, Color, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion,
     EdgeMode, EvalCtx, Fractal, FractalMode, Graph, HeightToNormal, LayerId, LayerKind, Map,
     MinMax, MinMaxMode, Mix, Noise, NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, Output,
-    ScalarInput, Transform, Warp, WarpMode, Wave, WaveShape, color::to_srgb8,
+    ParamDecl, ParamValue, ScalarInput, Transform, Warp, WarpMode, Wave, WaveShape,
+    color::to_srgb8,
 };
 
 use crate::{Baker, DeviceCtx, ScalarFormat};
@@ -1723,7 +1724,7 @@ fn scalar_bake_ignores_layers_its_field_does_not_read() {
     assert_eq!(sched.order, vec![field], "only the field should be dispatched");
     // And the ordinary Output schedule still covers the branch, so the two
     // are genuinely different plans rather than one that lost layers.
-    assert!(crate::schedule::schedule(&graph).unwrap().order.len() > 1);
+    assert!(crate::schedule::schedule(&graph, &EvalCtx::default()).unwrap().order.len() > 1);
 }
 
 /// The async readers have to produce the same bytes as the blocking ones —
@@ -2038,7 +2039,7 @@ fn a_warp_widens_its_sources_bake_domain() {
             normal: None,
         })
         .unwrap();
-    let sched = crate::schedule::schedule(&graph).expect("schedule");
+    let sched = crate::schedule::schedule(&graph, &EvalCtx::default()).expect("schedule");
     let d = sched.domain_of[&src];
     assert!((d.min[0] + 0.3).abs() < 1e-6, "u min {}", d.min[0]);
     assert!((d.max[0] - 1.3).abs() < 1e-6, "u max {}", d.max[0]);
@@ -2047,4 +2048,196 @@ fn a_warp_widens_its_sources_bake_domain() {
     // The driver is read at the warp's own coordinates, so it stays put.
     assert_eq!(sched.domain_of[&driver], crate::schedule::Domain::UNIT);
     assert_eq!(sched.domain_of[&warp], crate::schedule::Domain::UNIT);
+}
+
+// ---- Named parameters (§6) ----------------------------------------------
+
+/// One graph, several bakes, different pictures — and each of them still
+/// matching the CPU evaluator under the same bindings.
+///
+/// This is the claim that makes a graph worth transmitting: the wire
+/// carries it once and per-instance variation is a small block of values.
+#[test]
+fn one_graph_bakes_differently_under_different_bindings() {
+    const RES: u32 = 32;
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+
+    // A ramp whose far stop is a color parameter, mixed toward black by a
+    // scalar parameter: palette and contrast, the consumer's two axes.
+    let mut graph = Graph::new();
+    graph
+        .declare_param(ParamDecl::color("tint", Color::new(0.2, 0.0, 0.0, 1.0)))
+        .unwrap();
+    graph
+        .declare_param(ParamDecl::scalar("contrast", 0.0, 1.0, 0.25))
+        .unwrap();
+    let ramp = graph.output.color.unwrap();
+    graph
+        .set_kind(
+            ramp,
+            LayerKind::ColorRamp(ColorRamp {
+                stops: vec![
+                    ColorStop {
+                        t: 0.0,
+                        color: ColorInput::Const(Color::new(0.05, 0.0, 0.0, 1.0)),
+                    },
+                    ColorStop { t: 1.0, color: ColorInput::Param("tint".into()) },
+                ],
+                space: BlendSpace::Oklch,
+            }),
+        )
+        .unwrap();
+    let dark = graph
+        .add_layer("dark", LayerKind::Color(Color::new(0.0, 0.0, 0.0, 1.0)))
+        .unwrap();
+    let mixed = graph
+        .add_layer(
+            "mixed",
+            LayerKind::Mix(Mix {
+                a: Some(dark),
+                b: Some(ramp),
+                mode: BlendMode::Blend,
+                factor: ScalarInput::Param("contrast".into()),
+                space: BlendSpace::Oklch,
+            }),
+        )
+        .unwrap();
+    graph
+        .set_output(Output {
+            color: Some(mixed),
+            // A parameter on an output scalar channel goes through the
+            // scheduler rather than a dispatch, so it is worth covering.
+            roughness: ScalarInput::Param("contrast".into()),
+            metallic: ScalarInput::Const(0.0),
+            normal: None,
+        })
+        .unwrap();
+
+    let bindings: [(&str, EvalCtx); 3] = [
+        ("defaults", EvalCtx::default()),
+        (
+            "bright teal",
+            EvalCtx::default()
+                .with_param("tint", ParamValue::Color(Color::new(0.85, 0.1, 190.0, 1.0)))
+                .with_param("contrast", ParamValue::Scalar(1.0)),
+        ),
+        (
+            "dim rust",
+            EvalCtx::default()
+                .with_param("tint", ParamValue::Color(Color::new(0.45, 0.12, 40.0, 1.0)))
+                .with_param("contrast", ParamValue::Scalar(0.6)),
+        ),
+    ];
+
+    let mut frames = Vec::new();
+    for (label, eval) in &bindings {
+        let out = baker.bake_output(&graph, (RES, RES), eval, false).expect("bake");
+        let px = readback_all_pixels(&ctx, &out.color, (RES, RES));
+        // Same bindings, same picture as the CPU evaluator.
+        let mut worst = 0u32;
+        for y in 0..RES {
+            for x in 0..RES {
+                let u = (x as f32 + 0.5) / RES as f32;
+                let v = (y as f32 + 0.5) / RES as f32;
+                let m = texture_graph_core::evaluate_material(
+                    &graph,
+                    texture_graph_core::Sample::new(u, v, texture_graph_core::FLAT_W),
+                    eval,
+                );
+                let expected = to_srgb8(m.color);
+                let got = px[(y * RES + x) as usize];
+                for i in 0..3 {
+                    worst = worst.max((expected[i] as i32 - got[i] as i32).unsigned_abs());
+                }
+            }
+        }
+        assert!(worst <= 1, "{label}: worst sRGB delta {worst}");
+
+        // And the roughness channel, which the scheduler resolved.
+        let rough = readback_all_pixels(&ctx, &out.roughness, (RES, RES));
+        let want = texture_graph_core::evaluate_material(
+            &graph,
+            texture_graph_core::Sample::flat(0.5, 0.5),
+            eval,
+        )
+        .roughness;
+        let got = rough[0][0] as f32 / 255.0;
+        // The channel is sRGB-encoded for display, so compare in that space.
+        let want_srgb = if want <= 0.0031308 {
+            12.92 * want
+        } else {
+            1.055 * want.powf(1.0 / 2.4) - 0.055
+        };
+        assert!(
+            (got - want_srgb).abs() <= 2.0 / 255.0,
+            "{label}: roughness {got} vs {want_srgb}"
+        );
+        frames.push((label, px));
+    }
+
+    // Different bindings have to give different pictures, or the test
+    // above would pass on three identical bakes.
+    for i in 0..frames.len() {
+        for j in (i + 1)..frames.len() {
+            assert_ne!(
+                frames[i].1, frames[j].1,
+                "{} and {} baked the same picture",
+                frames[i].0, frames[j].0
+            );
+        }
+    }
+}
+
+/// A parameter is resolved before any dispatch is recorded, so a bake of a
+/// parameterised graph costs exactly what the equivalent constant graph
+/// does: same schedule, same slots, same dispatches.
+#[test]
+fn a_parameter_costs_the_same_as_the_constant_it_stands_in_for() {
+    let mut param_graph = Graph::new();
+    param_graph
+        .declare_param(ParamDecl::scalar("k", 0.0, 1.0, 0.3))
+        .unwrap();
+    let base = param_graph.output.color.unwrap();
+    let other = param_graph
+        .add_layer("other", LayerKind::Color(Color::new(0.9, 0.0, 0.0, 1.0)))
+        .unwrap();
+    let mix = |factor: ScalarInput| {
+        LayerKind::Mix(Mix {
+            a: Some(base),
+            b: Some(other),
+            mode: BlendMode::Blend,
+            factor,
+            space: BlendSpace::Oklch,
+        })
+    };
+    let m = param_graph
+        .add_layer("m", mix(ScalarInput::Param("k".into())))
+        .unwrap();
+    param_graph
+        .set_output(Output {
+            color: Some(m),
+            roughness: ScalarInput::Param("k".into()),
+            metallic: ScalarInput::Const(0.0),
+            normal: None,
+        })
+        .unwrap();
+
+    let mut const_graph = param_graph.clone();
+    const_graph.remove_param("k").unwrap();
+
+    let eval = EvalCtx::default();
+    let a = crate::schedule::schedule(&param_graph, &eval).expect("schedule");
+    let b = crate::schedule::schedule(&const_graph, &eval).expect("schedule");
+    assert_eq!(a.order, b.order);
+    assert_eq!(a.peak_slots, b.peak_slots);
+    // `remove_param` froze the channel at the declared 0.3, and the
+    // parameterised graph resolves to the same number.
+    let (crate::ScalarSlot::Const(x), crate::ScalarSlot::Const(y)) =
+        (a.output_slots.roughness, b.output_slots.roughness)
+    else {
+        panic!("both should have resolved to a constant")
+    };
+    assert_eq!(x, y);
+    assert_eq!(x, 0.3);
 }

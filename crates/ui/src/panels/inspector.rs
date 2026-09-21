@@ -5,18 +5,23 @@ use texture_graph_core::color::oklcha;
 use texture_graph_core::{
     Axis, BlendMode, BlendSpace, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion, Graph,
     HeightToNormal, LayerId, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseKernel,
-    RadialDim, ScalarInput, Transform, Warp, Wave, noise::MAX_OCTAVES,
+    EvalCtx, ParamUse, RadialDim, ScalarInput, Transform, Warp, Wave, noise::MAX_OCTAVES,
 };
 
 use crate::catalog::{self, Kind};
 use crate::state::{EditCmd, UiState};
 use crate::widgets::enum_combo::enum_combo;
-use crate::widgets::node_labels;
-use crate::widgets::{color_edit, layer_ref};
+use crate::widgets::{color_edit, layer_ref, node_labels, param_ref};
 
 /// Render the inspector for a single layer. Emits `EditCmd::SetKind` when
 /// any control changes.
-pub fn show(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, id: LayerId) {
+pub fn show(
+    ui: &mut egui::Ui,
+    graph: &Graph,
+    state: &mut UiState,
+    id: LayerId,
+    ctx: &EvalCtx,
+) {
     let Some(layer) = graph.get(id) else { return };
     let mut kind = layer.kind.clone();
     let mut changed = false;
@@ -48,13 +53,13 @@ pub fn show(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, id: LayerId) 
             changed |= noise_widgets(ui, id, n);
         }
         LayerKind::ColorRamp(r) => {
-            changed |= ramp_widgets(ui, graph, id, r);
+            changed |= ramp_widgets(ui, graph, id, r, ctx);
         }
         LayerKind::Transform(t) => {
             changed |= transform_widgets(ui, graph, id, t);
         }
         LayerKind::Mix(m) => {
-            changed |= mix_widgets(ui, graph, id, m);
+            changed |= mix_widgets(ui, graph, id, m, ctx);
         }
         LayerKind::Map(m) => {
             changed |= map_widgets(ui, graph, id, m);
@@ -66,7 +71,7 @@ pub fn show(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, id: LayerId) 
             changed |= h2n_widgets(ui, graph, id, h);
         }
         LayerKind::Wave(w) => {
-            changed |= wave_widgets(ui, graph, id, w);
+            changed |= wave_widgets(ui, graph, id, w, ctx);
         }
         LayerKind::Warp(w) => {
             changed |= warp_widgets(ui, graph, id, w);
@@ -211,9 +216,15 @@ fn warp_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, w: &mut Warp) -> 
     changed
 }
 
-fn wave_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, w: &mut Wave) -> bool {
+fn wave_widgets(
+    ui: &mut egui::Ui,
+    graph: &Graph,
+    id: LayerId,
+    w: &mut Wave,
+    ctx: &EvalCtx,
+) -> bool {
     let mut changed = false;
-    changed |= scalar_input_widget(ui, graph, id, "input", &mut w.input);
+    changed |= scalar_input_widget(ui, graph, id, "input", &mut w.input, ctx);
     changed |= enum_combo(
         ui,
         (id.0, "wave-shape"),
@@ -243,7 +254,13 @@ fn wave_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, w: &mut Wave) -> 
     changed
 }
 
-fn ramp_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, r: &mut ColorRamp) -> bool {
+fn ramp_widgets(
+    ui: &mut egui::Ui,
+    graph: &Graph,
+    id: LayerId,
+    r: &mut ColorRamp,
+    ctx: &EvalCtx,
+) -> bool {
     let mut changed = false;
     changed |= enum_combo(
         ui,
@@ -270,6 +287,7 @@ fn ramp_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, r: &mut ColorRamp
                 "stop",
                 &mut stop.color,
                 Some(id),
+                ctx,
             );
             if stop_count > 2 && ui.small_button("remove").clicked() {
                 remove_at = Some(i);
@@ -386,7 +404,13 @@ fn axis_label(a: Axis) -> &'static str {
     }
 }
 
-fn mix_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, m: &mut Mix) -> bool {
+fn mix_widgets(
+    ui: &mut egui::Ui,
+    graph: &Graph,
+    id: LayerId,
+    m: &mut Mix,
+    ctx: &EvalCtx,
+) -> bool {
     let mut changed = false;
     if let Some(new) = layer_ref::layer_ref_opt(ui, ("mix-a", id.0), "a", m.a, graph, Some(id)) {
         m.a = new;
@@ -422,7 +446,7 @@ fn mix_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, m: &mut Mix) -> bo
                 BlendSpace::Hsv => "Hsv",
             },
         );
-        changed |= scalar_input_widget(ui, graph, id, "factor", &mut m.factor);
+        changed |= scalar_input_widget(ui, graph, id, "factor", &mut m.factor, ctx);
     }
     changed
 }
@@ -504,14 +528,23 @@ fn h2n_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, h: &mut HeightToNo
 
 // ---- Small helpers ------------------------------------------------------
 
+/// A `ScalarInput` as a constant, a layer reference or a named parameter.
+///
+/// `ctx` carries the parameter bindings in force, so switching a bound
+/// socket back to a constant freezes it at what it currently reads rather
+/// than at an arbitrary 0.5.
 pub fn scalar_input_widget(
     ui: &mut egui::Ui,
     graph: &Graph,
     self_id: LayerId,
     label: &str,
     si: &mut ScalarInput,
+    ctx: &EvalCtx,
 ) -> bool {
     let mut changed = false;
+    // A mode switch replaces the whole enum, which would invalidate the
+    // borrow the arm below holds. Decide inside, assign after.
+    let mut swap_to: Option<ScalarInput> = None;
     ui.horizontal(|ui| {
         ui.label(label);
         match si {
@@ -520,10 +553,16 @@ pub fn scalar_input_widget(
                     .add(egui::Slider::new(v, 0.0..=1.0))
                     .changed();
                 if ui.small_button("use layer").clicked() {
-                    *si = ScalarInput::Layer(
+                    swap_to = Some(ScalarInput::Layer(
                         graph.layers.first().map(|l| l.id).unwrap_or(self_id),
-                    );
-                    changed = true;
+                    ));
+                }
+                // Only offered when a scalar parameter is declared; a
+                // button that can only fail is worse than none.
+                if let Some(first) = param_ref::first(graph, ParamUse::Scalar) {
+                    if ui.small_button("use param").clicked() {
+                        swap_to = Some(ScalarInput::Param(first));
+                    }
                 }
             }
             ScalarInput::Layer(lref) => {
@@ -539,12 +578,35 @@ pub fn scalar_input_widget(
                     changed = true;
                 }
                 if ui.small_button("use const").clicked() {
-                    *si = ScalarInput::Const(0.5);
+                    swap_to = Some(ScalarInput::Const(0.5));
+                }
+            }
+            ScalarInput::Param(name) => {
+                if let Some(new) = param_ref::param_ref(
+                    ui,
+                    ("scalar-param", self_id.0, label),
+                    label,
+                    name,
+                    graph,
+                    ParamUse::Scalar,
+                ) {
+                    *name = new;
                     changed = true;
+                }
+                if ui.small_button("use const").clicked() {
+                    let frozen = graph
+                        .param_value(name, ctx)
+                        .and_then(|v| v.as_scalar())
+                        .unwrap_or(0.5);
+                    swap_to = Some(ScalarInput::Const(frozen));
                 }
             }
         }
     });
+    if let Some(next) = swap_to {
+        *si = next;
+        changed = true;
+    }
     changed
 }
 
