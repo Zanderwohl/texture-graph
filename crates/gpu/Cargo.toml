@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-texture-graph-core = { path = "../core" }
+# Without `default-features = false` every consumer of this crate gets
+# `std-fs` switched on, and a wasm host loses the compile error it is for.
+texture-graph-core = { path = "../core", default-features = false }
 wgpu.workspace = true
 bytemuck.workspace = true
 glam.workspace = true
@@ -18,3 +20,5 @@ wasm-bindgen-futures = "0.4"
 # Only the test modules block on `DeviceCtx::request_headless`; a consumer
 # drives that future with its own executor.
 pollster = "0.4"
+# `examples/bake.rs` loads a graph from disk.
+texture-graph-core = { path = "../core", features = ["std-fs"] }
