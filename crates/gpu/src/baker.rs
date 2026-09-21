@@ -16,6 +16,7 @@ use texture_graph_core::{
     Axis, BlendMode, BlendSpace, ColorInput, ColorRamp, CoordMode, Criterion, EvalCtx,
     FractalMode, Graph, HeightToNormal, LayerId, LayerKind, MinMax, MinMaxMode, Mix, Noise,
     NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, RadialDim, ScalarInput, Transform,
+    Wave, WaveShape,
 };
 
 use texture_graph_core::EdgeMode;
@@ -146,6 +147,8 @@ pub struct Baker {
     dummy_input: wgpu::Texture,
     dummy_input_view: wgpu::TextureView,
     h2n_pipeline: wgpu::ComputePipeline,
+    // wave reuses `transform_bgl` too — uniform + storage_out + input_2d.
+    wave_pipeline: wgpu::ComputePipeline,
     // h2n reuses `transform_bgl` — same binding shape (uniform + storage_out + input_2d).
     // missing reuses `color_bgl`: same binding shape (uniform + storage_texture).
     missing_pipeline: wgpu::ComputePipeline,
@@ -175,6 +178,7 @@ impl Baker {
         let min_max_pipeline = make_min_max_pipeline(&ctx.device, &map_bgl);
         let (ramp_pipeline, ramp_bgl) = make_ramp_pipeline(&ctx.device);
         let h2n_pipeline = make_h2n_pipeline(&ctx.device, &transform_bgl);
+        let wave_pipeline = make_wave_pipeline(&ctx.device, &transform_bgl);
         let dummy_input = ctx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("tg-dummy-input"),
             size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
@@ -215,6 +219,7 @@ impl Baker {
             dummy_input,
             dummy_input_view,
             h2n_pipeline,
+            wave_pipeline,
             pack_pipeline,
             pack_bgl,
             solid_pipeline,
@@ -495,6 +500,27 @@ impl Baker {
                     size,
                     own_dom,
                     dom_opt(h.source),
+                );
+            }
+            LayerKind::Wave(wv) => {
+                // A const input never reads the texture; bind the output's
+                // own domain's placeholder rather than leave the slot
+                // unbound, as Mix does for its factor.
+                let (src_view, dom_input) = match wv.input {
+                    ScalarInput::Layer(id) => (resolve(Some(id)), dom_opt(Some(id))),
+                    ScalarInput::Const(_) => (missing_view, Domain::UNIT.packed()),
+                };
+                dispatch_wave(
+                    &self.ctx,
+                    encoder,
+                    &self.wave_pipeline,
+                    &self.transform_bgl,
+                    &pool_views[dst_slot],
+                    src_view,
+                    wv,
+                    size,
+                    own_dom,
+                    dom_input,
                 );
             }
             LayerKind::ColorRamp(r) => {
@@ -1196,6 +1222,21 @@ struct H2NParams {
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
+struct WaveParams {
+    size: [u32; 2],
+    shape: u32,
+    range: u32,
+    frequency: f32,
+    phase: f32,
+    input_const: f32,
+    input_is_layer: u32,
+    /// Own bake domain, then the input layer's.
+    dom: [f32; 4],
+    dom_input: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
 struct RampStopPacked {
     color: [f32; 4],   // Oklcha; used when kind == 0
     t: f32,
@@ -1273,6 +1314,69 @@ fn dispatch_h2n(
     });
     let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
         label: Some("h2n-cpass"),
+        timestamp_writes: None,
+    });
+    cpass.set_pipeline(pipeline);
+    cpass.set_bind_group(0, &bg, &[]);
+    let (wg_x, wg_y) = workgroup_counts(size);
+    cpass.dispatch_workgroups(wg_x, wg_y, 1);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_wave(
+    ctx: &DeviceCtx,
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::ComputePipeline,
+    bgl: &wgpu::BindGroupLayout,
+    dst_view: &wgpu::TextureView,
+    src_view: &wgpu::TextureView,
+    w: &Wave,
+    size: (u32, u32),
+    dom: [f32; 4],
+    dom_input: [f32; 4],
+) {
+    let shape = match w.shape {
+        WaveShape::Sine => 0u32,
+        WaveShape::Triangle => 1,
+        WaveShape::Square => 2,
+        WaveShape::Sawtooth => 3,
+    };
+    let (input_const, input_is_layer) = match w.input {
+        ScalarInput::Const(v) => (v, 0u32),
+        ScalarInput::Layer(_) => (0.0, 1u32),
+    };
+    let params = WaveParams {
+        size: [size.0, size.1],
+        shape,
+        range: match w.range {
+            NoiseRange::Unsigned => 0,
+            NoiseRange::Signed => 1,
+        },
+        frequency: w.frequency,
+        phase: w.phase,
+        input_const,
+        input_is_layer,
+        dom,
+        dom_input,
+    };
+    let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "wave-params");
+    let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("wave-bg"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: ubo.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(dst_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(src_view),
+            },
+        ],
+    });
+    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("wave-cpass"),
         timestamp_writes: None,
     });
     cpass.set_pipeline(pipeline);
@@ -2337,6 +2441,29 @@ fn make_h2n_pipeline(
     });
     device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("h2n-pipeline"),
+        layout: Some(&pl),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    })
+}
+
+fn make_wave_pipeline(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+) -> wgpu::ComputePipeline {
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("wave-pl"),
+        bind_group_layouts: &[Some(bgl)],
+        ..Default::default()
+    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("wave-shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/wave.wgsl").into()),
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("wave-pipeline"),
         layout: Some(&pl),
         module: &shader,
         entry_point: Some("main"),

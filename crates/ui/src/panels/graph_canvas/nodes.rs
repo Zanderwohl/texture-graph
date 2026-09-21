@@ -18,7 +18,7 @@ use crate::state::{
     EditCmd, NodeDrag, NodeRef, RampDrag, RampMenu, Renaming, UiState, WireDrag,
 };
 use crate::widgets::enum_combo::enum_combo;
-use crate::widgets::noise_labels;
+use crate::widgets::{noise_labels, wave_labels};
 
 use super::layout::{socket_label, NodeLayout, ParamRow, Row};
 use super::ramp;
@@ -863,6 +863,12 @@ fn socket_row(
                 changed |= ui.add(egui::Slider::new(v, 0.0..=1.0)).changed();
             }
         }
+        (LayerKind::Wave(w), InputKey::WaveInput) => {
+            ui.label(socket_label(key));
+            if let ScalarInput::Const(v) = &mut w.input {
+                changed |= ui.add(egui::DragValue::new(v).speed(0.01)).changed();
+            }
+        }
         (LayerKind::ColorRamp(r), InputKey::RampStop(i)) => {
             let can_delete = r.stops.len() > 2;
             // egui doesn't bubble a secondary click from a child to its
@@ -968,6 +974,31 @@ fn param_row(ui: &mut egui::Ui, id: LayerId, kind: &mut LayerKind, p: ParamRow) 
             ui.label("normalize");
             ui.checkbox(&mut n.fractal.normalize, "").changed()
         }
+        (LayerKind::Wave(w), ParamRow::WaveShape) => enum_combo(
+            ui,
+            salt("wave-shape"),
+            "shape",
+            &mut w.shape,
+            wave_labels::SHAPES,
+            wave_labels::shape,
+        ),
+        (LayerKind::Wave(w), ParamRow::WaveFrequency) => {
+            ui.label("freq");
+            ui.add(egui::Slider::new(&mut w.frequency, 0.1..=64.0).logarithmic(true))
+                .changed()
+        }
+        (LayerKind::Wave(w), ParamRow::WavePhase) => {
+            ui.label("phase");
+            ui.add(egui::Slider::new(&mut w.phase, 0.0..=1.0)).changed()
+        }
+        (LayerKind::Wave(w), ParamRow::WaveRange) => enum_combo(
+            ui,
+            salt("wave-range"),
+            "range",
+            &mut w.range,
+            noise_labels::RANGES,
+            noise_labels::range,
+        ),
         (LayerKind::ColorRamp(r), ParamRow::RampSpace) => {
             blend_space_combo(ui, salt("space"), &mut r.space)
         }

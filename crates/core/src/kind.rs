@@ -14,6 +14,7 @@ pub enum LayerKind {
     Map(Map),
     MinMax(MinMax),
     HeightToNormal(HeightToNormal),
+    Wave(Wave),
 }
 
 impl LayerKind {
@@ -27,6 +28,7 @@ impl LayerKind {
             LayerKind::Map(_) => "Map",
             LayerKind::MinMax(_) => "MinMax",
             LayerKind::HeightToNormal(_) => "HeightToNormal",
+            LayerKind::Wave(_) => "Wave",
         }
     }
 
@@ -67,6 +69,7 @@ impl LayerKind {
                 out.extend(mm.b);
             }
             LayerKind::HeightToNormal(h) => out.extend(h.source),
+            LayerKind::Wave(w) => push_scalar(&mut out, w.input),
         }
         out
     }
@@ -348,6 +351,68 @@ pub struct HeightToNormal {
     /// `None` renders as the missing-texture grid.
     pub source: Option<LayerId>,
     pub strength: f32,
+}
+
+/// A periodic waveform over a scalar input — what `sin(...)` is, and what
+/// a ColorRamp with enough stops to fake one is not.
+///
+/// `input` is read as a scalar (a layer's Oklch L), scaled by `frequency`,
+/// shifted by `phase`, and shaped. The output drives L with C = 0, the
+/// same as grayscale [`Noise`].
+///
+/// **Outside the noise op-order contract.** [`WaveShape::Sine`] is
+/// transcendental, so the CPU and GPU implementations agree to within one
+/// sRGB step rather than bit-exactly, and the parity test asserts the
+/// looser bound rather than pretending otherwise.
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+pub struct Wave {
+    /// Scalar to run the wave over. A `Const` makes the whole layer one
+    /// flat value, which is valid and rarely what anybody wants.
+    pub input: ScalarInput,
+    pub shape: WaveShape,
+    /// Cycles per unit of `input`, matching [`Noise::frequency`]'s unit.
+    /// A hand-written shader's `sin(x * k)` counts radians, so it ports as
+    /// `k / 2π` cycles — `sin(x * 18)` is `frequency: 2.8648`.
+    pub frequency: f32,
+    /// Offset in cycles: `0.25` is a quarter turn, `1.0` is no shift at
+    /// all. In cycles rather than radians so the UI never shows a π.
+    pub phase: f32,
+    /// `Signed` is `[-1, 1]`, which composes with `Mix::Add`; `Unsigned`
+    /// is `[0, 1]`, which is what bands want.
+    pub range: NoiseRange,
+}
+
+impl Default for Wave {
+    fn default() -> Self {
+        Self {
+            input: ScalarInput::Const(0.5),
+            shape: WaveShape::Sine,
+            frequency: 4.0,
+            phase: 0.0,
+            range: NoiseRange::Unsigned,
+        }
+    }
+}
+
+/// Waveform shape. Every one is described over the phase `t ∈ [0, 1)`
+/// within a cycle and lands in `[-1, 1]` before [`Wave::range`] maps it.
+///
+/// Sine alone covers the known need; the other three came nearly free
+/// once the node existed.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum WaveShape {
+    /// `sin(2πt)`.
+    #[default]
+    Sine,
+    /// Phase-aligned with `Sine`: 0 at `t = 0`, peaking at `t = 0.25`.
+    Triangle,
+    /// `+1` for the first half of the cycle, `-1` for the second — the
+    /// sign of `Sine`.
+    Square,
+    /// A rising ramp from `-1` to `+1` across the cycle, resetting at each
+    /// period. Not phase-aligned with `Sine`; a sawtooth that started
+    /// mid-ramp would be the surprising one.
+    Sawtooth,
 }
 
 /// Per-pixel winner-take-all between two color layers. Whichever pixel

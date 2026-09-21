@@ -7,7 +7,7 @@ use texture_graph_core::{
     BlendMode, BlendSpace, Color, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion,
     EdgeMode, EvalCtx, Fractal, FractalMode, Graph, HeightToNormal, LayerId, LayerKind, Map,
     MinMax, MinMaxMode, Mix, Noise, NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, Output,
-    ScalarInput, Transform, color::to_srgb8,
+    ScalarInput, Transform, Wave, WaveShape, color::to_srgb8,
 };
 
 use crate::{Baker, DeviceCtx, ScalarFormat};
@@ -1781,4 +1781,127 @@ fn drive<F: std::future::Future>(ctx: &DeviceCtx, fut: F) -> F::Output {
         }
         let _ = ctx.device.poll(wgpu::PollType::Poll);
     }
+}
+
+// ---- Wave (§4) ----------------------------------------------------------
+
+/// CPU/GPU parity for the waveform node, at the looser bound its doc
+/// comment promises.
+///
+/// `Sine` is transcendental, so this is explicitly *not* the noise
+/// op-order contract: within one sRGB step, not bit-exact. Asserting the
+/// bound honestly is the point — a test that demanded equality here would
+/// either be disabled or force a lie in the doc comment.
+#[test]
+fn cpu_and_gpu_wave_agree_within_one_srgb_step() {
+    const RES: u32 = 64;
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+
+    for shape in [WaveShape::Sine, WaveShape::Triangle, WaveShape::Square, WaveShape::Sawtooth] {
+        for range in [NoiseRange::Unsigned, NoiseRange::Signed] {
+            // A ramp along U gives the wave a coordinate to run over —
+            // the shape the banded-planet surface needs.
+            let mut graph = Graph::new();
+            let ramp = graph.output.color.unwrap();
+            graph
+                .set_kind(
+                    ramp,
+                    LayerKind::ColorRamp(ColorRamp {
+                        stops: vec![
+                            ColorStop {
+                                t: 0.0,
+                                color: ColorInput::Const(Color::new(0.0, 0.0, 0.0, 1.0)),
+                            },
+                            ColorStop {
+                                t: 1.0,
+                                color: ColorInput::Const(Color::new(1.0, 0.0, 0.0, 1.0)),
+                            },
+                        ],
+                        space: BlendSpace::Oklch,
+                    }),
+                )
+                .unwrap();
+            let wave = graph
+                .add_layer(
+                    "wave",
+                    LayerKind::Wave(Wave {
+                        input: ScalarInput::Layer(ramp),
+                        shape,
+                        frequency: 5.0,
+                        phase: 0.125,
+                        range,
+                    }),
+                )
+                .unwrap();
+            graph
+                .set_output(Output {
+                    color: Some(wave),
+                    roughness: ScalarInput::Const(0.5),
+                    metallic: ScalarInput::Const(0.0),
+                    normal: None,
+                })
+                .unwrap();
+
+            let eval = EvalCtx::default();
+            let out = baker.bake_output(&graph, (RES, RES), &eval, false).expect("bake");
+            let px = readback_all_pixels(&ctx, &out.color, (RES, RES));
+            let (mut worst, mut compared) = (0u32, 0u32);
+            for y in 0..RES {
+                for x in 0..RES {
+                    let u = (x as f32 + 0.5) / RES as f32;
+                    let v = (y as f32 + 0.5) / RES as f32;
+                    let m = texture_graph_core::evaluate_material(
+                        &graph,
+                        texture_graph_core::Sample::new(u, v, texture_graph_core::FLAT_W),
+                        &eval,
+                    );
+                    // Signed output spends half its range below zero,
+                    // where the two backends differ on purpose — `to_srgb8`
+                    // clamps and `pack_srgb8` paints the checker.
+                    if !(0.0..=1.0).contains(&m.color.l) {
+                        continue;
+                    }
+                    compared += 1;
+                    let expected = to_srgb8(m.color);
+                    let got = px[(y * RES + x) as usize];
+                    for i in 0..3 {
+                        worst = worst
+                            .max((expected[i] as i32 - got[i] as i32).unsigned_abs());
+                    }
+                }
+            }
+            assert!(compared * 4 > RES * RES, "{shape:?} {range:?}: only {compared} in range");
+            assert!(worst <= 1, "{shape:?} {range:?}: worst sRGB delta {worst}");
+        }
+    }
+}
+
+/// A `Const` input never reads the bound texture — the shader's
+/// placeholder path. The result must be one flat value, not whatever
+/// happened to be in the slot.
+#[test]
+fn a_const_input_wave_bakes_flat() {
+    const RES: u32 = 16;
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let id = graph.output.color.unwrap();
+    graph
+        .set_kind(
+            id,
+            LayerKind::Wave(Wave {
+                input: ScalarInput::Const(0.125),
+                shape: WaveShape::Sine,
+                frequency: 2.0,
+                phase: 0.0,
+                range: NoiseRange::Unsigned,
+            }),
+        )
+        .unwrap();
+    let out = baker.bake_output(&graph, (RES, RES), &EvalCtx::default(), false).expect("bake");
+    let px = readback_all_pixels(&ctx, &out.color, (RES, RES));
+    assert!(px.iter().all(|p| *p == px[0]), "a constant input gave a varying field");
+    // 0.125 × 2 cycles is sine's peak, so L = 1 — white.
+    assert!(px[0][0] > 250, "expected the peak of the wave, got {:?}", px[0]);
 }

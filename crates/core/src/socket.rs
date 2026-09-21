@@ -21,6 +21,7 @@ pub enum InputKey {
     MinMaxA,
     MinMaxB,
     H2nSource,
+    WaveInput,
     RampStop(usize),
     OutColor,
     OutRoughness,
@@ -142,6 +143,9 @@ impl LayerKind {
                 "source",
                 SocketValue::LayerOpt(h.source),
             )],
+            LayerKind::Wave(w) => {
+                vec![sock(InputKey::WaveInput, "input", SocketValue::Scalar(w.input))]
+            }
         }
     }
 
@@ -168,6 +172,7 @@ impl LayerKind {
             (LayerKind::HeightToNormal(h), InputKey::H2nSource) => {
                 Ok(set_opt(&mut h.source, target))
             }
+            (LayerKind::Wave(w), InputKey::WaveInput) => Ok(set_scalar(&mut w.input, target)),
             (LayerKind::ColorRamp(r), InputKey::RampStop(i)) => match r.stops.get_mut(i) {
                 // A stop can vanish between drag start and drop (removed in
                 // the inspector) — report it rather than panic.
@@ -184,6 +189,10 @@ impl LayerKind {
         match (self, key, value) {
             (LayerKind::Mix(m), InputKey::MixFactor, ConstValue::Scalar(v)) => {
                 m.factor = ScalarInput::Const(v);
+                Ok(())
+            }
+            (LayerKind::Wave(w), InputKey::WaveInput, ConstValue::Scalar(v)) => {
+                w.input = ScalarInput::Const(v);
                 Ok(())
             }
             (LayerKind::ColorRamp(r), InputKey::RampStop(i), ConstValue::Color(c)) => {
@@ -304,6 +313,10 @@ mod tests {
                 criterion: Criterion::Luma,
             }),
             LayerKind::HeightToNormal(HeightToNormal { source: Some(id(12)), strength: 1.0 }),
+            LayerKind::Wave(crate::kind::Wave {
+                input: ScalarInput::Layer(id(13)),
+                ..crate::kind::Wave::default()
+            }),
         ]
     }
 

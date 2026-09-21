@@ -5,13 +5,13 @@ use texture_graph_core::color::oklcha;
 use texture_graph_core::{
     Axis, BlendMode, BlendSpace, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion, Graph,
     HeightToNormal, LayerId, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseKernel,
-    RadialDim, ScalarInput, Transform, noise::MAX_OCTAVES,
+    RadialDim, ScalarInput, Transform, Wave, noise::MAX_OCTAVES,
 };
 
 use crate::catalog::{self, Kind};
 use crate::state::{EditCmd, UiState};
 use crate::widgets::enum_combo::enum_combo;
-use crate::widgets::noise_labels;
+use crate::widgets::{noise_labels, wave_labels};
 use crate::widgets::{color_edit, layer_ref};
 
 /// Render the inspector for a single layer. Emits `EditCmd::SetKind` when
@@ -64,6 +64,9 @@ pub fn show(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, id: LayerId) 
         }
         LayerKind::HeightToNormal(h) => {
             changed |= h2n_widgets(ui, graph, id, h);
+        }
+        LayerKind::Wave(w) => {
+            changed |= wave_widgets(ui, graph, id, w);
         }
     }
 
@@ -166,6 +169,38 @@ fn noise_widgets(ui: &mut egui::Ui, id: LayerId, n: &mut Noise) -> bool {
             .changed();
         changed |= ui.checkbox(&mut n.fractal.normalize, "normalize").changed();
     }
+    changed
+}
+
+fn wave_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, w: &mut Wave) -> bool {
+    let mut changed = false;
+    changed |= scalar_input_widget(ui, graph, id, "input", &mut w.input);
+    changed |= enum_combo(
+        ui,
+        (id.0, "wave-shape"),
+        "shape",
+        &mut w.shape,
+        wave_labels::SHAPES,
+        wave_labels::shape,
+    );
+    changed |= ui
+        .add(
+            egui::Slider::new(&mut w.frequency, 0.1..=64.0)
+                .logarithmic(true)
+                .text("frequency (cycles)"),
+        )
+        .changed();
+    changed |= ui
+        .add(egui::Slider::new(&mut w.phase, 0.0..=1.0).text("phase (cycles)"))
+        .changed();
+    changed |= enum_combo(
+        ui,
+        (id.0, "wave-range"),
+        "range",
+        &mut w.range,
+        noise_labels::RANGES,
+        noise_labels::range,
+    );
     changed
 }
 

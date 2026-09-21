@@ -54,6 +54,10 @@ pub enum ParamRow {
     MinMaxMode,
     MinMaxCriterion,
     H2nStrength,
+    WaveShape,
+    WaveFrequency,
+    WavePhase,
+    WaveRange,
 }
 
 /// Row table for a layer node. Height follows the kind, conditional rows
@@ -143,6 +147,13 @@ pub fn rows_for(kind: &LayerKind) -> Vec<Row> {
             Row::Socket(InputKey::H2nSource),
             Row::Param(ParamRow::H2nStrength),
         ]),
+        LayerKind::Wave(_) => rows.extend([
+            Row::Socket(InputKey::WaveInput),
+            Row::Param(ParamRow::WaveShape),
+            Row::Param(ParamRow::WaveFrequency),
+            Row::Param(ParamRow::WavePhase),
+            Row::Param(ParamRow::WaveRange),
+        ]),
     }
     rows
 }
@@ -164,6 +175,7 @@ pub fn socket_label(key: InputKey) -> &'static str {
         InputKey::MixA | InputKey::MinMaxA => "a",
         InputKey::MixB | InputKey::MinMaxB => "b",
         InputKey::MixFactor => "factor",
+        InputKey::WaveInput => "input",
         InputKey::MapValue => "value",
         InputKey::MapPalette => "palette",
         InputKey::RampStop(_) => "stop",

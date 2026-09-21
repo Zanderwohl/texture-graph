@@ -6,7 +6,8 @@ use crate::id::LayerId;
 use crate::kind::{
     Axis, BlendMode, ColorInput, ColorRamp, CoordMode, Criterion, EXTEND_LIMIT, EdgeMode,
     FractalMode, HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims,
-    NoiseKernel, NoiseOutput, NoiseRange, RadialDim, ScalarInput, Transform,
+    NoiseKernel, NoiseOutput, NoiseRange, RadialDim, ScalarInput, Transform, Wave,
+    WaveShape,
 };
 
 /// A sample point in the graph's canonical unit cube. Consumers of the
@@ -99,6 +100,7 @@ fn eval_layer(id: LayerId, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &Ev
         LayerKind::Map(m) => eval_map(m, s, by_id, ctx),
         LayerKind::MinMax(mm) => eval_min_max(mm, s, by_id, ctx),
         LayerKind::HeightToNormal(h) => eval_h2n(h, s, by_id, ctx),
+        LayerKind::Wave(w) => eval_wave(w, s, by_id, ctx),
     }
 }
 
@@ -403,6 +405,40 @@ fn criterion_of(c: Color, crit: Criterion) -> f32 {
     }
 }
 
+/// One cycle of `shape` at phase `t`, in `[-1, 1]`.
+///
+/// `t` is reduced to `[0, 1)` first — `fract` written as `x - floor(x)`,
+/// because Rust's `f32::fract` truncates toward zero and WGSL's does not,
+/// which would differ on every negative input. The same reason
+/// `crate::noise` writes it out.
+pub fn wave_cycle(t: f32, shape: WaveShape) -> f32 {
+    let frac = |x: f32| x - x.floor();
+    let t = frac(t);
+    match shape {
+        WaveShape::Sine => (std::f32::consts::TAU * t).sin(),
+        // Phase-aligned with sine: 0 at t = 0, +1 at t = 0.25.
+        WaveShape::Triangle => 1.0 - 4.0 * (frac(t + 0.25) - 0.5).abs(),
+        WaveShape::Square => {
+            if t < 0.5 {
+                1.0
+            } else {
+                -1.0
+            }
+        }
+        WaveShape::Sawtooth => 2.0 * t - 1.0,
+    }
+}
+
+fn eval_wave(w: &Wave, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &EvalCtx) -> Color {
+    let x = eval_scalar(&w.input, s, by_id, ctx);
+    let v = wave_cycle(x * w.frequency + w.phase, w.shape);
+    let l = match w.range {
+        NoiseRange::Signed => v,
+        NoiseRange::Unsigned => v * 0.5 + 0.5,
+    };
+    Color::new(l, 0.0, 0.0, 1.0)
+}
+
 fn eval_h2n(h: &HeightToNormal, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &EvalCtx) -> Color {
     let eps = ctx.normal_epsilon.max(f32::EPSILON);
     let sample_l = |ds: Sample| scalar_of(eval_opt(h.source, ds, by_id, ctx));
@@ -420,6 +456,149 @@ fn eval_h2n(h: &HeightToNormal, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx
     n[1] /= mag;
     n[2] /= mag;
     normal_to_color(n)
+}
+
+#[cfg(test)]
+mod wave_tests {
+    use super::*;
+    use crate::kind::{Wave, WaveShape};
+
+    /// Every shape is described over the phase within a cycle, so it has
+    /// to actually be periodic in it.
+    #[test]
+    fn every_shape_repeats_once_a_cycle() {
+        for shape in [
+            WaveShape::Sine,
+            WaveShape::Triangle,
+            WaveShape::Square,
+            WaveShape::Sawtooth,
+        ] {
+            for k in 0..16 {
+                let t = k as f32 / 16.0;
+                let here = wave_cycle(t, shape);
+                for turns in [-3.0, -1.0, 1.0, 4.0] {
+                    let there = wave_cycle(t + turns, shape);
+                    assert!(
+                        (here - there).abs() < 1e-5,
+                        "{shape:?} at {t} vs {} turns away: {here} vs {there}",
+                        turns
+                    );
+                }
+            }
+        }
+    }
+
+    /// Sine, triangle and square share a phase: zero-crossings and sign in
+    /// the same places. A sawtooth deliberately does not — it ramps.
+    #[test]
+    fn shapes_stay_inside_range_and_share_sines_phase() {
+        for k in 0..64 {
+            let t = k as f32 / 64.0;
+            for shape in [
+                WaveShape::Sine,
+                WaveShape::Triangle,
+                WaveShape::Square,
+                WaveShape::Sawtooth,
+            ] {
+                let v = wave_cycle(t, shape);
+                assert!((-1.0..=1.0).contains(&v), "{shape:?} at {t} gave {v}");
+            }
+            // Away from the crossings at 0 and 0.5, the three agree on sign.
+            if (t - 0.0).abs() > 1e-3 && (t - 0.5).abs() > 1e-3 {
+                let sine = wave_cycle(t, WaveShape::Sine);
+                for shape in [WaveShape::Triangle, WaveShape::Square] {
+                    let v = wave_cycle(t, shape);
+                    assert_eq!(
+                        sine > 0.0,
+                        v > 0.0,
+                        "{shape:?} disagrees with sine on sign at {t}"
+                    );
+                }
+            }
+        }
+        // The landmarks, exactly.
+        assert!((wave_cycle(0.25, WaveShape::Triangle) - 1.0).abs() < 1e-6);
+        assert!((wave_cycle(0.75, WaveShape::Triangle) + 1.0).abs() < 1e-6);
+        assert_eq!(wave_cycle(0.0, WaveShape::Sawtooth), -1.0);
+        assert!((wave_cycle(0.999, WaveShape::Sawtooth) - 1.0).abs() < 0.01);
+    }
+
+    /// `frequency` counts cycles, `phase` shifts by cycles, and `range`
+    /// maps the result the same way grayscale noise does.
+    #[test]
+    fn frequency_and_phase_are_counted_in_cycles() {
+        let mut g = Graph::new();
+        let id = g.output.color.unwrap();
+        let wave = |frequency, phase, range| Wave {
+            input: ScalarInput::Const(0.125),
+            shape: WaveShape::Sine,
+            frequency,
+            phase,
+            range,
+        };
+        let at = |g: &Graph, id| scalar_of(evaluate(g, id, Sample::uv(0.0, 0.0), &EvalCtx::default()));
+
+        // Const input 0.125 at frequency 2 is phase 0.25 — sine's peak.
+        g.set_kind(id, LayerKind::Wave(wave(2.0, 0.0, NoiseRange::Signed))).unwrap();
+        assert!((at(&g, id) - 1.0).abs() < 1e-5);
+        // A full turn of phase changes nothing.
+        g.set_kind(id, LayerKind::Wave(wave(2.0, 1.0, NoiseRange::Signed))).unwrap();
+        assert!((at(&g, id) - 1.0).abs() < 1e-5);
+        // Half a turn inverts it.
+        g.set_kind(id, LayerKind::Wave(wave(2.0, 0.5, NoiseRange::Signed))).unwrap();
+        assert!((at(&g, id) + 1.0).abs() < 1e-5);
+        // Unsigned is the signed field on [0, 1].
+        g.set_kind(id, LayerKind::Wave(wave(2.0, 0.0, NoiseRange::Unsigned))).unwrap();
+        assert!((at(&g, id) - 1.0).abs() < 1e-5);
+        g.set_kind(id, LayerKind::Wave(wave(2.0, 0.5, NoiseRange::Unsigned))).unwrap();
+        assert!(at(&g, id).abs() < 1e-5);
+    }
+
+    /// The wave reads its input as a scalar, so wiring a layer in makes
+    /// the output vary with that layer rather than sit flat.
+    #[test]
+    fn a_layer_input_makes_the_wave_vary() {
+        let mut g = Graph::new();
+        let ramp = g.output.color.unwrap();
+        g.set_kind(
+            ramp,
+            LayerKind::ColorRamp(crate::kind::ColorRamp {
+                stops: vec![
+                    crate::kind::ColorStop {
+                        t: 0.0,
+                        color: ColorInput::Const(Color::new(0.0, 0.0, 0.0, 1.0)),
+                    },
+                    crate::kind::ColorStop {
+                        t: 1.0,
+                        color: ColorInput::Const(Color::new(1.0, 0.0, 0.0, 1.0)),
+                    },
+                ],
+                space: crate::color::BlendSpace::Oklch,
+            }),
+        )
+        .unwrap();
+        let w = g
+            .add_layer(
+                "bands",
+                LayerKind::Wave(Wave {
+                    input: ScalarInput::Layer(ramp),
+                    shape: WaveShape::Sine,
+                    frequency: 4.0,
+                    phase: 0.0,
+                    range: NoiseRange::Unsigned,
+                }),
+            )
+            .unwrap();
+        let ctx = EvalCtx::default();
+        let at = |u| scalar_of(evaluate(&g, w, Sample::uv(u, 0.5), &ctx));
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for k in 0..64 {
+            let v = at(k as f32 / 64.0);
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        assert!(hi - lo > 0.9, "bands barely vary: {lo}..{hi}");
+    }
 }
 
 #[cfg(test)]

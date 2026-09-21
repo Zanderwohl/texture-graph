@@ -29,6 +29,7 @@ pub use id::LayerId;
 pub use kind::{
     Axis, BlendMode, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion, EXTEND_LIMIT,
     EdgeMode, Fractal, FractalMode, HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix,
-    Noise, NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, RadialDim, ScalarInput, Transform,
+    Noise, NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, RadialDim, ScalarInput,
+    Transform, Wave, WaveShape,
 };
 pub use socket::{ConstValue, InputKey, InputSocket, SocketError, SocketValue};
