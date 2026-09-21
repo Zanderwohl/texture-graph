@@ -547,9 +547,14 @@ fn stop_menu(
     bound: bool,
 ) -> Option<StopAction> {
     let mut action = None;
-    resp.context_menu(|ui| {
-        action = stop_menu_items(ui, can_delete, graph, bound);
-    });
+    // Not `Response::context_menu`: that keys the popup on
+    // `Popup::default_response_id`, which is also what egui's color button
+    // keys its picker on, so a right-click on the swatch opened both.
+    egui::Popup::context_menu(resp)
+        .id(resp.id.with("stop-menu"))
+        .show(|ui| {
+            action = stop_menu_items(ui, can_delete, graph, bound);
+        });
     action
 }
 
