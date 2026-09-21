@@ -7,7 +7,7 @@
 //! happen.
 
 use texture_graph_core::{
-    FractalMode, NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, WarpMode, WaveShape,
+    Axis, FractalMode, NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, WarpMode, WaveShape,
 };
 
 // ---- Noise ------------------------------------------------------------
@@ -86,6 +86,16 @@ pub fn period_hint(frequency: f32, period: [u32; 3]) -> String {
 }
 
 // ---- Wave -------------------------------------------------------------
+
+pub const AXES: &[Axis] = &[Axis::U, Axis::V, Axis::W];
+
+pub fn axis(a: Axis) -> &'static str {
+    match a {
+        Axis::U => "u",
+        Axis::V => "v",
+        Axis::W => "w",
+    }
+}
 
 pub const SHAPES: &[WaveShape] = &[
     WaveShape::Sine,

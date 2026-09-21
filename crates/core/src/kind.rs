@@ -17,6 +17,7 @@ pub enum LayerKind {
     HeightToNormal(HeightToNormal),
     Wave(Wave),
     Warp(Warp),
+    Coordinate(Coordinate),
 }
 
 impl LayerKind {
@@ -32,6 +33,7 @@ impl LayerKind {
             LayerKind::HeightToNormal(_) => "HeightToNormal",
             LayerKind::Wave(_) => "Wave",
             LayerKind::Warp(_) => "Warp",
+            LayerKind::Coordinate(_) => "Coordinate",
         }
     }
 
@@ -51,7 +53,7 @@ impl LayerKind {
             }
         };
         match self {
-            LayerKind::Color(_) | LayerKind::Noise(_) => {}
+            LayerKind::Color(_) | LayerKind::Noise(_) | LayerKind::Coordinate(_) => {}
             LayerKind::ColorRamp(r) => {
                 for s in &r.stops {
                     push_color(&mut out, &s.color);
@@ -110,7 +112,8 @@ impl LayerKind {
             | LayerKind::Map(_)
             | LayerKind::MinMax(_)
             | LayerKind::HeightToNormal(_)
-            | LayerKind::Warp(_) => {}
+            | LayerKind::Warp(_)
+            | LayerKind::Coordinate(_) => {}
         }
         out
     }
@@ -353,8 +356,13 @@ pub enum CoordMode {
     Radial { dim: RadialDim, into: Axis },
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub enum Axis { U, V, W }
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum Axis {
+    #[default]
+    U,
+    V,
+    W,
+}
 
 /// Which coordinates contribute to the radial distance.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -523,6 +531,17 @@ impl Default for Wave {
 ///
 /// Sine alone covers the known need; the other three came nearly free
 /// once the node existed.
+/// One axis of the sample point, as a gray: L is the coordinate itself,
+/// unclamped. What a graph reaches for to make something depend on
+/// position directly — latitude bands on a planet are `V` through a Wave.
+///
+/// In a sphere bake the sample point is on the sphere, so `V` there is
+/// the height of the point, not a row of the face being baked.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Coordinate {
+    pub axis: Axis,
+}
+
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum WaveShape {
     /// `sin(2πt)`.

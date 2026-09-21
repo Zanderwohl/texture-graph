@@ -1,6 +1,6 @@
 // LayerKind::Noise. The GPU twin of `core::noise` — that module is the
 // spec, this is its transcription, function for function, and the two must
-// change in the same commit.
+// change in the same commit. Needs `sphere.wgsl` prepended.
 //
 // Two kernels:
 //
@@ -30,9 +30,8 @@ struct NoiseParams {
     fractal_mode: u32,    // 0=Standard, 1=Turbulence, 2=Ridged
     normalize: u32,       // 0 = raw sum, 1 = divide by the amplitude sum
     kernel: u32,          // 0=Simplex, 1=Value
-    // Three scalars, not a vec3: a vec3 aligns to 16 and would land at
-    // offset 96, pushing the struct to 112 while the Rust twin stayed 96.
-    _pad0: u32,
+    face: u32,            // 0 = plane; k + 1 = cube face k. See sphere.wgsl.
+    // Scalars, not a vec2: the struct has to stay 96 bytes, as its Rust twin.
     _pad1: u32,
     _pad2: u32,
 }
@@ -372,10 +371,10 @@ const CHROMA_SCALE: f32 = 0.15;
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.size.x || gid.y >= params.size.y) { return; }
-    // Pixel-center sample coordinates within the bake domain.
-    let u = params.dom.x + (f32(gid.x) + 0.5) / f32(params.size.x) * params.dom.z;
-    let v = params.dom.y + (f32(gid.y) + 0.5) / f32(params.size.y) * params.dom.w;
-    let w = params.w_coord;
+    let p = sample_point(params.face, params.dom, gid.xy, params.size, params.w_coord);
+    let u = p.x;
+    let v = p.y;
+    let w = p.z;
 
     if (params.output_mode == 0u) {
         let n = sample_noise(u, v, w, 0u);

@@ -19,7 +19,9 @@ pub mod readback;
 pub mod scene;
 pub mod schedule;
 
-pub use baker::{BakeError, BakeOutput, Baker, ScalarFormat, ScalarVolume, VolumeOutput};
+pub use baker::{
+    BakeError, BakeOutput, Baker, ScalarCube, ScalarFormat, ScalarVolume, VolumeOutput,
+};
 pub use device::DeviceCtx;
 pub use readback::{
     Image, ScalarImage, read_rgba8, read_rgba8_async, read_scalar, read_scalar_async,
@@ -39,3 +41,6 @@ mod smoke_test;
 
 #[cfg(test)]
 mod scene_test;
+
+#[cfg(test)]
+mod sphere_test;

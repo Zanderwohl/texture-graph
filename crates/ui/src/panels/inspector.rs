@@ -76,6 +76,16 @@ pub fn show(
         LayerKind::Warp(w) => {
             changed |= warp_widgets(ui, graph, id, w);
         }
+        LayerKind::Coordinate(c) => {
+            changed |= enum_combo(
+                ui,
+                (id.0, "coordinate-axis"),
+                "axis",
+                &mut c.axis,
+                node_labels::AXES,
+                node_labels::axis,
+            );
+        }
     }
 
     if changed {

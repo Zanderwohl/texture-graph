@@ -1,0 +1,29 @@
+// Where a stage that generates coordinates samples the graph. Prepended to
+// those stages' sources; the twin of `core::sphere`.
+//
+// `face` is 0 for a plane or a volume slice, where the point is the pixel's
+// (u, v) and the pass's w. For cube face `k` it is `k + 1`, and the point is
+// that face's direction on the sphere inscribed in the unit cube — so a
+// sphere bake is the volume's field restricted to that shell.
+
+fn cube_direction(face: u32, u: f32, v: f32) -> vec3<f32> {
+    let s = 2.0 * u - 1.0;
+    let t = 2.0 * v - 1.0;
+    switch face {
+        case 0u: { return vec3<f32>(1.0, -t, -s); }
+        case 1u: { return vec3<f32>(-1.0, -t, s); }
+        case 2u: { return vec3<f32>(s, 1.0, t); }
+        case 3u: { return vec3<f32>(s, -1.0, -t); }
+        case 4u: { return vec3<f32>(s, -t, 1.0); }
+        default: { return vec3<f32>(-s, -t, -1.0); }
+    }
+}
+
+fn sample_point(face: u32, dom: vec4<f32>, gid: vec2<u32>, size: vec2<u32>, w: f32) -> vec3<f32> {
+    let u = dom.x + (f32(gid.x) + 0.5) / f32(size.x) * dom.z;
+    let v = dom.y + (f32(gid.y) + 0.5) / f32(size.y) * dom.w;
+    if (face == 0u) {
+        return vec3<f32>(u, v, w);
+    }
+    return normalize(cube_direction(face - 1u, u, v)) * 0.5 + vec3<f32>(0.5);
+}

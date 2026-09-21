@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
-use crate::color::{Color, blend, normal_to_color, scalar_of};
+use crate::color::{Color, blend, normal_to_color, oklcha, scalar_of};
 use crate::graph::{Graph, Layer};
 use crate::id::LayerId;
 use crate::param::ParamValue;
@@ -167,6 +167,14 @@ fn eval_layer(id: LayerId, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &Ev
         LayerKind::HeightToNormal(h) => eval_h2n(h, s, by_id, ctx),
         LayerKind::Wave(w) => eval_wave(w, s, by_id, ctx),
         LayerKind::Warp(w) => eval_warp(w, s, by_id, ctx),
+        LayerKind::Coordinate(c) => {
+            let at = match c.axis {
+                Axis::U => s.u,
+                Axis::V => s.v,
+                Axis::W => s.w,
+            };
+            oklcha(at, 0.0, 0.0, 1.0)
+        }
     }
 }
 

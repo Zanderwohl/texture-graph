@@ -193,6 +193,7 @@ impl Graph {
     ///
     /// Detected sources of w-variation:
     /// - `Noise` with `dims == D3`
+    /// - `Coordinate` on `Axis::W`
     /// - `Transform` that routes w into the sampled plane
     ///   (a `Permute` involving `Axis::W`, or a 3D `Radial`)
     pub fn output_is_3d(&self) -> bool {
@@ -206,6 +207,7 @@ impl Graph {
             let Some(l) = self.get(cur) else { continue };
             let is_3d = match &l.kind {
                 LayerKind::Noise(n) => matches!(n.dims, NoiseDims::D3),
+                LayerKind::Coordinate(c) => matches!(c.axis, Axis::W),
                 LayerKind::Transform(t) => match &t.coord_mode {
                     CoordMode::Permute(axes) => {
                         axes.iter().any(|a| matches!(a, Axis::W))

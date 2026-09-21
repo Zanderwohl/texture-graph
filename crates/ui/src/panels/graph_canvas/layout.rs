@@ -60,6 +60,7 @@ pub enum ParamRow {
     WaveRange,
     WarpMode,
     WarpAmount,
+    CoordinateAxis,
 }
 
 /// Row table for a layer node. Height follows the kind, conditional rows
@@ -162,6 +163,7 @@ pub fn rows_for(kind: &LayerKind) -> Vec<Row> {
             Row::Param(ParamRow::WavePhase),
             Row::Param(ParamRow::WaveRange),
         ]),
+        LayerKind::Coordinate(_) => rows.push(Row::Param(ParamRow::CoordinateAxis)),
     }
     rows
 }

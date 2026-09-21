@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use bytemuck::{Pod, Zeroable};
 use texture_graph_core::{
-    Axis, BlendMode, BlendSpace, ColorInput, ColorRamp, CoordMode, Criterion, EvalCtx,
+    Axis, BlendMode, Coordinate, BlendSpace, ColorInput, ColorRamp, CoordMode, Criterion, EvalCtx,
     FractalMode, Graph, HeightToNormal, LayerId, LayerKind, MinMax, MinMaxMode, Mix, Noise,
     NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, RadialDim, ScalarInput, Transform,
     Warp, WarpMode, Wave, WaveShape,
@@ -89,6 +89,70 @@ impl ScalarFormat {
     }
 }
 
+/// One scalar field over the six faces of a cube — the sphere counterpart
+/// of [`Baker::bake_scalar_volume`]. See [`texture_graph_core::sphere`].
+///
+/// A 2D texture of six array layers in `+X, -X, +Y, -Y, +Z, -Z` order, which
+/// is what a `Cube` view of it expects. [`crate::read_scalar_volume`] reads
+/// it back with `size = (face, face, 6)`.
+pub struct ScalarCube {
+    pub texture: wgpu::Texture,
+    /// Texels along each edge of a face.
+    pub face: u32,
+    pub format: ScalarFormat,
+}
+
+/// What one pass through the layers samples: a plane at some `w`, or one
+/// face of a sphere bake.
+#[derive(Copy, Clone, Debug)]
+enum Slice {
+    Plane { w: f32 },
+    CubeFace(u32),
+}
+
+impl Slice {
+    /// The `w` a stage that only knows planes should use.
+    fn w(self) -> f32 {
+        match self {
+            Slice::Plane { w } => w,
+            Slice::CubeFace(_) => texture_graph_core::FLAT_W,
+        }
+    }
+
+    /// The shaders' `face` uniform: 0 for a plane, `k + 1` for face `k`.
+    fn face_code(self) -> u32 {
+        match self {
+            Slice::Plane { .. } => 0,
+            Slice::CubeFace(k) => k + 1,
+        }
+    }
+}
+
+/// Whether a layer means the same thing on a sphere as in a volume.
+///
+/// The rest re-sample an input at other (u, v) — a Transform, a Warp, a
+/// normal's finite difference, a Map's palette read along u — and on a cube
+/// face (u, v) is not a position in the field, so they would bake something
+/// plausible and wrong. Refusing them is honest until each has a sphere
+/// meaning of its own.
+fn sphere_supports(kind: &LayerKind) -> Result<(), BakeError> {
+    match kind {
+        LayerKind::Color(_)
+        | LayerKind::Noise(_)
+        | LayerKind::Coordinate(_)
+        | LayerKind::Mix(_)
+        | LayerKind::MinMax(_)
+        | LayerKind::Wave(_) => Ok(()),
+        LayerKind::ColorRamp(_) => Err(BakeError::Unsupported("ColorRamp in a sphere bake")),
+        LayerKind::Transform(_) => Err(BakeError::Unsupported("Transform in a sphere bake")),
+        LayerKind::Map(_) => Err(BakeError::Unsupported("Map in a sphere bake")),
+        LayerKind::HeightToNormal(_) => {
+            Err(BakeError::Unsupported("HeightToNormal in a sphere bake"))
+        }
+        LayerKind::Warp(_) => Err(BakeError::Unsupported("Warp in a sphere bake")),
+    }
+}
+
 /// One scalar field over a whole `res × res × depth` volume, `w` at each
 /// slice centre — the volume counterpart of [`Baker::bake_scalar`].
 pub struct ScalarVolume {
@@ -130,6 +194,7 @@ pub struct Baker {
     color_pipeline: wgpu::ComputePipeline,
     color_bgl: wgpu::BindGroupLayout,
     noise_pipeline: wgpu::ComputePipeline,
+    coordinate_pipeline: wgpu::ComputePipeline,
     // noise reuses `color_bgl`: same binding shape (uniform + storage_texture).
     transform_pipeline: wgpu::ComputePipeline,
     transform_bgl: wgpu::BindGroupLayout,
@@ -174,6 +239,7 @@ impl Baker {
     pub fn new(ctx: DeviceCtx) -> Self {
         let (color_pipeline, color_bgl) = make_color_pipeline(&ctx.device);
         let noise_pipeline = make_noise_pipeline(&ctx.device, &color_bgl);
+        let coordinate_pipeline = make_coordinate_pipeline(&ctx.device, &color_bgl);
         let (transform_pipeline, transform_bgl) = make_transform_pipeline(&ctx.device);
         let (mix_pipeline, mix_bgl) = make_mix_pipeline(&ctx.device);
         let (map_pipeline, map_bgl) = make_map_pipeline(&ctx.device);
@@ -207,6 +273,7 @@ impl Baker {
             color_pipeline,
             color_bgl,
             noise_pipeline,
+            coordinate_pipeline,
             transform_pipeline,
             transform_bgl,
             mix_pipeline,
@@ -332,7 +399,7 @@ impl Baker {
                 &inter_views,
                 size,
                 slot,
-                0.5,
+                Slice::Plane { w: 0.5 },
                 &missing_view,
             )?;
         }
@@ -377,9 +444,10 @@ impl Baker {
         pool_views: &[wgpu::TextureView],
         size: (u32, u32),
         dst_slot: usize,
-        w: f32,
+        at: Slice,
         missing_view: &wgpu::TextureView,
     ) -> Result<(), BakeError> {
+        let w = at.w();
         // A `None` input has no slot — it samples the missing-texture grid.
         let resolve = |opt: Option<texture_graph_core::LayerId>| -> &wgpu::TextureView {
             match opt {
@@ -419,6 +487,21 @@ impl Baker {
                     eval_ctx.seed,
                     size,
                     w,
+                    at.face_code(),
+                    own_dom,
+                );
+            }
+            LayerKind::Coordinate(c) => {
+                dispatch_coordinate(
+                    &self.ctx,
+                    encoder,
+                    &self.coordinate_pipeline,
+                    &self.color_bgl,
+                    &pool_views[dst_slot],
+                    c,
+                    size,
+                    w,
+                    at.face_code(),
                     own_dom,
                 );
             }
@@ -656,7 +739,7 @@ impl Baker {
                 &self.pool_views,
                 size,
                 slot,
-                0.5,
+                Slice::Plane { w: 0.5 },
                 missing_view,
             )?;
         }
@@ -808,7 +891,7 @@ impl Baker {
             &sched,
             layer,
             size,
-            texture_graph_core::FLAT_W,
+            Slice::Plane { w: texture_graph_core::FLAT_W },
             format,
             &dst.create_view(&wgpu::TextureViewDescriptor::default()),
             eval_ctx,
@@ -855,7 +938,8 @@ impl Baker {
                 });
             let w = (z as f32 + 0.5) / depth as f32;
             self.record_scalar_slice(
-                &mut encoder, graph, &sched, layer, size, w, format, &slice_view, eval_ctx,
+                &mut encoder, graph, &sched, layer, size, Slice::Plane { w }, format, &slice_view,
+                eval_ctx,
             )?;
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -884,8 +968,72 @@ impl Baker {
         Ok(ScalarVolume { texture, size: (res, res, depth), format })
     }
 
-    /// Dispatch every layer for one `w` slice, then pack `layer`'s slot
-    /// into `dst_view`. Shared by the flat and volume scalar bakes.
+    /// [`Baker::bake_scalar`] on a sphere: `layer` sampled over the six
+    /// faces of a cube, each texel at its direction's point on the sphere
+    /// inscribed in the unit cube. The same field a volume bake holds on
+    /// that shell, at a resolution a volume could not afford.
+    ///
+    /// Only layers that mean the same thing on a sphere may be reachable
+    /// from `layer`; anything else is refused before a dispatch is
+    /// recorded. See `sphere_supports`.
+    pub fn bake_scalar_cube(
+        &mut self,
+        graph: &Graph,
+        layer: LayerId,
+        face: u32,
+        format: ScalarFormat,
+        eval_ctx: &EvalCtx,
+    ) -> Result<ScalarCube, BakeError> {
+        let t0 = BakeTimer::start();
+        let eval_ctx = &graph.resolve_params(eval_ctx);
+        let sched = schedule_layer(graph, layer)?;
+        for &id in &sched.order {
+            sphere_supports(&graph.get(id).expect("scheduled layers exist").kind)?;
+        }
+        let size = (face, face);
+        self.ensure_pool(size, sched.peak_slots.max(1));
+
+        let device = self.ctx.device.clone();
+        let slice = make_scalar_texture(&device, size, format, "tg-scalar-cube-face");
+        let slice_view = slice.create_view(&wgpu::TextureViewDescriptor::default());
+        let texture = make_scalar_cube_texture(&device, face, format, "tg-scalar-cube");
+
+        for k in 0..texture_graph_core::CUBE_FACES {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("tg-bake-scalar-cube"),
+            });
+            self.record_scalar_slice(
+                &mut encoder, graph, &sched, layer, size, Slice::CubeFace(k), format,
+                &slice_view, eval_ctx,
+            )?;
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &slice,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: k },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d { width: face, height: face, depth_or_array_layers: 1 },
+            );
+            self.ctx.queue.submit([encoder.finish()]);
+        }
+
+        log::debug!(
+            "bake_scalar_cube 6×{face}² ({format:?}): layers/face={} record+submit={:?}",
+            sched.order.len(),
+            t0.elapsed(),
+        );
+        Ok(ScalarCube { texture, face, format })
+    }
+
+    /// Dispatch every layer for one slice, then pack `layer`'s slot into
+    /// `dst_view`. Shared by the flat, volume and sphere scalar bakes.
     #[allow(clippy::too_many_arguments)]
     fn record_scalar_slice(
         &mut self,
@@ -894,7 +1042,7 @@ impl Baker {
         sched: &Schedule,
         layer: LayerId,
         size: (u32, u32),
-        w: f32,
+        at: Slice,
         format: ScalarFormat,
         dst_view: &wgpu::TextureView,
         eval_ctx: &EvalCtx,
@@ -902,13 +1050,13 @@ impl Baker {
         let missing_view = self.missing_view.clone().expect("ensure_pool made one");
         dispatch_missing(
             &self.ctx, encoder, &self.missing_pipeline, &self.color_bgl,
-            &missing_view, size, w,
+            &missing_view, size, at.w(),
         );
         for &id in &sched.order {
             let slot = *sched.slot_of.get(&id).unwrap() as usize;
             let l = graph.get(id).unwrap();
             self.dispatch_kind(
-                encoder, l, eval_ctx, sched, &self.pool_views, size, slot, w, &missing_view,
+                encoder, l, eval_ctx, sched, &self.pool_views, size, slot, at, &missing_view,
             )?;
         }
         let src_slot = *sched
@@ -1042,7 +1190,7 @@ impl Baker {
                     &self.pool_views,
                     size,
                     slot,
-                    w,
+                    Slice::Plane { w },
                     missing_view,
                 )?;
             }
@@ -1135,7 +1283,9 @@ struct NoiseParams {
     fractal_mode: u32,
     normalize: u32,
     kernel: u32,
-    _pad: [u32; 3],
+    /// 0 for a plane; `k + 1` for cube face `k`.
+    face: u32,
+    _pad: [u32; 2],
 }
 
 #[repr(C)]
@@ -1864,6 +2014,90 @@ fn dispatch_ramp(
     Ok(())
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct CoordinateParams {
+    size: [u32; 2],
+    axis: u32,
+    face: u32,
+    dom: [f32; 4],
+    w_coord: f32,
+    _pad: [u32; 3],
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_coordinate(
+    ctx: &DeviceCtx,
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::ComputePipeline,
+    bgl: &wgpu::BindGroupLayout,
+    dst_view: &wgpu::TextureView,
+    c: &Coordinate,
+    size: (u32, u32),
+    w: f32,
+    face: u32,
+    dom: [f32; 4],
+) {
+    let params = CoordinateParams {
+        size: [size.0, size.1],
+        axis: match c.axis {
+            Axis::U => 0,
+            Axis::V => 1,
+            Axis::W => 2,
+        },
+        face,
+        dom,
+        w_coord: w,
+        _pad: [0; 3],
+    };
+    let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "coordinate-params");
+    let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("coordinate-bg"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: ubo.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(dst_view),
+            },
+        ],
+    });
+    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("coordinate-cpass"),
+        timestamp_writes: None,
+    });
+    cpass.set_pipeline(pipeline);
+    cpass.set_bind_group(0, &bg, &[]);
+    cpass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
+}
+
+fn make_coordinate_pipeline(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+) -> wgpu::ComputePipeline {
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("coordinate-pl"),
+        bind_group_layouts: &[Some(bgl)],
+        ..Default::default()
+    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("coordinate-shader"),
+        source: wgpu::ShaderSource::Wgsl(
+            concat!(include_str!("shaders/sphere.wgsl"), include_str!("shaders/coordinate.wgsl"))
+                .into(),
+        ),
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("coordinate-pipeline"),
+        layout: Some(&pl),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn dispatch_noise(
     ctx: &DeviceCtx,
     encoder: &mut wgpu::CommandEncoder,
@@ -1874,6 +2108,7 @@ fn dispatch_noise(
     ctx_seed: u32,
     size: (u32, u32),
     w: f32,
+    face: u32,
     dom: [f32; 4],
 ) {
     let dims = match n.dims {
@@ -1916,7 +2151,8 @@ fn dispatch_noise(
         fractal_mode,
         normalize: n.fractal.normalize as u32,
         kernel,
-        _pad: [0; 3],
+        face,
+        _pad: [0; 2],
     };
     let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "noise-params");
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2360,6 +2596,30 @@ fn make_scalar_texture(
     })
 }
 
+fn make_scalar_cube_texture(
+    device: &wgpu::Device,
+    face: u32,
+    format: ScalarFormat,
+    label: &str,
+) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: face,
+            height: face,
+            depth_or_array_layers: texture_graph_core::CUBE_FACES,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: format.texture_format(),
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    })
+}
+
 fn make_scalar_volume_texture(
     device: &wgpu::Device,
     res: u32,
@@ -2503,7 +2763,9 @@ fn make_noise_pipeline(
     });
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("noise-shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/noise.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(
+            concat!(include_str!("shaders/sphere.wgsl"), include_str!("shaders/noise.wgsl")).into(),
+        ),
     });
     device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("noise-pipeline"),

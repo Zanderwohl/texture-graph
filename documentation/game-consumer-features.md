@@ -291,6 +291,32 @@ once, and per-instance variation is a small parameter block.
   point at which the rev pin turns into a version, and is worth doing once §1–§5
   are stable rather than before.
 
+## 8. Baking on a sphere
+
+Added after §1–§7 landed, when the consumer reached planet surfaces. A planet's
+pattern is a function of direction, and the only bake that fits a sphere was the
+volume — which spends nearly all its texels on an interior nobody sees. At
+128³ a close approach is visibly soft; at 256³ it is 16 MB a body.
+
+- **`Baker::bake_scalar_cube`** bakes one layer over the six faces of a cube, each
+  texel at its direction's point on the sphere inscribed in the unit cube. So it
+  holds exactly the field a volume bake holds on that shell, and a graph authored
+  and previewed as a solid bakes unchanged. `core::sphere` is the face convention —
+  WebGPU's, `+X, -X, +Y, -Y, +Z, -Z` with `v` down — and a GPU test samples the
+  result through a real `Cube` view, since a mirrored face passes every CPU-side
+  check.
+- **`LayerKind::Coordinate`** — one axis of the sample point, as a gray. Bands in
+  latitude are `Coordinate(V)` through a Wave. In a volume a ColorRamp through a
+  Transform could fake it; on a sphere it cannot, because a Transform's (u, v) is
+  a face's, not a position.
+
+The sphere bake supports the kinds that read their inputs at the sample itself —
+Color, Noise, Coordinate, Mix, MinMax, Wave — and refuses the rest with
+`BakeError::Unsupported`. Transform, Warp and HeightToNormal re-sample an input at
+other (u, v), and Map reads its palette along u; on a cube face those would bake
+something plausible and wrong. Each can be given a sphere meaning later. Format
+version 3.
+
 ## Suggested order
 
 1. §1 value kernel + period, §5 scalar output. Together these are enough to

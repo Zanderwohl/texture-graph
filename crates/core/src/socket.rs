@@ -162,6 +162,7 @@ impl LayerKind {
                 sock(InputKey::WarpSource, "source", SocketValue::LayerOpt(w.source)),
                 sock(InputKey::WarpBy, "by", SocketValue::LayerOpt(w.by)),
             ],
+            LayerKind::Coordinate(_) => Vec::new(),
         }
     }
 

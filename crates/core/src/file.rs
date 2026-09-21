@@ -29,9 +29,9 @@ pub const FILE_EXTENSION: &str = "tgraph";
 /// RON tags enum variants by name, so a `LayerKind` variant added here
 /// keeps old files loading in new builds — it is the other direction that
 /// needs the version, and that is what a reader older than a writer checks.
-/// Bumped once for the batch in
-/// `documentation/game-consumer-features.md`, not once per node.
-pub const CURRENT_FORMAT_VERSION: u32 = 2;
+/// Bumped once per batch of new kinds, not once per node: 2 for §1–§7 of
+/// `documentation/game-consumer-features.md`, 3 for §8's `Coordinate`.
+pub const CURRENT_FORMAT_VERSION: u32 = 3;
 
 /// Structural magic — the RON parser sees this literal as the top-level
 /// struct name.

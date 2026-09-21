@@ -1088,6 +1088,14 @@ fn param_row(ui: &mut egui::Ui, id: LayerId, kind: &mut LayerKind, p: ParamRow) 
         (LayerKind::Warp(w), ParamRow::WarpAmount) => {
             vec3_row(ui, "amount", &mut w.amount, 0.005)
         }
+        (LayerKind::Coordinate(c), ParamRow::CoordinateAxis) => enum_combo(
+            ui,
+            salt("coordinate-axis"),
+            "axis",
+            &mut c.axis,
+            node_labels::AXES,
+            node_labels::axis,
+        ),
         (LayerKind::Wave(w), ParamRow::WaveShape) => enum_combo(
             ui,
             salt("wave-shape"),

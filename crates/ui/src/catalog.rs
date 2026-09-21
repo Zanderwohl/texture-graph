@@ -9,7 +9,8 @@
 
 use texture_graph_core::color::oklcha;
 use texture_graph_core::{
-    BlendMode, BlendSpace, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion, EdgeMode,
+    BlendMode, BlendSpace, ColorInput, ColorRamp, ColorStop, CoordMode, Coordinate, Criterion,
+    EdgeMode,
     Graph, HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, ScalarInput,
     Transform, Warp, Wave,
 };
@@ -36,6 +37,7 @@ pub enum Kind {
     HeightToNormal,
     Wave,
     Warp,
+    Coordinate,
 }
 
 impl Kind {
@@ -55,13 +57,14 @@ impl Kind {
             LayerKind::HeightToNormal(_) => Kind::HeightToNormal,
             LayerKind::Wave(_) => Kind::Wave,
             LayerKind::Warp(_) => Kind::Warp,
+            LayerKind::Coordinate(_) => Kind::Coordinate,
         }
     }
 }
 
 /// Every node the editor offers, in menu order.
 ///
-/// Flat rather than grouped: ten entries still fit in one menu, and five
+/// Flat rather than grouped: eleven entries still fit in one menu, and five
 /// submenus of two would cost a hover and a pointer trip to reach any of
 /// them. Group them when the catalog outgrows a single list.
 pub const VARIANTS: &[Variant] = &[
@@ -75,6 +78,7 @@ pub const VARIANTS: &[Variant] = &[
     Variant { label: "HeightToNormal", kind: Kind::HeightToNormal },
     Variant { label: "Wave", kind: Kind::Wave },
     Variant { label: "Warp", kind: Kind::Warp },
+    Variant { label: "Coordinate", kind: Kind::Coordinate },
 ];
 
 /// What a node of this variant looks like the moment it is added.
@@ -120,6 +124,7 @@ pub fn default_kind(kind: Kind) -> LayerKind {
         }
         Kind::Wave => LayerKind::Wave(Wave::default()),
         Kind::Warp => LayerKind::Warp(Warp::default()),
+        Kind::Coordinate => LayerKind::Coordinate(Coordinate::default()),
     }
 }
 
@@ -173,6 +178,7 @@ mod tests {
             Kind::HeightToNormal,
             Kind::Wave,
             Kind::Warp,
+            Kind::Coordinate,
         ];
         for kind in ALL {
             assert!(

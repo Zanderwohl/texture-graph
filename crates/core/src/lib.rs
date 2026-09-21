@@ -16,6 +16,7 @@ pub mod kind;
 pub mod noise;
 pub mod param;
 pub mod socket;
+pub mod sphere;
 
 pub use color::{BlendSpace, Color};
 pub use eval::{EvalCtx, FLAT_W, Material, Sample, evaluate, evaluate_material};
@@ -28,10 +29,12 @@ pub use file::{load_from_path, save_to_path};
 pub use graph::{Canvas, Graph, GraphError, Layer, Output};
 pub use id::LayerId;
 pub use kind::{
-    Axis, BlendMode, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion, EXTEND_LIMIT,
+    Axis, BlendMode, ColorInput, ColorRamp, ColorStop, CoordMode, Coordinate, Criterion,
+    EXTEND_LIMIT,
     EdgeMode, Fractal, FractalMode, HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix,
     Noise, NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, RadialDim, ScalarInput,
     Transform, Warp, WarpMode, Wave, WaveShape,
 };
 pub use param::{ParamDecl, ParamKind, ParamUse, ParamValue};
 pub use socket::{ConstValue, InputKey, InputSocket, SocketError, SocketValue};
+pub use sphere::{CUBE_FACES, cube_direction, cube_sample};
