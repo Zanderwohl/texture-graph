@@ -25,6 +25,7 @@ use texture_graph_core::color::to_srgb8;
 use texture_graph_core::{EvalCtx, Graph, LayerId, Sample, evaluate};
 
 use crate::app::GpuBits;
+use crate::throttle::Throttle;
 
 pub const PREVIEW_SIZE: u32 = 128;
 
@@ -61,6 +62,9 @@ pub struct PreviewCache {
     /// At most one bulk bake a frame: the baker runs every stale layer in a
     /// single submit, so the first request rebuilds all of them.
     rebuilt_this_frame: bool,
+    /// Spaces out rebakes of images that are merely out of date; see
+    /// [`crate::throttle`].
+    throttle: Throttle,
 }
 
 impl PreviewCache {
@@ -118,8 +122,20 @@ impl PreviewCache {
         graph.get(id)?;
 
         if !self.is_fresh(id) && !self.rebuilt_this_frame {
-            self.rebuilt_this_frame = true;
-            self.rebuild(graph, eval_ctx, gpu);
+            // An out-of-date image can stay up a little longer; a missing
+            // one can't, or a new node sits blank (or, below, takes the
+            // slow CPU path) until the throttle opens.
+            let cold = !self.has_entry(id);
+            let go = if cold {
+                self.throttle.mark(egui_ctx);
+                true
+            } else {
+                self.throttle.allow(egui_ctx)
+            };
+            if go {
+                self.rebuilt_this_frame = true;
+                self.rebuild(graph, eval_ctx, gpu);
+            }
         }
 
         if let Some(thumb) = self.gpu_entries.get(&id) {
@@ -137,6 +153,10 @@ impl PreviewCache {
             CpuThumb { handle, revision: self.revision, forced: self.forced },
         );
         Some(tid)
+    }
+
+    fn has_entry(&self, id: LayerId) -> bool {
+        self.gpu_entries.contains_key(&id) || self.cpu_entries.contains_key(&id)
     }
 
     /// The layers whose thumbnail is out of date and still exists.

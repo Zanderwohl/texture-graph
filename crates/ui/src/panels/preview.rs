@@ -13,15 +13,20 @@ use texture_graph_core::color::to_srgb8;
 use texture_graph_core::{
     EvalCtx, Graph, LayerId, Output, Sample, ScalarInput, evaluate_material,
 };
-use texture_graph_gpu::{SceneCamera, SceneMaterial, SceneShape, VolumeOutput};
+use texture_graph_gpu::{SceneCamera, SceneMaterial, SceneShape, VolumeJob, VolumeOutput};
 
 use crate::app::GpuBits;
 use crate::state::UiState;
+use crate::throttle::Throttle;
 
 /// Per-axis cap on the volume bake. Volume memory is cubic: 256³ Rgba8 is
 /// 64 MiB a channel and 1024³ would be 4 GiB, so past the cap the size
 /// buttons only sharpen the viewport.
 const VOLUME_RES_CAP: u32 = 256;
+/// Compute dispatches a volume rebake records per frame: about 5 ms where
+/// this was measured, so the UI keeps its frame rate and a mid-sized graph
+/// at 256³ lands in a quarter second or so.
+const VOLUME_DISPATCHES_PER_FRAME: u32 = 256;
 
 pub struct PreviewPanelState {
     pub texture: Option<TextureHandle>,
@@ -45,9 +50,15 @@ pub struct PreviewPanelState {
     /// rebakes now and the other when it is switched to.
     channels_stale: bool,
     volume_stale: bool,
+    /// A volume rebake in progress, replacing `volume` when it finishes.
+    volume_job: Option<VolumeJob>,
     /// A change invalidates both bake products, so switching what a node
     /// previews rebakes at once.
     last_preview_target: Option<LayerId>,
+    /// Spaces out rebakes of a product that is merely out of date; see
+    /// [`crate::throttle`]. Missing, resized or re-moded products bake at
+    /// once.
+    throttle: Throttle,
 }
 
 pub struct GpuChannels {
@@ -116,7 +127,9 @@ impl PreviewPanelState {
             auto_spin: true,
             channels_stale: false,
             volume_stale: false,
+            volume_job: None,
             last_preview_target: None,
+            throttle: Throttle::default(),
         }
     }
 }
@@ -258,17 +271,53 @@ pub fn show(
             if preview.volume.as_ref().is_some_and(|v| v.size.0 != vol_res) {
                 preview.volume = None;
             }
-            if preview.volume_stale || preview.volume.is_none() {
+            if preview.volume_job.as_ref().is_some_and(|j| j.res() != vol_res) {
+                preview.volume_job = None;
+            }
+            // A running job is left to finish rather than restarted, or an
+            // edit every frame would keep any rebake from ever landing.
+            let go = preview.volume_job.is_none()
+                && if preview.volume.is_none() {
+                    preview.throttle.mark(ui.ctx());
+                    true
+                } else {
+                    preview.volume_stale && preview.throttle.allow(ui.ctx())
+                };
+            if go {
                 preview.gpu_error = None;
-                match gpu.baker.bake_volume(graph, vol_res, vol_res, eval_ctx) {
-                    Ok(v) => {
-                        preview.volume = Some(v);
+                match gpu.baker.begin_volume(graph, vol_res, vol_res, eval_ctx) {
+                    Ok(job) => {
+                        preview.volume_job = Some(job);
                         preview.volume_stale = false;
                     }
                     Err(e) => {
                         preview.gpu_error =
                             Some(format!("volume bake failed, using UV mapping: {e}"));
                         preview.volume = None;
+                    }
+                }
+            }
+            if let Some(job) = preview.volume_job.as_mut() {
+                // A 256³ volume is ~80 ms of recording on a mid-sized graph,
+                // so a rebake is spread over frames while the previous volume
+                // stays up. With nothing up yet there is nothing to keep
+                // showing, so the first one is done at once.
+                let slices = if preview.volume.is_none() {
+                    u32::MAX
+                } else {
+                    (VOLUME_DISPATCHES_PER_FRAME / job.dispatches_per_slice()).max(1)
+                };
+                match gpu.baker.step_volume(job, slices) {
+                    Ok(true) => {
+                        let job = preview.volume_job.take().unwrap();
+                        preview.volume = Some(job.into_output());
+                    }
+                    Ok(false) => ui.ctx().request_repaint(),
+                    Err(e) => {
+                        preview.gpu_error =
+                            Some(format!("volume bake failed, using UV mapping: {e}"));
+                        preview.volume = None;
+                        preview.volume_job = None;
                     }
                 }
             }
@@ -282,13 +331,18 @@ pub fn show(
     //    3D shapes want real alpha (the object blends); Flat wants the
     //    gray backing checker composited in.
     let want_object_alpha = preview.shape.is_3d();
+    let must_bake = (preview.gpu_channels.is_none() && preview.texture.is_none())
+        || preview
+            .gpu_channels
+            .as_ref()
+            .is_some_and(|c| c.size != preview.size || c.object_alpha != want_object_alpha);
     let needs_bake = !solid_active
-        && (preview.channels_stale
-            || (preview.gpu_channels.is_none() && preview.texture.is_none())
-            || preview
-                .gpu_channels
-                .as_ref()
-                .is_some_and(|c| c.size != preview.size || c.object_alpha != want_object_alpha));
+        && if must_bake {
+            preview.throttle.mark(ui.ctx());
+            true
+        } else {
+            preview.channels_stale && preview.throttle.allow(ui.ctx())
+        };
     if needs_bake {
         preview.gpu_error = None;
         let baked_on_gpu = if let Some(gpu) = gpu.as_deref_mut() {
