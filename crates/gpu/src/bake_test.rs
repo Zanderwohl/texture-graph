@@ -5,8 +5,9 @@ use std::collections::HashSet;
 
 use texture_graph_core::{
     BlendMode, BlendSpace, Color, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion,
-    EdgeMode, EvalCtx, Graph, HeightToNormal, LayerId, LayerKind, Map, MinMax, MinMaxMode, Mix,
-    Noise, NoiseDims, NoiseOutput, NoiseRange, Output, ScalarInput, Transform, color::to_srgb8,
+    EdgeMode, EvalCtx, Fractal, FractalMode, Graph, HeightToNormal, LayerId, LayerKind, Map,
+    MinMax, MinMaxMode, Mix, Noise, NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, Output,
+    ScalarInput, Transform, color::to_srgb8,
 };
 
 use crate::{Baker, DeviceCtx};
@@ -183,6 +184,7 @@ fn noise_layer_has_variance_and_is_deterministic() {
                 frequency: 4.0,
                 range: NoiseRange::Unsigned,
                 output: NoiseOutput::Grayscale,
+                ..Noise::default()
             }),
         )
         .unwrap();
@@ -477,6 +479,7 @@ fn perf_fractal_stack_1024() {
                 frequency: 1.0,
                 range: NoiseRange::Signed,
                 output: NoiseOutput::Grayscale,
+                ..Noise::default()
             }),
         )
         .unwrap();
@@ -493,6 +496,7 @@ fn perf_fractal_stack_1024() {
                     frequency: freq,
                     range: NoiseRange::Signed,
                     output: NoiseOutput::Grayscale,
+                    ..Noise::default()
                 }),
             )
             .unwrap();
@@ -872,6 +876,7 @@ fn a_subset_bake_gives_the_same_picture_as_a_full_one() {
                 frequency: 8.0,
                 range: NoiseRange::Unsigned,
                 output: NoiseOutput::Grayscale,
+                ..Noise::default()
             }),
         )
         .unwrap();
@@ -977,6 +982,7 @@ fn noise_signed_range_lifts_grays_around_50pct() {
                 frequency: 2.0,
                 range: NoiseRange::Signed,
                 output: NoiseOutput::Grayscale,
+                ..Noise::default()
             }),
         )
         .unwrap();
@@ -1337,27 +1343,12 @@ fn radial_extend_past_limit_shows_missing_grid_like_cpu() {
 /// checker. That is a display choice, and this is about the field under it.
 ///
 /// Returns `(histogram, worst, compared, skipped)`.
-fn noise_parity_histogram(
-    dims: NoiseDims,
-    range: NoiseRange,
-    frequency: f32,
-) -> (Vec<u32>, u32, u32, u32) {
+fn noise_parity_histogram(n: Noise) -> (Vec<u32>, u32, u32, u32) {
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
     let mut baker = Baker::new(ctx.clone());
     let mut graph = Graph::new();
     let id = graph.output.color.unwrap();
-    graph
-        .set_kind(
-            id,
-            LayerKind::Noise(Noise {
-                dims,
-                seed_offset: 3,
-                frequency,
-                range,
-                output: NoiseOutput::Grayscale,
-            }),
-        )
-        .unwrap();
+    graph.set_kind(id, LayerKind::Noise(n)).unwrap();
 
     const RES: u32 = 64;
     let eval = EvalCtx::default();
@@ -1398,28 +1389,152 @@ fn noise_parity_histogram(
 
 #[test]
 fn cpu_and_gpu_noise_agree() {
-    for (dims, range, freq) in [
-        (NoiseDims::D2, NoiseRange::Unsigned, 4.0),
-        (NoiseDims::D2, NoiseRange::Signed, 9.0),
-        (NoiseDims::D1, NoiseRange::Unsigned, 6.0),
-        (NoiseDims::D3, NoiseRange::Unsigned, 5.0),
-        (NoiseDims::D3, NoiseRange::Signed, 2.0),
-    ] {
-        let (hist, worst, compared, skipped) = noise_parity_histogram(dims, range, freq);
+    let plain = |dims, range, frequency| Noise {
+        dims,
+        seed_offset: 3,
+        frequency,
+        range,
+        output: NoiseOutput::Grayscale,
+        ..Noise::default()
+    };
+    let value = |dims, range, frequency, period| Noise {
+        kernel: NoiseKernel::Value,
+        period,
+        ..plain(dims, range, frequency)
+    };
+    let cases: [(&str, Noise); 12] = [
+        // Simplex, the pre-existing coverage.
+        ("simplex D2 unsigned", plain(NoiseDims::D2, NoiseRange::Unsigned, 4.0)),
+        ("simplex D2 signed", plain(NoiseDims::D2, NoiseRange::Signed, 9.0)),
+        ("simplex D1 unsigned", plain(NoiseDims::D1, NoiseRange::Unsigned, 6.0)),
+        ("simplex D3 unsigned", plain(NoiseDims::D3, NoiseRange::Unsigned, 5.0)),
+        ("simplex D3 signed", plain(NoiseDims::D3, NoiseRange::Signed, 2.0)),
+        // Value, aperiodic and periodic, every dimensionality.
+        ("value D1 unsigned", value(NoiseDims::D1, NoiseRange::Unsigned, 6.0, [0; 3])),
+        ("value D2 unsigned", value(NoiseDims::D2, NoiseRange::Unsigned, 4.0, [0; 3])),
+        ("value D2 signed", value(NoiseDims::D2, NoiseRange::Signed, 9.0, [0; 3])),
+        ("value D3 unsigned", value(NoiseDims::D3, NoiseRange::Unsigned, 5.0, [0; 3])),
+        ("value D2 tiling", value(NoiseDims::D2, NoiseRange::Unsigned, 8.0, [8, 8, 0])),
+        // Octaves, on both kernels and a shaping mode each.
+        (
+            "value ridged x4",
+            Noise {
+                fractal: Fractal {
+                    octaves: 4,
+                    lacunarity: 2.0,
+                    gain: 0.5,
+                    mode: FractalMode::Ridged,
+                    normalize: true,
+                },
+                ..value(NoiseDims::D3, NoiseRange::Unsigned, 3.0, [0; 3])
+            },
+        ),
+        (
+            "simplex turbulence x5",
+            Noise {
+                fractal: Fractal {
+                    octaves: 5,
+                    lacunarity: 2.13,
+                    gain: 0.55,
+                    mode: FractalMode::Turbulence,
+                    normalize: true,
+                },
+                ..plain(NoiseDims::D2, NoiseRange::Unsigned, 3.0)
+            },
+        ),
+    ];
+    for (label, n) in cases {
+        let (hist, worst, compared, skipped) = noise_parity_histogram(n);
         println!(
-            "{dims:?} {range:?} f={freq}: worst={worst} hist={hist:?} \
-             compared={compared} skipped={skipped}"
+            "{label}: worst={worst} hist={hist:?} compared={compared} skipped={skipped}"
         );
         // A test that skipped everything would pass on an empty
         // comparison. Signed noise spends a good third of its range below
         // zero, so the floor is a quarter of the image rather than half.
-        assert!(
-            compared * 4 > 64 * 64,
-            "{dims:?} {range:?}: only {compared} samples were in range"
-        );
-        assert!(
-            worst <= 1,
-            "{dims:?} {range:?} f={freq}: worst sRGB delta {worst}, histogram {hist:?}"
-        );
+        assert!(compared * 4 > 64 * 64, "{label}: only {compared} samples were in range");
+        assert!(worst <= 1, "{label}: worst sRGB delta {worst}, histogram {hist:?}");
+    }
+}
+
+/// The claim §1 of the consumer doc is built on, checked where it matters:
+/// on the GPU, in a real bake, not only in the CPU kernel.
+///
+/// `period / frequency` is the repeat length in sample space. At
+/// `period = 4`, `frequency = 16` that is a quarter of a unit, so a bake of
+/// the unit square is four identical tiles across and down. Exact pixel
+/// equality is the right bar: same shader, same lattice cells, same integer
+/// corner hashes.
+const TILE_PERIOD: u32 = 4;
+const TILES_ACROSS: u32 = 4;
+const TILE_RES: u32 = 64;
+
+fn tiling_noise(kernel: NoiseKernel, period: [u32; 3]) -> Noise {
+    Noise {
+        dims: NoiseDims::D2,
+        seed_offset: 1,
+        frequency: (TILE_PERIOD * TILES_ACROSS) as f32,
+        range: NoiseRange::Unsigned,
+        output: NoiseOutput::Grayscale,
+        kernel,
+        period,
+        fractal: Fractal::default(),
+    }
+}
+
+fn bake_noise_pixels(n: Noise) -> Vec<[u8; 4]> {
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    let mut graph = Graph::new();
+    let id = graph.output.color.unwrap();
+    graph.set_kind(id, LayerKind::Noise(n)).unwrap();
+    let size = (TILE_RES, TILE_RES);
+    let out = baker.bake_output(&graph, size, &EvalCtx::default(), false).expect("bake");
+    readback_all_pixels(&ctx, &out.color, size)
+}
+
+#[test]
+fn a_periodic_value_bake_tiles_exactly_on_the_gpu() {
+    let px = bake_noise_pixels(tiling_noise(
+        NoiseKernel::Value,
+        [TILE_PERIOD, TILE_PERIOD, 0],
+    ));
+    let tile = TILE_RES / TILES_ACROSS;
+    let mut varied = false;
+    for y in 0..tile {
+        for x in 0..tile {
+            let first = px[(y * TILE_RES + x) as usize];
+            if first != px[0] {
+                varied = true;
+            }
+            for ty in 0..TILES_ACROSS {
+                for tx in 0..TILES_ACROSS {
+                    let (sx, sy) = (x + tx * tile, y + ty * tile);
+                    assert_eq!(
+                        first,
+                        px[(sy * TILE_RES + sx) as usize],
+                        "tile ({tx},{ty}) differs at ({x},{y})"
+                    );
+                }
+            }
+        }
+    }
+    assert!(varied, "the field is constant, so tiling proves nothing");
+}
+
+/// The same bake without a period must *not* repeat — otherwise the field
+/// tiles for some reason of its own and the test above proves nothing.
+#[test]
+fn an_aperiodic_bake_does_not_tile() {
+    let tile = TILE_RES / TILES_ACROSS;
+    let repeats = |px: &[[u8; 4]]| {
+        (0..tile).all(|y| {
+            (0..tile).all(|x| {
+                px[(y * TILE_RES + x) as usize] == px[(y * TILE_RES + x + tile) as usize]
+            })
+        })
+    };
+    for kernel in [NoiseKernel::Simplex, NoiseKernel::Value] {
+        let px = bake_noise_pixels(tiling_noise(kernel, [0; 3]));
+        assert!(!repeats(&px), "{kernel:?} repeated across a tile boundary");
     }
 }

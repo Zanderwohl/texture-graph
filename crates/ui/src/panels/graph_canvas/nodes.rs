@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use texture_graph_core::{
     Axis, BlendMode, BlendSpace, Color, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion,
-    EvalCtx, Graph, InputKey, LayerId, LayerKind, MinMaxMode, NoiseDims, NoiseOutput,
-    NoiseRange, RadialDim, ScalarInput,
+    EvalCtx, Graph, InputKey, LayerId, LayerKind, MinMaxMode, NoiseKernel, RadialDim,
+    ScalarInput, noise::MAX_OCTAVES,
 };
 
 use crate::app::GpuBits;
@@ -18,6 +18,7 @@ use crate::state::{
     EditCmd, NodeDrag, NodeRef, RampDrag, RampMenu, Renaming, UiState, WireDrag,
 };
 use crate::widgets::enum_combo::enum_combo;
+use crate::widgets::noise_labels;
 
 use super::layout::{socket_label, NodeLayout, ParamRow, Row};
 use super::ramp;
@@ -904,39 +905,32 @@ fn param_row(ui: &mut egui::Ui, id: LayerId, kind: &mut LayerKind, p: ParamRow) 
             ui.label("color");
             color_swatch(ui, c).changed()
         }
+        (LayerKind::Noise(n), ParamRow::NoiseKernel) => {
+            noise_kernel_combo(ui, salt("kernel"), n)
+        }
         (LayerKind::Noise(n), ParamRow::NoiseDims) => enum_combo(
             ui,
             salt("dims"),
             "dims",
             &mut n.dims,
-            &[NoiseDims::D1, NoiseDims::D2, NoiseDims::D3],
-            |d| match d {
-                NoiseDims::D1 => "1D",
-                NoiseDims::D2 => "2D",
-                NoiseDims::D3 => "3D",
-            },
+            noise_labels::DIMS,
+            noise_labels::dims,
         ),
         (LayerKind::Noise(n), ParamRow::NoiseOutput) => enum_combo(
             ui,
             salt("output"),
             "output",
             &mut n.output,
-            &[NoiseOutput::Grayscale, NoiseOutput::Color],
-            |o| match o {
-                NoiseOutput::Grayscale => "grayscale",
-                NoiseOutput::Color => "color (LCh)",
-            },
+            noise_labels::OUTPUTS,
+            noise_labels::output,
         ),
         (LayerKind::Noise(n), ParamRow::NoiseRange) => enum_combo(
             ui,
             salt("range"),
             "range",
             &mut n.range,
-            &[NoiseRange::Unsigned, NoiseRange::Signed],
-            |r| match r {
-                NoiseRange::Unsigned => "[0, 1]",
-                NoiseRange::Signed => "[-1, 1]",
-            },
+            noise_labels::RANGES,
+            noise_labels::range,
         ),
         (LayerKind::Noise(n), ParamRow::NoiseFrequency) => {
             ui.label("freq");
@@ -946,6 +940,33 @@ fn param_row(ui: &mut egui::Ui, id: LayerId, kind: &mut LayerKind, p: ParamRow) 
         (LayerKind::Noise(n), ParamRow::NoiseSeed) => {
             ui.label("seed");
             ui.add(egui::DragValue::new(&mut n.seed_offset)).changed()
+        }
+        (LayerKind::Noise(n), ParamRow::NoisePeriod) => noise_period_row(ui, n),
+        (LayerKind::Noise(n), ParamRow::NoiseOctaves) => {
+            ui.label("octaves");
+            ui.add(egui::Slider::new(&mut n.fractal.octaves, 1..=MAX_OCTAVES))
+                .changed()
+        }
+        (LayerKind::Noise(n), ParamRow::NoiseFractalMode) => enum_combo(
+            ui,
+            salt("fractal-mode"),
+            "fbm",
+            &mut n.fractal.mode,
+            noise_labels::FRACTAL_MODES,
+            noise_labels::fractal_mode,
+        ),
+        (LayerKind::Noise(n), ParamRow::NoiseLacunarity) => {
+            ui.label("lacunarity");
+            ui.add(egui::Slider::new(&mut n.fractal.lacunarity, 1.0..=4.0))
+                .changed()
+        }
+        (LayerKind::Noise(n), ParamRow::NoiseGain) => {
+            ui.label("gain");
+            ui.add(egui::Slider::new(&mut n.fractal.gain, 0.0..=1.0)).changed()
+        }
+        (LayerKind::Noise(n), ParamRow::NoiseNormalize) => {
+            ui.label("normalize");
+            ui.checkbox(&mut n.fractal.normalize, "").changed()
         }
         (LayerKind::ColorRamp(r), ParamRow::RampSpace) => {
             blend_space_combo(ui, salt("space"), &mut r.space)
@@ -1108,6 +1129,42 @@ fn blend_space_combo(
             BlendSpace::Hsv => "Hsv",
         },
     )
+}
+
+/// Kernel picker. Moving off the value kernel clears the period rather
+/// than leaving one that `Graph::set_kind` would reject — the edit the user
+/// made is the kernel, and an error toast about a field they cannot see on
+/// simplex would be no help.
+fn noise_kernel_combo(
+    ui: &mut egui::Ui,
+    salt: (&'static str, u64, &'static str),
+    n: &mut texture_graph_core::Noise,
+) -> bool {
+    let changed = enum_combo(
+        ui,
+        salt,
+        "kernel",
+        &mut n.kernel,
+        noise_labels::KERNELS,
+        noise_labels::kernel,
+    );
+    if changed && n.kernel == NoiseKernel::Simplex {
+        n.period = [0; 3];
+    }
+    changed
+}
+
+/// Per-axis lattice period, `0` meaning "does not repeat on this axis".
+/// Hovering says what the current pair actually repeats at, because
+/// `period / frequency` is the number that matters and neither field is it.
+fn noise_period_row(ui: &mut egui::Ui, n: &mut texture_graph_core::Noise) -> bool {
+    let mut changed = false;
+    ui.label("period")
+        .on_hover_text(noise_labels::period_hint(n.frequency, n.period));
+    for p in n.period.iter_mut() {
+        changed |= ui.add(egui::DragValue::new(p).speed(0.25)).changed();
+    }
+    changed
 }
 
 fn vec3_row(ui: &mut egui::Ui, label: &str, v: &mut [f32; 3], speed: f32) -> bool {

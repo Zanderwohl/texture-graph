@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::color::Color;
 use crate::id::LayerId;
-use crate::kind::{ColorRamp, LayerKind, ScalarInput};
+use crate::kind::{ColorRamp, LayerKind, NoiseKernel, ScalarInput};
 
 /// Named node in the graph. Canvas position lives in [`Graph::canvases`], so
 /// identity, display and layout stay independent.
@@ -88,6 +88,8 @@ pub enum GraphError {
     Cycle(LayerId),
     #[error("color ramp must have at least two stops")]
     RampTooFewStops,
+    #[error("a periodic lattice needs the Value kernel; simplex has none to wrap")]
+    PeriodicSimplex,
     #[error("canvas {0:?} does not exist")]
     UnknownCanvas(String),
     #[error("canvas {0:?} already exists")]
@@ -212,9 +214,7 @@ impl Graph {
                 return Err(GraphError::UnknownId(input));
             }
         }
-        if let LayerKind::ColorRamp(r) = &kind {
-            validate_ramp(r)?;
-        }
+        validate_kind(&kind)?;
         let id = LayerId(self.next_id);
         self.next_id += 1;
         self.layers.push(Layer { id, name, kind });
@@ -285,9 +285,7 @@ impl Graph {
                 return Err(GraphError::UnknownId(input));
             }
         }
-        if let LayerKind::ColorRamp(r) = &kind {
-            validate_ramp(r)?;
-        }
+        validate_kind(&kind)?;
         let old = std::mem::replace(&mut self.get_mut(id).unwrap().kind, kind);
         if self.has_cycle_from(id) {
             self.get_mut(id).unwrap().kind = old;
@@ -450,6 +448,25 @@ fn validate_ramp(r: &ColorRamp) -> Result<(), GraphError> {
     Ok(())
 }
 
+/// Per-variant invariants the evaluator and the baker are allowed to
+/// assume. Checked by every path that installs a kind, so neither backend
+/// has to carry a fallback for a graph that cannot exist.
+fn validate_kind(kind: &LayerKind) -> Result<(), GraphError> {
+    match kind {
+        LayerKind::ColorRamp(r) => validate_ramp(r),
+        LayerKind::Noise(n) => {
+            // Silently dropping the period would make a graph look tiled in
+            // the editor and seam in the consumer — the one failure this
+            // feature exists to prevent.
+            if n.kernel == NoiseKernel::Simplex && n.period != [0; 3] {
+                return Err(GraphError::PeriodicSimplex);
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,6 +565,58 @@ mod tests {
         assert_eq!(g.output.color, None);
         assert_eq!(g.output.normal, None);
         assert!(matches!(g.output.roughness, ScalarInput::Const(_)));
+    }
+
+    fn value_noise(period: [u32; 3]) -> LayerKind {
+        LayerKind::Noise(crate::kind::Noise {
+            dims: crate::kind::NoiseDims::D3,
+            seed_offset: 0,
+            frequency: 8.0,
+            range: crate::kind::NoiseRange::Unsigned,
+            output: crate::kind::NoiseOutput::Grayscale,
+            kernel: NoiseKernel::Value,
+            period,
+            fractal: crate::kind::Fractal::default(),
+        })
+    }
+
+    /// A period on the simplex kernel is rejected, not dropped: a silent
+    /// no-op would look tiled here and seam in whatever samples the bake.
+    #[test]
+    fn a_periodic_simplex_is_rejected_by_every_path() {
+        let mut periodic_simplex = value_noise([8, 8, 8]);
+        let LayerKind::Noise(n) = &mut periodic_simplex else { panic!() };
+        n.kernel = NoiseKernel::Simplex;
+
+        let mut g = Graph::new();
+        assert!(matches!(
+            g.add_layer("bad", periodic_simplex.clone()),
+            Err(GraphError::PeriodicSimplex)
+        ));
+        let id = g.output.color.unwrap();
+        assert!(matches!(
+            g.set_kind(id, periodic_simplex),
+            Err(GraphError::PeriodicSimplex)
+        ));
+        // An unbounded period on simplex, and any period on value, are fine.
+        let mut aperiodic = value_noise([0; 3]);
+        let LayerKind::Noise(n) = &mut aperiodic else { panic!() };
+        n.kernel = NoiseKernel::Simplex;
+        assert!(g.add_layer("plain simplex", aperiodic).is_ok());
+        assert!(g.add_layer("tiling value", value_noise([8, 8, 8])).is_ok());
+    }
+
+    /// The rejected kind must not be left installed — `set_kind` restores
+    /// what was there on every other failure, and this one is no different.
+    #[test]
+    fn a_rejected_kind_leaves_the_layer_alone() {
+        let mut g = Graph::new();
+        let id = g.output.color.unwrap();
+        let mut periodic_simplex = value_noise([4, 0, 0]);
+        let LayerKind::Noise(n) = &mut periodic_simplex else { panic!() };
+        n.kernel = NoiseKernel::Simplex;
+        let _ = g.set_kind(id, periodic_simplex);
+        assert!(matches!(g.get(id).unwrap().kind, LayerKind::Color(_)));
     }
 
     #[test]

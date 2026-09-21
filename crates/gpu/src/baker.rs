@@ -13,9 +13,9 @@ use std::collections::{HashMap, HashSet};
 
 use bytemuck::{Pod, Zeroable};
 use texture_graph_core::{
-    Axis, BlendMode, BlendSpace, ColorInput, ColorRamp, CoordMode, Criterion, EvalCtx, Graph,
-    HeightToNormal, LayerId, LayerKind, MinMax, MinMaxMode, Mix, Noise, NoiseDims, NoiseOutput,
-    NoiseRange, RadialDim, ScalarInput, Transform,
+    Axis, BlendMode, BlendSpace, ColorInput, ColorRamp, CoordMode, Criterion, EvalCtx,
+    FractalMode, Graph, HeightToNormal, LayerId, LayerKind, MinMax, MinMaxMode, Mix, Noise,
+    NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, RadialDim, ScalarInput, Transform,
 };
 
 use texture_graph_core::EdgeMode;
@@ -509,7 +509,7 @@ impl Baker {
         &mut self,
         graph: &Graph,
         size: (u32, u32),
-        _ctx: &EvalCtx,
+        eval_ctx: &EvalCtx,
         object_alpha: bool,
     ) -> Result<BakeOutput, BakeError> {
         let t0 = std::time::Instant::now();
@@ -536,7 +536,7 @@ impl Baker {
             self.dispatch_kind(
                 &mut encoder,
                 layer,
-                _ctx,
+                eval_ctx,
                 &sched,
                 &self.pool_views,
                 size,
@@ -830,6 +830,17 @@ struct NoiseParams {
     w_coord: f32,
     /// Bake domain as (min_u, min_v, ext_u, ext_v).
     dom: [f32; 4],
+    /// Lattice period in cells; 0 = unbounded on that axis. `vec3<u32>` in
+    /// the shader, so it has to start 16-byte aligned — which offset 48
+    /// is, and the trailing `_pad` keeps the struct a multiple of 16.
+    period: [u32; 3],
+    octaves: u32,
+    lacunarity: f32,
+    gain: f32,
+    fractal_mode: u32,
+    normalize: u32,
+    kernel: u32,
+    _pad: [u32; 3],
 }
 
 #[repr(C)]
@@ -1422,6 +1433,15 @@ fn dispatch_noise(
         NoiseOutput::Grayscale => 0u32,
         NoiseOutput::Color => 1u32,
     };
+    let kernel = match n.kernel {
+        NoiseKernel::Simplex => 0u32,
+        NoiseKernel::Value => 1u32,
+    };
+    let fractal_mode = match n.fractal.mode {
+        FractalMode::Standard => 0u32,
+        FractalMode::Turbulence => 1u32,
+        FractalMode::Ridged => 2u32,
+    };
     let params = NoiseParams {
         size: [size.0, size.1],
         dims,
@@ -1431,6 +1451,16 @@ fn dispatch_noise(
         frequency: n.frequency,
         w_coord: w,
         dom,
+        // `Graph` rejects a period on the simplex kernel, so the shader
+        // never has to decide which of the two the caller meant.
+        period: n.period,
+        octaves: n.fractal.octaves.clamp(1, texture_graph_core::noise::MAX_OCTAVES),
+        lacunarity: n.fractal.lacunarity,
+        gain: n.fractal.gain,
+        fractal_mode,
+        normalize: n.fractal.normalize as u32,
+        kernel,
+        _pad: [0; 3],
     };
     let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "noise-params");
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {

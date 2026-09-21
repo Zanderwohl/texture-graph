@@ -66,6 +66,7 @@ fn demo_graph() -> Graph {
                 frequency: 6.0,
                 range: NoiseRange::Unsigned,
                 output: NoiseOutput::Grayscale,
+                ..Noise::default()
             }),
         )
         .unwrap();

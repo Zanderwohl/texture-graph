@@ -10,8 +10,8 @@
 use texture_graph_core::color::oklcha;
 use texture_graph_core::{
     BlendMode, BlendSpace, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion, EdgeMode,
-    Graph, HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims,
-    NoiseOutput, NoiseRange, ScalarInput, Transform,
+    Graph, HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, ScalarInput,
+    Transform,
 };
 
 /// One entry in the add-node menu and the variant switcher.
@@ -79,13 +79,7 @@ pub const VARIANTS: &[Variant] = &[
 pub fn default_kind(kind: Kind) -> LayerKind {
     match kind {
         Kind::Color => LayerKind::Color(oklcha(0.5, 0.0, 0.0, 1.0)),
-        Kind::Noise => LayerKind::Noise(Noise {
-            dims: NoiseDims::D2,
-            seed_offset: 0,
-            frequency: 4.0,
-            range: NoiseRange::Unsigned,
-            output: NoiseOutput::Grayscale,
-        }),
+        Kind::Noise => LayerKind::Noise(Noise::default()),
         Kind::ColorRamp => LayerKind::ColorRamp(ColorRamp {
             stops: vec![
                 ColorStop { t: 0.0, color: ColorInput::Const(oklcha(0.0, 0.0, 0.0, 1.0)) },

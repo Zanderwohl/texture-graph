@@ -1,14 +1,18 @@
-// LayerKind::Noise. Simplex noise ported to WGSL.
+// LayerKind::Noise. The GPU twin of `core::noise` — that module is the
+// spec, this is its transcription, function for function, and the two must
+// change in the same commit.
 //
-// Uses Stefan Gustavson's textureless simplex noise (permutation-polynomial
-// gradient hash). This does NOT bit-match the `noise` crate's Simplex used by
-// the CPU evaluator: their permutation tables differ, and CPU noise runs in
-// f64 while the GPU is f32. The two share only their statistical shape —
-// same range, same smoothness class, similar feature scale. GPU-baked
-// graphs stay deterministic under fixed (seed, seed_offset, dims, frequency).
+// Two kernels:
 //
-// Range mapping and Grayscale/Color output modes match `eval_noise` in
-// `core::eval` verbatim.
+// - Simplex: Stefan Gustavson's textureless simplex (permutation-polynomial
+//   gradient hash), all f32 polynomial arithmetic. Aperiodic.
+// - Value: trilinear value noise on an integer lattice, with the cell index
+//   taken modulo a per-axis period. The hash is pure u32, so corner values
+//   match the CPU's bit for bit and a periodic field seams against itself
+//   exactly.
+//
+// Both run under the same fractal octave loop. Range mapping and the
+// Grayscale/Color output modes match `eval_noise` in `core::eval` verbatim.
 
 struct NoiseParams {
     size: vec2<u32>,
@@ -19,7 +23,26 @@ struct NoiseParams {
     frequency: f32,
     w_coord: f32,         // third texture coordinate; 0.5 for flat bakes
     dom: vec4<f32>,       // bake domain (min_u, min_v, ext_u, ext_v)
+    period: vec3<u32>,    // lattice period in cells; 0 = unbounded on that axis
+    octaves: u32,         // 1..=MAX_OCTAVES
+    lacunarity: f32,
+    gain: f32,
+    fractal_mode: u32,    // 0=Standard, 1=Turbulence, 2=Ridged
+    normalize: u32,       // 0 = raw sum, 1 = divide by the amplitude sum
+    kernel: u32,          // 0=Simplex, 1=Value
+    // Three scalars, not a vec3: a vec3 aligns to 16 and would land at
+    // offset 96, pushing the struct to 112 while the Rust twin stayed 96.
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
+
+// Mirrors `core::noise::MAX_OCTAVES`. The loop is bounded so a bad uniform
+// costs a fixed ceiling rather than a hung dispatch.
+const MAX_OCTAVES: u32 = 8u;
+
+// Mirrors `core::noise::OCTAVE_SEED_STRIDE`.
+const OCTAVE_SEED_STRIDE: u32 = 0x9E3779B9u;
 
 @group(0) @binding(0) var<uniform> params: NoiseParams;
 @group(0) @binding(1) var out_tex: texture_storage_2d<rgba32float, write>;
@@ -153,45 +176,195 @@ fn hash_to_float01(x: u32) -> f32 {
     return f32(x >> 8u) * (1.0 / 16777216.0);
 }
 
-fn seeded_uv(u: f32, v: f32, extra_seed_offset: u32) -> vec2<f32> {
-    let s = params.seed_base + extra_seed_offset;
+// The translation the simplex kernel applies for a given seed — twin of
+// `seed_offsets`. Takes the seed itself rather than an offset from
+// `params`, because each octave runs under its own.
+fn seeded_uv_for(u: f32, v: f32, s: u32) -> vec2<f32> {
     let ox = hash_to_float01(wang_hash(s ^ 0xA1B2C3D4u)) * 256.0;
     let oy = hash_to_float01(wang_hash(s ^ 0x51F0E7A9u)) * 256.0;
     return vec2<f32>(u + ox, v + oy);
 }
 
-fn seeded_uvw(u: f32, v: f32, w: f32, extra_seed_offset: u32) -> vec3<f32> {
-    let s = params.seed_base + extra_seed_offset;
+fn seeded_uvw_for(u: f32, v: f32, w: f32, s: u32) -> vec3<f32> {
     let ox = hash_to_float01(wang_hash(s ^ 0xA1B2C3D4u)) * 256.0;
     let oy = hash_to_float01(wang_hash(s ^ 0x51F0E7A9u)) * 256.0;
     let oz = hash_to_float01(wang_hash(s ^ 0x0BADC0DEu)) * 256.0;
     return vec3<f32>(u + ox, v + oy, w + oz);
 }
 
-fn sample_noise(u: f32, v: f32, w: f32, extra_seed_offset: u32) -> f32 {
-    let f = params.frequency;
-    var raw: f32;
+// ---- Value noise ------------------------------------------------------
+
+// Twin of `lattice_hash` in core::noise. Integer end to end, so a corner
+// value is the same bits on both backends.
+fn lattice_hash(cell: vec3<i32>, seed: u32) -> u32 {
+    var h = (u32(cell.x) * 1597334677u)
+          ^ (u32(cell.y) * 3812015801u)
+          ^ (u32(cell.z) * 2654435761u)
+          ^ wang_hash(seed);
+    h = h ^ (h >> 15u);
+    h = h * 2246822519u;
+    h = h ^ (h >> 13u);
+    h = h * 3266489917u;
+    h = h ^ (h >> 16u);
+    return h;
+}
+
+// Twin of `wrap_cell`. WGSL's `%` on i32 truncates toward zero, as Rust's
+// does, so the double-mod is the same expression on both sides.
+fn wrap_cell(i: i32, period: u32) -> i32 {
+    if (period == 0u) { return i; }
+    let p = i32(period);
+    return ((i % p) + p) % p;
+}
+
+fn smooth_weight(t: f32) -> f32 {
+    return t * t * (3.0 - 2.0 * t);
+}
+
+fn lerp1(a: f32, b: f32, t: f32) -> f32 {
+    return a + (b - a) * t;
+}
+
+fn lattice_corner(base: vec3<i32>, d: vec3<i32>, period: vec3<u32>, seed: u32) -> f32 {
+    let cell = vec3<i32>(
+        wrap_cell(base.x + d.x, period.x),
+        wrap_cell(base.y + d.y, period.y),
+        wrap_cell(base.z + d.z, period.z),
+    );
+    return hash_to_float01(lattice_hash(cell, seed)) * 2.0 - 1.0;
+}
+
+// Trilinear value noise at `p`, roughly [-1, 1]; twin of `value_noise`.
+fn value_noise(p: vec3<f32>, period: vec3<u32>, seed: u32) -> f32 {
+    let i = floor(p);
+    let base = vec3<i32>(i32(i.x), i32(i.y), i32(i.z));
+    let w = vec3<f32>(
+        smooth_weight(p.x - i.x),
+        smooth_weight(p.y - i.y),
+        smooth_weight(p.z - i.z),
+    );
+    let c00 = lerp1(
+        lattice_corner(base, vec3<i32>(0, 0, 0), period, seed),
+        lattice_corner(base, vec3<i32>(1, 0, 0), period, seed), w.x);
+    let c10 = lerp1(
+        lattice_corner(base, vec3<i32>(0, 1, 0), period, seed),
+        lattice_corner(base, vec3<i32>(1, 1, 0), period, seed), w.x);
+    let c01 = lerp1(
+        lattice_corner(base, vec3<i32>(0, 0, 1), period, seed),
+        lattice_corner(base, vec3<i32>(1, 0, 1), period, seed), w.x);
+    let c11 = lerp1(
+        lattice_corner(base, vec3<i32>(0, 1, 1), period, seed),
+        lattice_corner(base, vec3<i32>(1, 1, 1), period, seed), w.x);
+    let c0 = lerp1(c00, c10, w.y);
+    let c1 = lerp1(c01, c11, w.y);
+    return lerp1(c0, c1, w.z);
+}
+
+// ---- Octaves ----------------------------------------------------------
+
+// One raw octave in the kernel's own roughly-[-1, 1] convention; twin of
+// `octave`. The value kernel leaves the coordinates alone and seeds
+// through the hash, or the lattice would slide off the integers and the
+// period would stop meaning anything.
+fn noise_octave(
+    u: f32, v: f32, w: f32,
+    seed: u32,
+    f: f32,
+    period: vec3<u32>,
+) -> f32 {
+    if (params.kernel == 1u) {
+        switch params.dims {
+            case 0u: {
+                return value_noise(vec3<f32>(u * f, 0.0, 0.0),
+                    vec3<u32>(period.x, 0u, 0u), seed);
+            }
+            case 2u: {
+                return value_noise(vec3<f32>(u * f, v * f, w * f), period, seed);
+            }
+            default: {
+                return value_noise(vec3<f32>(u * f, v * f, 0.0),
+                    vec3<u32>(period.x, period.y, 0u), seed);
+            }
+        }
+    }
     switch params.dims {
         case 0u: {
             // D1: sample 2D with y=0.
-            let sh = seeded_uv(u, 0.0, extra_seed_offset);
-            raw = snoise2(vec2<f32>(sh.x * f, sh.y));
+            let sh = seeded_uv_for(u, 0.0, seed);
+            return snoise2(vec2<f32>(sh.x * f, sh.y));
         }
         case 2u: {
-            let p = seeded_uvw(u, v, w, extra_seed_offset) * f;
-            raw = snoise3(p);
+            return snoise3(seeded_uvw_for(u, v, w, seed) * f);
         }
         default: {
             // D2 (and any other value).
-            let p = seeded_uv(u, v, extra_seed_offset) * f;
-            raw = snoise2(p);
+            return snoise2(seeded_uv_for(u, v, seed) * f);
         }
+    }
+}
+
+// Twin of `shape`.
+fn shape_octave(r: f32) -> f32 {
+    switch params.fractal_mode {
+        case 1u: { return abs(r); }
+        case 2u: {
+            let t = 1.0 - abs(r);
+            return t * t;
+        }
+        default: { return r; }
+    }
+}
+
+// Twin of `octave_period`. `floor(x + 0.5)` rather than `round`, which
+// breaks ties to even here and away from zero in Rust.
+fn octave_period(base: vec3<u32>, scale: f32) -> vec3<u32> {
+    var out = vec3<u32>(0u, 0u, 0u);
+    if (base.x != 0u) { out.x = u32(floor(f32(base.x) * scale + 0.5)); }
+    if (base.y != 0u) { out.y = u32(floor(f32(base.y) * scale + 0.5)); }
+    if (base.z != 0u) { out.z = u32(floor(f32(base.z) * scale + 0.5)); }
+    return out;
+}
+
+// Twin of `core::noise::sample`. `extra_seed_offset` is the output
+// channel (0 for grayscale, 0/1/2 for L/C/hue).
+fn sample_noise(u: f32, v: f32, w: f32, extra_seed_offset: u32) -> f32 {
+    let seed = params.seed_base + extra_seed_offset;
+    let octaves = clamp(params.octaves, 1u, MAX_OCTAVES);
+    var frequency = params.frequency;
+    var period_scale = 1.0;
+    var amplitude = 1.0;
+    var sum = 0.0;
+    var amplitude_sum = 0.0;
+
+    for (var i: u32 = 0u; i < octaves; i = i + 1u) {
+        let r = noise_octave(
+            u, v, w,
+            seed + i * OCTAVE_SEED_STRIDE,
+            frequency,
+            octave_period(params.period, period_scale),
+        );
+        sum = sum + amplitude * shape_octave(r);
+        amplitude_sum = amplitude_sum + amplitude;
+        frequency = frequency * params.lacunarity;
+        period_scale = period_scale * params.lacunarity;
+        amplitude = amplitude * params.gain;
+    }
+
+    var acc = sum;
+    if (params.normalize == 1u && amplitude_sum > 0.0) {
+        acc = sum / amplitude_sum;
+    }
+    // Turbulence and Ridged land in [0, 1]; stretch them into the signed
+    // convention so one range rule covers every mode.
+    var signed_value = acc;
+    if (params.fractal_mode != 0u) {
+        signed_value = acc * 2.0 - 1.0;
     }
     // range: 0=Unsigned -> [0,1], 1=Signed -> [-1, 1].
     if (params.range == 0u) {
-        return raw * 0.5 + 0.5;
+        return signed_value * 0.5 + 0.5;
     }
-    return raw;
+    return signed_value;
 }
 
 const CHROMA_SCALE: f32 = 0.15;

@@ -4,13 +4,14 @@
 use texture_graph_core::color::oklcha;
 use texture_graph_core::{
     Axis, BlendMode, BlendSpace, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion, Graph,
-    HeightToNormal, LayerId, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims,
-    NoiseOutput, NoiseRange, RadialDim, ScalarInput, Transform,
+    HeightToNormal, LayerId, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseKernel,
+    RadialDim, ScalarInput, Transform, noise::MAX_OCTAVES,
 };
 
 use crate::catalog::{self, Kind};
 use crate::state::{EditCmd, UiState};
 use crate::widgets::enum_combo::enum_combo;
+use crate::widgets::noise_labels;
 use crate::widgets::{color_edit, layer_ref};
 
 /// Render the inspector for a single layer. Emits `EditCmd::SetKind` when
@@ -75,39 +76,45 @@ pub fn show(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, id: LayerId) 
 
 fn noise_widgets(ui: &mut egui::Ui, id: LayerId, n: &mut Noise) -> bool {
     let mut changed = false;
+    if enum_combo(
+        ui,
+        (id.0, "noise-kernel"),
+        "kernel",
+        &mut n.kernel,
+        noise_labels::KERNELS,
+        noise_labels::kernel,
+    ) {
+        changed = true;
+        // Leaving a period behind on simplex would make `set_kind` reject
+        // the very edit the user just made, over a field the simplex UI
+        // does not even show.
+        if n.kernel == NoiseKernel::Simplex {
+            n.period = [0; 3];
+        }
+    }
     changed |= enum_combo(
         ui,
         (id.0, "noise-dims"),
         "dims",
         &mut n.dims,
-        &[NoiseDims::D1, NoiseDims::D2, NoiseDims::D3],
-        |d| match d {
-            NoiseDims::D1 => "1D",
-            NoiseDims::D2 => "2D",
-            NoiseDims::D3 => "3D",
-        },
+        noise_labels::DIMS,
+        noise_labels::dims,
     );
     changed |= enum_combo(
         ui,
         (id.0, "noise-output"),
         "output",
         &mut n.output,
-        &[NoiseOutput::Grayscale, NoiseOutput::Color],
-        |o| match o {
-            NoiseOutput::Grayscale => "grayscale",
-            NoiseOutput::Color => "color (LCh)",
-        },
+        noise_labels::OUTPUTS,
+        noise_labels::output,
     );
     changed |= enum_combo(
         ui,
         (id.0, "noise-range"),
         "range",
         &mut n.range,
-        &[NoiseRange::Unsigned, NoiseRange::Signed],
-        |r| match r {
-            NoiseRange::Unsigned => "[0, 1]",
-            NoiseRange::Signed => "[-1, 1]",
-        },
+        noise_labels::RANGES,
+        noise_labels::range,
     );
     changed |= ui
         .add(
@@ -119,6 +126,46 @@ fn noise_widgets(ui: &mut egui::Ui, id: LayerId, n: &mut Noise) -> bool {
     changed |= ui
         .add(egui::DragValue::new(&mut n.seed_offset).prefix("seed+"))
         .changed();
+
+    // Only the value kernel has a lattice to wrap; simplex would be
+    // rejected outright, so the control stays hidden rather than armed.
+    if n.kernel == NoiseKernel::Value {
+        ui.horizontal(|ui| {
+            ui.label("period");
+            for p in n.period.iter_mut() {
+                changed |= ui.add(egui::DragValue::new(p).speed(0.25)).changed();
+            }
+        });
+        ui.weak(noise_labels::period_hint(n.frequency, n.period));
+    }
+
+    changed |= ui
+        .add(egui::Slider::new(&mut n.fractal.octaves, 1..=MAX_OCTAVES).text("octaves"))
+        .changed();
+    // At one octave the rest of the stack describes nothing.
+    if n.fractal.octaves > 1 {
+        changed |= enum_combo(
+            ui,
+            (id.0, "noise-fractal-mode"),
+            "fbm",
+            &mut n.fractal.mode,
+            noise_labels::FRACTAL_MODES,
+            noise_labels::fractal_mode,
+        );
+        changed |= ui
+            .add(egui::Slider::new(&mut n.fractal.lacunarity, 1.0..=4.0).text("lacunarity"))
+            .changed();
+        if n.period != [0; 3] && n.fractal.lacunarity.fract() != 0.0 {
+            ui.weak(
+                "a fractional lacunarity scales the period off the lattice — \
+                 the field stops tiling exactly",
+            );
+        }
+        changed |= ui
+            .add(egui::Slider::new(&mut n.fractal.gain, 0.0..=1.0).text("gain"))
+            .changed();
+        changed |= ui.checkbox(&mut n.fractal.normalize, "normalize").changed();
+    }
     changed
 }
 

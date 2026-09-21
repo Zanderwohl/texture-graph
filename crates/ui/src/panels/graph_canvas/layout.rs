@@ -28,6 +28,16 @@ pub enum ParamRow {
     NoiseRange,
     NoiseFrequency,
     NoiseSeed,
+    NoiseKernel,
+    /// Only shown for the value kernel — simplex has no lattice to wrap.
+    NoisePeriod,
+    NoiseOctaves,
+    /// The four rows below only appear once there is more than one octave;
+    /// at one they describe a stack that does not exist.
+    NoiseFractalMode,
+    NoiseLacunarity,
+    NoiseGain,
+    NoiseNormalize,
     RampSpace,
     /// Gradient bar with draggable indicators; taller than a standard row.
     RampBar,
@@ -53,13 +63,28 @@ pub fn rows_for(kind: &LayerKind) -> Vec<Row> {
     let mut rows = Vec::new();
     match kind {
         LayerKind::Color(_) => rows.push(Row::Param(ParamRow::ColorValue)),
-        LayerKind::Noise(_) => rows.extend([
-            Row::Param(ParamRow::NoiseDims),
-            Row::Param(ParamRow::NoiseOutput),
-            Row::Param(ParamRow::NoiseRange),
-            Row::Param(ParamRow::NoiseFrequency),
-            Row::Param(ParamRow::NoiseSeed),
-        ]),
+        LayerKind::Noise(n) => {
+            rows.extend([
+                Row::Param(ParamRow::NoiseKernel),
+                Row::Param(ParamRow::NoiseDims),
+                Row::Param(ParamRow::NoiseOutput),
+                Row::Param(ParamRow::NoiseRange),
+                Row::Param(ParamRow::NoiseFrequency),
+                Row::Param(ParamRow::NoiseSeed),
+            ]);
+            if n.kernel == texture_graph_core::NoiseKernel::Value {
+                rows.push(Row::Param(ParamRow::NoisePeriod));
+            }
+            rows.push(Row::Param(ParamRow::NoiseOctaves));
+            if n.fractal.octaves > 1 {
+                rows.extend([
+                    Row::Param(ParamRow::NoiseFractalMode),
+                    Row::Param(ParamRow::NoiseLacunarity),
+                    Row::Param(ParamRow::NoiseGain),
+                    Row::Param(ParamRow::NoiseNormalize),
+                ]);
+            }
+        }
         LayerKind::ColorRamp(r) => {
             rows.push(Row::Param(ParamRow::RampSpace));
             rows.push(Row::Param(ParamRow::RampBar));

@@ -92,8 +92,8 @@ pub enum ScalarInput {
 
 // ---- Node payloads ------------------------------------------------------
 
-/// Simplex noise at a chosen dimensionality, with a chosen numeric range
-/// and either grayscale or LCh-colorful output.
+/// Noise at a chosen dimensionality, with a chosen numeric range and
+/// either grayscale or LCh-colorful output.
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub struct Noise {
     pub dims: NoiseDims,
@@ -102,6 +102,113 @@ pub struct Noise {
     pub frequency: f32,
     pub range: NoiseRange,
     pub output: NoiseOutput,
+    /// Which kernel generates the field. A file without the field loads as
+    /// [`NoiseKernel::Simplex`], which is what every graph written before
+    /// this field existed contains.
+    #[serde(default)]
+    pub kernel: NoiseKernel,
+    /// Lattice period in cells, per axis; `0` = unbounded on that axis.
+    ///
+    /// With `frequency = f` and `period = p`, the lattice cell index is
+    /// taken `mod p`, so the field repeats every `p / f` units of sample
+    /// space. Seamless across the unit cube is exactly the case `p == f`
+    /// with `f` integral — anything else tiles, just not on the cube.
+    ///
+    /// Per-axis rather than one flag because periodicity is often wanted
+    /// on one axis alone: an animation that scrolls through w forever
+    /// wants `[0, 0, 64]` and nothing more.
+    ///
+    /// [`NoiseKernel::Value`] only — a nonzero period on `Simplex` is
+    /// rejected as [`crate::GraphError::PeriodicSimplex`] rather than
+    /// silently ignored, because tiled simplex needs a 6D kernel for 3D
+    /// and this crate does not have one.
+    #[serde(default)]
+    pub period: [u32; 3],
+    /// Octave stack. The default is one octave, which is the plain kernel.
+    #[serde(default)]
+    pub fractal: Fractal,
+}
+
+impl Default for Noise {
+    /// The node a fresh Noise layer starts as: one octave of aperiodic
+    /// simplex, grayscale, `[0, 1]`. Every other field is `..Default`'s
+    /// job at a call site that only cares about one of them.
+    fn default() -> Self {
+        Self {
+            dims: NoiseDims::D2,
+            seed_offset: 0,
+            frequency: 4.0,
+            range: NoiseRange::Unsigned,
+            output: NoiseOutput::Grayscale,
+            kernel: NoiseKernel::Simplex,
+            period: [0; 3],
+            fractal: Fractal::default(),
+        }
+    }
+}
+
+/// Which kernel generates a [`Noise`] field. The twin implementations are
+/// [`crate::noise`] (CPU) and `noise.wgsl` (GPU).
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum NoiseKernel {
+    /// Gustavson simplex. Aperiodic — it has no lattice to wrap — and the
+    /// default a file without the field loads as.
+    #[default]
+    Simplex,
+    /// Trilinear value noise on an integer lattice, smoothstep weights.
+    /// The only kernel that can tile, and the one a hand-written shader
+    /// most likely already uses.
+    Value,
+}
+
+/// Octave stack applied inside the kernel dispatch.
+///
+/// This lives on [`Noise`] rather than in an `Fbm { source }` node on
+/// purpose. The baker evaluates each layer once per pixel over a fixed
+/// domain, so a downstream node cannot re-sample its input at a different
+/// scale — the same constraint already documented on `bake_volume`.
+/// Octaves have to be where the coordinates are still live.
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Fractal {
+    /// `1..=`[`crate::noise::MAX_OCTAVES`]. 1 is a plain single-octave
+    /// sample, and is exactly the bare kernel.
+    pub octaves: u32,
+    /// Frequency multiplier per octave. A float, not a shift: 2.13 and 2.4
+    /// are as common as 2.0 in hand-tuned fbm. Only an integral value
+    /// keeps a `period` tiling exactly — see [`Noise::period`].
+    pub lacunarity: f32,
+    /// Amplitude multiplier per octave.
+    pub gain: f32,
+    pub mode: FractalMode,
+    /// Divide by the sum of amplitudes so the result stays in range.
+    pub normalize: bool,
+}
+
+impl Default for Fractal {
+    /// One octave: the plain kernel, and what a file written before
+    /// fractals existed means.
+    fn default() -> Self {
+        Self {
+            octaves: 1,
+            lacunarity: 2.0,
+            gain: 0.5,
+            mode: FractalMode::Standard,
+            normalize: true,
+        }
+    }
+}
+
+/// How each octave is shaped before it is summed. Written over the signed
+/// sample `r ∈ [-1, 1]`; `n` below is the unsigned `r * 0.5 + 0.5`.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum FractalMode {
+    /// `Σ aᵢ · n(fᵢx)` — ordinary fbm.
+    #[default]
+    Standard,
+    /// `Σ aᵢ · |n|` — creased at every zero crossing.
+    Turbulence,
+    /// `Σ aᵢ · (1 - |2n - 1|)²` — filaments, as a star corona wants.
+    Ridged,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]

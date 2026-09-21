@@ -5,8 +5,8 @@ use crate::graph::{Graph, Layer};
 use crate::id::LayerId;
 use crate::kind::{
     Axis, BlendMode, ColorInput, ColorRamp, CoordMode, Criterion, EXTEND_LIMIT, EdgeMode,
-    HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims, NoiseOutput,
-    NoiseRange, RadialDim, ScalarInput, Transform,
+    FractalMode, HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims,
+    NoiseKernel, NoiseOutput, NoiseRange, RadialDim, ScalarInput, Transform,
 };
 
 /// A sample point in the graph's canonical unit cube. Consumers of the
@@ -147,20 +147,45 @@ fn eval_scalar(si: &ScalarInput, s: Sample, by_id: &HashMap<LayerId, &Layer>, ct
 
 // ---- Node implementations ----------------------------------------------
 
-fn eval_noise(n: &Noise, s: Sample, ctx: &EvalCtx) -> Color {
-    // Straight through to the shared kernel; `crate::noise` has the why.
-    let sample = |off: u32| -> f32 {
-        let dims = match n.dims {
+/// Translate the serialized node into the kernel's own vocabulary. The two
+/// sets of enums stay separate so `crate::noise` — the spec the shader is
+/// transcribed from — does not depend on the file format.
+fn noise_spec(n: &Noise) -> crate::noise::Spec {
+    crate::noise::Spec {
+        dims: match n.dims {
             NoiseDims::D1 => crate::noise::Dims::D1,
             NoiseDims::D2 => crate::noise::Dims::D2,
             NoiseDims::D3 => crate::noise::Dims::D3,
-        };
+        },
+        kernel: match n.kernel {
+            NoiseKernel::Simplex => crate::noise::Kernel::Simplex,
+            NoiseKernel::Value => crate::noise::Kernel::Value,
+        },
+        frequency: n.frequency,
+        period: n.period,
+        fractal: crate::noise::Fractal {
+            octaves: n.fractal.octaves,
+            lacunarity: n.fractal.lacunarity,
+            gain: n.fractal.gain,
+            mode: match n.fractal.mode {
+                FractalMode::Standard => crate::noise::FractalMode::Standard,
+                FractalMode::Turbulence => crate::noise::FractalMode::Turbulence,
+                FractalMode::Ridged => crate::noise::FractalMode::Ridged,
+            },
+            normalize: n.fractal.normalize,
+        },
+        signed: matches!(n.range, NoiseRange::Signed),
+    }
+}
+
+fn eval_noise(n: &Noise, s: Sample, ctx: &EvalCtx) -> Color {
+    // Straight through to the shared kernel; `crate::noise` has the why.
+    let spec = noise_spec(n);
+    let sample = |off: u32| -> f32 {
         crate::noise::sample(
-            dims,
+            &spec,
             ctx.seed.wrapping_add(n.seed_offset).wrapping_add(off),
-            n.frequency,
             [s.u, s.v, s.w],
-            matches!(n.range, NoiseRange::Signed),
         )
     };
 
