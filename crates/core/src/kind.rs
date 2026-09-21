@@ -15,6 +15,7 @@ pub enum LayerKind {
     MinMax(MinMax),
     HeightToNormal(HeightToNormal),
     Wave(Wave),
+    Warp(Warp),
 }
 
 impl LayerKind {
@@ -29,6 +30,7 @@ impl LayerKind {
             LayerKind::MinMax(_) => "MinMax",
             LayerKind::HeightToNormal(_) => "HeightToNormal",
             LayerKind::Wave(_) => "Wave",
+            LayerKind::Warp(_) => "Warp",
         }
     }
 
@@ -70,6 +72,10 @@ impl LayerKind {
             }
             LayerKind::HeightToNormal(h) => out.extend(h.source),
             LayerKind::Wave(w) => push_scalar(&mut out, w.input),
+            LayerKind::Warp(w) => {
+                out.extend(w.source);
+                out.extend(w.by);
+            }
         }
         out
     }
@@ -351,6 +357,78 @@ pub struct HeightToNormal {
     /// `None` renders as the missing-texture grid.
     pub source: Option<LayerId>,
     pub strength: f32,
+}
+
+/// Displace the sample point by what another layer says, then read
+/// `source` there.
+///
+/// [`Transform::offset`] is a constant, so there was no way to express
+/// "move this sample by what that field says" — which is what a domain
+/// warp is, and what the banded-planet surface needs.
+///
+/// # What the displacement is
+///
+/// The field's value **as it stands**, times `amount`. It is not
+/// recentred: a [`NoiseRange::Signed`] driver gives a warp centred on
+/// zero, and an unsigned one pushes in one direction only. That is the
+/// same convention `Mix::Add` already follows, and it keeps the node from
+/// guessing what range its input meant.
+///
+/// # Where it stops
+///
+/// The driving field is *assumed* to lie in `[-1, 1]`, so the baker grows
+/// `source`'s bake domain by `|amount|` per axis — exactly as
+/// [`EdgeMode::Extend`] grows a Transform's — and a displacement that
+/// reaches further than that lands outside baked territory and shows the
+/// missing-texture grid. Past [`EXTEND_LIMIT`] it does so regardless.
+/// Both backends draw the line in the same place so a warp looks the same
+/// either side of it.
+///
+/// # The w axis
+///
+/// `amount[2]` displaces w on the CPU evaluator. The GPU baker cannot
+/// honour it: each slice only has its inputs baked at that slice's w, so
+/// nothing downstream can re-sample them at another — the same limitation
+/// `bake_volume` documents for a Transform's w offset. Leave it at zero
+/// unless the CPU evaluator is the only consumer.
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+pub struct Warp {
+    /// Sampled at the displaced coordinate. `None` renders as the
+    /// missing-texture grid.
+    pub source: Option<LayerId>,
+    /// The displacement field. `None` displaces by the missing-texture
+    /// grid's own values, which is visible nonsense rather than a silent
+    /// no-op.
+    pub by: Option<LayerId>,
+    pub mode: WarpMode,
+    /// Per-axis scale on the displacement, in sample-space units.
+    pub amount: [f32; 3],
+}
+
+impl Default for Warp {
+    fn default() -> Self {
+        Self {
+            source: None,
+            by: None,
+            mode: WarpMode::Scalar,
+            amount: [0.1, 0.1, 0.0],
+        }
+    }
+}
+
+/// How many of the displacement field's channels are read.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum WarpMode {
+    /// One scalar — the field's Oklch L — displaces all three axes.
+    #[default]
+    Scalar,
+    /// L, C and hue drive x, y and z independently. Hue is divided by 360
+    /// so a full turn is one unit.
+    ///
+    /// The three are not on the same scale: `Noise`'s Color output puts L
+    /// in `[0, 1]` but holds chroma to `[0, 0.15]`. That is the reason
+    /// `amount` is per-axis rather than one number.
+    Vector,
 }
 
 /// A periodic waveform over a scalar input — what `sin(...)` is, and what

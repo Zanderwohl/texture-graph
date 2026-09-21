@@ -16,7 +16,7 @@ use texture_graph_core::{
     Axis, BlendMode, BlendSpace, ColorInput, ColorRamp, CoordMode, Criterion, EvalCtx,
     FractalMode, Graph, HeightToNormal, LayerId, LayerKind, MinMax, MinMaxMode, Mix, Noise,
     NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, RadialDim, ScalarInput, Transform,
-    Wave, WaveShape,
+    Warp, WarpMode, Wave, WaveShape,
 };
 
 use texture_graph_core::EdgeMode;
@@ -149,6 +149,8 @@ pub struct Baker {
     h2n_pipeline: wgpu::ComputePipeline,
     // wave reuses `transform_bgl` too — uniform + storage_out + input_2d.
     wave_pipeline: wgpu::ComputePipeline,
+    // warp reuses `map_bgl` — uniform + storage_out + 2 input textures.
+    warp_pipeline: wgpu::ComputePipeline,
     // h2n reuses `transform_bgl` — same binding shape (uniform + storage_out + input_2d).
     // missing reuses `color_bgl`: same binding shape (uniform + storage_texture).
     missing_pipeline: wgpu::ComputePipeline,
@@ -179,6 +181,7 @@ impl Baker {
         let (ramp_pipeline, ramp_bgl) = make_ramp_pipeline(&ctx.device);
         let h2n_pipeline = make_h2n_pipeline(&ctx.device, &transform_bgl);
         let wave_pipeline = make_wave_pipeline(&ctx.device, &transform_bgl);
+        let warp_pipeline = make_warp_pipeline(&ctx.device, &map_bgl);
         let dummy_input = ctx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("tg-dummy-input"),
             size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
@@ -220,6 +223,7 @@ impl Baker {
             dummy_input_view,
             h2n_pipeline,
             wave_pipeline,
+            warp_pipeline,
             pack_pipeline,
             pack_bgl,
             solid_pipeline,
@@ -500,6 +504,22 @@ impl Baker {
                     size,
                     own_dom,
                     dom_opt(h.source),
+                );
+            }
+            LayerKind::Warp(wp) => {
+                dispatch_warp(
+                    &self.ctx,
+                    encoder,
+                    &self.warp_pipeline,
+                    &self.map_bgl,
+                    &pool_views[dst_slot],
+                    resolve(wp.source),
+                    resolve(wp.by),
+                    wp,
+                    size,
+                    own_dom,
+                    dom_opt(wp.source),
+                    dom_opt(wp.by),
                 );
             }
             LayerKind::Wave(wv) => {
@@ -1222,6 +1242,20 @@ struct H2NParams {
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
+struct WarpParams {
+    size: [u32; 2],
+    mode: u32,
+    _pad0: u32,
+    amount: [f32; 4],
+    /// Own bake domain, the source's (already grown by `|amount|` by the
+    /// scheduler), and the displacement field's.
+    dom: [f32; 4],
+    dom_src: [f32; 4],
+    dom_by: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
 struct WaveParams {
     size: [u32; 2],
     shape: u32,
@@ -1314,6 +1348,65 @@ fn dispatch_h2n(
     });
     let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
         label: Some("h2n-cpass"),
+        timestamp_writes: None,
+    });
+    cpass.set_pipeline(pipeline);
+    cpass.set_bind_group(0, &bg, &[]);
+    let (wg_x, wg_y) = workgroup_counts(size);
+    cpass.dispatch_workgroups(wg_x, wg_y, 1);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_warp(
+    ctx: &DeviceCtx,
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::ComputePipeline,
+    bgl: &wgpu::BindGroupLayout,
+    dst_view: &wgpu::TextureView,
+    src_view: &wgpu::TextureView,
+    by_view: &wgpu::TextureView,
+    w: &Warp,
+    size: (u32, u32),
+    dom: [f32; 4],
+    dom_src: [f32; 4],
+    dom_by: [f32; 4],
+) {
+    let params = WarpParams {
+        size: [size.0, size.1],
+        mode: match w.mode {
+            WarpMode::Scalar => 0,
+            WarpMode::Vector => 1,
+        },
+        _pad0: 0,
+        // amount.z rides along for symmetry with the CPU struct; the
+        // shader cannot act on it — see warp.wgsl.
+        amount: [w.amount[0], w.amount[1], w.amount[2], 0.0],
+        dom,
+        dom_src,
+        dom_by,
+    };
+    let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "warp-params");
+    let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("warp-bg"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: ubo.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(dst_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(src_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(by_view),
+            },
+        ],
+    });
+    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("warp-cpass"),
         timestamp_writes: None,
     });
     cpass.set_pipeline(pipeline);
@@ -2441,6 +2534,29 @@ fn make_h2n_pipeline(
     });
     device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("h2n-pipeline"),
+        layout: Some(&pl),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    })
+}
+
+fn make_warp_pipeline(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+) -> wgpu::ComputePipeline {
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("warp-pl"),
+        bind_group_layouts: &[Some(bgl)],
+        ..Default::default()
+    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("warp-shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/warp.wgsl").into()),
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("warp-pipeline"),
         layout: Some(&pl),
         module: &shader,
         entry_point: Some("main"),

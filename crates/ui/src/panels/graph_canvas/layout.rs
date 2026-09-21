@@ -58,6 +58,8 @@ pub enum ParamRow {
     WaveFrequency,
     WavePhase,
     WaveRange,
+    WarpMode,
+    WarpAmount,
 }
 
 /// Row table for a layer node. Height follows the kind, conditional rows
@@ -147,6 +149,12 @@ pub fn rows_for(kind: &LayerKind) -> Vec<Row> {
             Row::Socket(InputKey::H2nSource),
             Row::Param(ParamRow::H2nStrength),
         ]),
+        LayerKind::Warp(_) => rows.extend([
+            Row::Socket(InputKey::WarpSource),
+            Row::Socket(InputKey::WarpBy),
+            Row::Param(ParamRow::WarpMode),
+            Row::Param(ParamRow::WarpAmount),
+        ]),
         LayerKind::Wave(_) => rows.extend([
             Row::Socket(InputKey::WaveInput),
             Row::Param(ParamRow::WaveShape),
@@ -171,11 +179,12 @@ pub fn rows_for_output() -> Vec<Row> {
 /// Display label next to a socket circle.
 pub fn socket_label(key: InputKey) -> &'static str {
     match key {
-        InputKey::TransformSource | InputKey::H2nSource => "source",
+        InputKey::TransformSource | InputKey::H2nSource | InputKey::WarpSource => "source",
         InputKey::MixA | InputKey::MinMaxA => "a",
         InputKey::MixB | InputKey::MinMaxB => "b",
         InputKey::MixFactor => "factor",
         InputKey::WaveInput => "input",
+        InputKey::WarpBy => "by",
         InputKey::MapValue => "value",
         InputKey::MapPalette => "palette",
         InputKey::RampStop(_) => "stop",

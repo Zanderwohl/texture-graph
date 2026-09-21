@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 use texture_graph_core::{
     Axis, CoordMode, EXTEND_LIMIT, EdgeMode, Graph, LayerId, LayerKind, RadialDim, ScalarInput,
-    Transform,
+    Transform, Warp,
 };
 
 /// Fully-resolved dispatch plan for one bake.
@@ -97,6 +97,20 @@ fn compute_domains(graph: &Graph, order: &[LayerId]) -> HashMap<LayerId, Domain>
                     e.union(d);
                 }
                 // Luminance-indexed, so the unit domain suffices.
+            }
+            LayerKind::Warp(w) => {
+                // The displacement field is read at the warp's own
+                // coordinates, so it needs no more than the warp's domain.
+                if let Some(e) = w.by.and_then(|b| dom.get_mut(&b)) {
+                    e.union(d);
+                }
+                // The source is read at the displaced ones. `Warp` promises
+                // its driver lies in [-1, 1], so |amount| bounds the reach;
+                // cap it like a radial extend, since `amount` is a float a
+                // user can type any number into.
+                if let Some(e) = w.source.and_then(|src| dom.get_mut(&src)) {
+                    e.union(warp_request(w, d));
+                }
             }
             _ => {
                 for input in layer.kind.inputs() {
@@ -193,6 +207,24 @@ fn transform_request(t: &Transform, d: Domain) -> Option<Domain> {
         return None;
     }
     Some(Domain { min: [u0, v0], max: [u1, v1] })
+}
+
+/// The UV rectangle a warp samples its source over: its own domain grown
+/// by `|amount|`, capped at the [`EXTEND_LIMIT`] box.
+///
+/// The twin of this bound on the CPU side is `warp_bounds` in
+/// `core::eval`, which states it over the unit square. They agree wherever
+/// the warp's own domain is the unit square, which is everywhere but under
+/// an extend transform.
+fn warp_request(w: &Warp, d: Domain) -> Domain {
+    let lo = 0.5 - EXTEND_LIMIT;
+    let hi = 0.5 + EXTEND_LIMIT;
+    let grow = |min: f32, max: f32, a: f32| {
+        ((min - a.abs()).max(lo), (max + a.abs()).min(hi))
+    };
+    let (u0, u1) = grow(d.min[0], d.max[0], w.amount[0]);
+    let (v0, v1) = grow(d.min[1], d.max[1], w.amount[1]);
+    Domain { min: [u0, v0], max: [u1, v1] }
 }
 
 /// Post-schedule descriptor for the `pack_srgb8` stage.

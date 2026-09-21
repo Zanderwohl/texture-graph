@@ -6,8 +6,8 @@ use crate::id::LayerId;
 use crate::kind::{
     Axis, BlendMode, ColorInput, ColorRamp, CoordMode, Criterion, EXTEND_LIMIT, EdgeMode,
     FractalMode, HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims,
-    NoiseKernel, NoiseOutput, NoiseRange, RadialDim, ScalarInput, Transform, Wave,
-    WaveShape,
+    NoiseKernel, NoiseOutput, NoiseRange, RadialDim, ScalarInput, Transform, Warp, WarpMode,
+    Wave, WaveShape,
 };
 
 /// A sample point in the graph's canonical unit cube. Consumers of the
@@ -101,6 +101,7 @@ fn eval_layer(id: LayerId, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &Ev
         LayerKind::MinMax(mm) => eval_min_max(mm, s, by_id, ctx),
         LayerKind::HeightToNormal(h) => eval_h2n(h, s, by_id, ctx),
         LayerKind::Wave(w) => eval_wave(w, s, by_id, ctx),
+        LayerKind::Warp(w) => eval_warp(w, s, by_id, ctx),
     }
 }
 
@@ -405,6 +406,48 @@ fn criterion_of(c: Color, crit: Criterion) -> f32 {
     }
 }
 
+/// The displacement `by`'s value contributes, per axis, before `amount`
+/// scales it. Shared with the GPU twin in `warp.wgsl`.
+pub fn warp_displacement(by: Color, mode: WarpMode) -> [f32; 3] {
+    match mode {
+        WarpMode::Scalar => {
+            let l = scalar_of(by);
+            [l, l, l]
+        }
+        // Hue over a full turn rather than in degrees, so it is on roughly
+        // the same footing as L.
+        WarpMode::Vector => [by.l, by.chroma, by.hue.into_degrees() / 360.0],
+    }
+}
+
+/// How far past the unit square a warp of `amount` may reach before the
+/// sample leaves what the baker covers.
+///
+/// The driving field is assumed to lie in `[-1, 1]`, so the reachable
+/// rectangle is the unit square grown by `|amount|` — which is exactly
+/// what `schedule.rs` asks the source to be baked over — and then capped
+/// at the [`EXTEND_LIMIT`] box like any other extended request. Outside
+/// it, both backends show the missing grid.
+fn warp_bounds(amount: [f32; 3]) -> ([f32; 2], [f32; 2]) {
+    let lo = |a: f32| (0.0 - a.abs()).max(0.5 - EXTEND_LIMIT);
+    let hi = |a: f32| (1.0 + a.abs()).min(0.5 + EXTEND_LIMIT);
+    ([lo(amount[0]), lo(amount[1])], [hi(amount[0]), hi(amount[1])])
+}
+
+fn eval_warp(w: &Warp, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &EvalCtx) -> Color {
+    let d = warp_displacement(eval_opt(w.by, s, by_id, ctx), w.mode);
+    let moved = Sample::new(
+        s.u + d[0] * w.amount[0],
+        s.v + d[1] * w.amount[1],
+        s.w + d[2] * w.amount[2],
+    );
+    let (lo, hi) = warp_bounds(w.amount);
+    if moved.u < lo[0] || moved.u > hi[0] || moved.v < lo[1] || moved.v > hi[1] {
+        return missing_texture(moved);
+    }
+    eval_opt(w.source, moved, by_id, ctx)
+}
+
 /// One cycle of `shape` at phase `t`, in `[-1, 1]`.
 ///
 /// `t` is reduced to `[0, 1)` first — `fract` written as `x - floor(x)`,
@@ -456,6 +499,176 @@ fn eval_h2n(h: &HeightToNormal, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx
     n[1] /= mag;
     n[2] /= mag;
     normal_to_color(n)
+}
+
+#[cfg(test)]
+mod warp_tests {
+    use super::*;
+    use crate::color::oklcha;
+    use crate::kind::{Warp, WarpMode};
+
+    /// A graph of: a ramp along U (the thing being warped), a flat driver
+    /// with a chosen L, and a Warp of the one by the other.
+    fn warped(driver_l: f32, amount: [f32; 3], mode: WarpMode) -> (Graph, LayerId) {
+        let mut g = Graph::new();
+        let ramp = g.output.color.unwrap();
+        g.set_kind(
+            ramp,
+            LayerKind::ColorRamp(crate::kind::ColorRamp {
+                stops: vec![
+                    crate::kind::ColorStop {
+                        t: 0.0,
+                        color: ColorInput::Const(oklcha(0.0, 0.0, 0.0, 1.0)),
+                    },
+                    crate::kind::ColorStop {
+                        t: 1.0,
+                        color: ColorInput::Const(oklcha(1.0, 0.0, 0.0, 1.0)),
+                    },
+                ],
+                space: crate::color::BlendSpace::Oklch,
+            }),
+        )
+        .unwrap();
+        let driver = g
+            .add_layer("driver", LayerKind::Color(oklcha(driver_l, 0.0, 0.0, 1.0)))
+            .unwrap();
+        let w = g
+            .add_layer(
+                "warp",
+                LayerKind::Warp(Warp {
+                    source: Some(ramp),
+                    by: Some(driver),
+                    mode,
+                    amount,
+                }),
+            )
+            .unwrap();
+        (g, w)
+    }
+
+    /// The displacement is the driver's value times `amount`, not a
+    /// recentred version of it: a flat 1.0 driver with amount 0.25 reads
+    /// the source a quarter of a unit further along.
+    #[test]
+    fn the_displacement_is_the_drivers_value_times_amount() {
+        let (g, w) = warped(1.0, [0.25, 0.0, 0.0], WarpMode::Scalar);
+        let ctx = EvalCtx::default();
+        let ramp = g.output.color.unwrap();
+        for k in 0..8 {
+            let u = k as f32 / 16.0;
+            let warped_here = scalar_of(evaluate(&g, w, Sample::uv(u, 0.5), &ctx));
+            let source_there = scalar_of(evaluate(&g, ramp, Sample::uv(u + 0.25, 0.5), &ctx));
+            assert!(
+                (warped_here - source_there).abs() < 1e-5,
+                "at u={u}: warp gave {warped_here}, source at u+0.25 gave {source_there}"
+            );
+        }
+    }
+
+    /// A zero driver is a zero displacement, so the warp is its source.
+    #[test]
+    fn a_zero_driver_is_a_no_op() {
+        let (g, w) = warped(0.0, [0.5, 0.5, 0.0], WarpMode::Scalar);
+        let ctx = EvalCtx::default();
+        let ramp = g.output.color.unwrap();
+        for k in 0..16 {
+            let u = k as f32 / 16.0;
+            assert_eq!(
+                scalar_of(evaluate(&g, w, Sample::uv(u, 0.5), &ctx)),
+                scalar_of(evaluate(&g, ramp, Sample::uv(u, 0.5), &ctx)),
+            );
+        }
+    }
+
+    /// The bound the node promises: a driver inside `[-1, 1]` always
+    /// lands on data, and one outside it shows the missing grid — which
+    /// is what the GPU does when the fetch leaves the source's baked
+    /// domain.
+    #[test]
+    fn a_driver_past_one_falls_off_the_baked_domain() {
+        let ctx = EvalCtx::default();
+        // L = 1 with amount 0.1 reaches u + 0.1, inside [0 - 0.1, 1 + 0.1].
+        let (inside, w_in) = warped(1.0, [0.1, 0.0, 0.0], WarpMode::Scalar);
+        let at_edge = evaluate(&inside, w_in, Sample::uv(1.0, 0.5), &ctx);
+        assert_ne!(at_edge, missing_texture(Sample::uv(1.1, 0.5)));
+
+        // L = 4 reaches u + 0.4, well past it.
+        let (outside, w_out) = warped(4.0, [0.1, 0.0, 0.0], WarpMode::Scalar);
+        let far = evaluate(&outside, w_out, Sample::uv(1.0, 0.5), &ctx);
+        assert_eq!(far, missing_texture(Sample::new(1.4, 0.5, 0.0)));
+    }
+
+    /// Vector mode reads three channels independently; scalar mode reads
+    /// one and applies it to all three axes.
+    #[test]
+    fn vector_mode_reads_three_channels() {
+        let c = oklcha(0.8, 0.1, 180.0, 1.0);
+        assert_eq!(warp_displacement(c, WarpMode::Scalar), [0.8, 0.8, 0.8]);
+        let v = warp_displacement(c, WarpMode::Vector);
+        assert!((v[0] - 0.8).abs() < 1e-6);
+        assert!((v[1] - 0.1).abs() < 1e-6);
+        // Hue over a full turn, not in degrees.
+        assert!((v[2] - 0.5).abs() < 1e-6, "hue should be half a turn, got {}", v[2]);
+    }
+
+    /// The warp reads `by` at its own coordinates and `source` at the
+    /// displaced ones — a varying driver must actually distort the source
+    /// rather than shift it uniformly.
+    #[test]
+    fn a_varying_driver_distorts_rather_than_shifts() {
+        let mut g = Graph::new();
+        let ramp = g.output.color.unwrap();
+        g.set_kind(
+            ramp,
+            LayerKind::ColorRamp(crate::kind::ColorRamp {
+                stops: vec![
+                    crate::kind::ColorStop {
+                        t: 0.0,
+                        color: ColorInput::Const(oklcha(0.0, 0.0, 0.0, 1.0)),
+                    },
+                    crate::kind::ColorStop {
+                        t: 1.0,
+                        color: ColorInput::Const(oklcha(1.0, 0.0, 0.0, 1.0)),
+                    },
+                ],
+                space: crate::color::BlendSpace::Oklch,
+            }),
+        )
+        .unwrap();
+        let driver = g
+            .add_layer(
+                "driver",
+                LayerKind::Noise(crate::kind::Noise {
+                    range: NoiseRange::Signed,
+                    kernel: crate::kind::NoiseKernel::Value,
+                    frequency: 6.0,
+                    ..crate::kind::Noise::default()
+                }),
+            )
+            .unwrap();
+        let w = g
+            .add_layer(
+                "warp",
+                LayerKind::Warp(Warp {
+                    source: Some(ramp),
+                    by: Some(driver),
+                    mode: WarpMode::Scalar,
+                    amount: [0.2, 0.0, 0.0],
+                }),
+            )
+            .unwrap();
+        let ctx = EvalCtx::default();
+        // The ramp alone is constant down a column; the warp must not be,
+        // because the driver varies in v too.
+        let column: Vec<f32> = (0..16)
+            .map(|k| scalar_of(evaluate(&g, w, Sample::uv(0.5, k as f32 / 16.0), &ctx)))
+            .collect();
+        let first = column[0];
+        assert!(
+            column.iter().any(|v| (v - first).abs() > 0.01),
+            "the warp shifted uniformly instead of distorting: {column:?}"
+        );
+    }
 }
 
 #[cfg(test)]

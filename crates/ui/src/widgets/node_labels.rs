@@ -1,11 +1,16 @@
-//! Display strings for the [`texture_graph_core::Noise`] enums.
+//! Display strings for the node enums, and the one hint that explains a
+//! pair of fields rather than a single control.
 //!
 //! Shared because the same field is edited in two places — the inspector
 //! column and the node body on the canvas — and a control that reads
 //! "ridged" in one and "Ridged" in the other is a bug report waiting to
 //! happen.
 
-use texture_graph_core::{FractalMode, NoiseDims, NoiseKernel, NoiseOutput, NoiseRange};
+use texture_graph_core::{
+    FractalMode, NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, WarpMode, WaveShape,
+};
+
+// ---- Noise ------------------------------------------------------------
 
 pub const DIMS: &[NoiseDims] = &[NoiseDims::D1, NoiseDims::D2, NoiseDims::D3];
 pub const OUTPUTS: &[NoiseOutput] = &[NoiseOutput::Grayscale, NoiseOutput::Color];
@@ -78,4 +83,33 @@ pub fn period_hint(frequency: f32, period: [u32; 3]) -> String {
         ));
     }
     format!("repeats: {}", parts.join(", "))
+}
+
+// ---- Wave -------------------------------------------------------------
+
+pub const SHAPES: &[WaveShape] = &[
+    WaveShape::Sine,
+    WaveShape::Triangle,
+    WaveShape::Square,
+    WaveShape::Sawtooth,
+];
+
+pub fn shape(s: WaveShape) -> &'static str {
+    match s {
+        WaveShape::Sine => "sine",
+        WaveShape::Triangle => "triangle",
+        WaveShape::Square => "square",
+        WaveShape::Sawtooth => "sawtooth",
+    }
+}
+
+// ---- Warp -------------------------------------------------------------
+
+pub const WARP_MODES: &[WarpMode] = &[WarpMode::Scalar, WarpMode::Vector];
+
+pub fn warp_mode(m: WarpMode) -> &'static str {
+    match m {
+        WarpMode::Scalar => "scalar (L)",
+        WarpMode::Vector => "vector (L, C, hue)",
+    }
 }

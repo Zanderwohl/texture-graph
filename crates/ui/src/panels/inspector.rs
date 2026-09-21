@@ -5,13 +5,13 @@ use texture_graph_core::color::oklcha;
 use texture_graph_core::{
     Axis, BlendMode, BlendSpace, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion, Graph,
     HeightToNormal, LayerId, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseKernel,
-    RadialDim, ScalarInput, Transform, Wave, noise::MAX_OCTAVES,
+    RadialDim, ScalarInput, Transform, Warp, Wave, noise::MAX_OCTAVES,
 };
 
 use crate::catalog::{self, Kind};
 use crate::state::{EditCmd, UiState};
 use crate::widgets::enum_combo::enum_combo;
-use crate::widgets::{noise_labels, wave_labels};
+use crate::widgets::node_labels;
 use crate::widgets::{color_edit, layer_ref};
 
 /// Render the inspector for a single layer. Emits `EditCmd::SetKind` when
@@ -68,6 +68,9 @@ pub fn show(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, id: LayerId) 
         LayerKind::Wave(w) => {
             changed |= wave_widgets(ui, graph, id, w);
         }
+        LayerKind::Warp(w) => {
+            changed |= warp_widgets(ui, graph, id, w);
+        }
     }
 
     if changed {
@@ -84,8 +87,8 @@ fn noise_widgets(ui: &mut egui::Ui, id: LayerId, n: &mut Noise) -> bool {
         (id.0, "noise-kernel"),
         "kernel",
         &mut n.kernel,
-        noise_labels::KERNELS,
-        noise_labels::kernel,
+        node_labels::KERNELS,
+        node_labels::kernel,
     ) {
         changed = true;
         // Leaving a period behind on simplex would make `set_kind` reject
@@ -100,24 +103,24 @@ fn noise_widgets(ui: &mut egui::Ui, id: LayerId, n: &mut Noise) -> bool {
         (id.0, "noise-dims"),
         "dims",
         &mut n.dims,
-        noise_labels::DIMS,
-        noise_labels::dims,
+        node_labels::DIMS,
+        node_labels::dims,
     );
     changed |= enum_combo(
         ui,
         (id.0, "noise-output"),
         "output",
         &mut n.output,
-        noise_labels::OUTPUTS,
-        noise_labels::output,
+        node_labels::OUTPUTS,
+        node_labels::output,
     );
     changed |= enum_combo(
         ui,
         (id.0, "noise-range"),
         "range",
         &mut n.range,
-        noise_labels::RANGES,
-        noise_labels::range,
+        node_labels::RANGES,
+        node_labels::range,
     );
     changed |= ui
         .add(
@@ -139,7 +142,7 @@ fn noise_widgets(ui: &mut egui::Ui, id: LayerId, n: &mut Noise) -> bool {
                 changed |= ui.add(egui::DragValue::new(p).speed(0.25)).changed();
             }
         });
-        ui.weak(noise_labels::period_hint(n.frequency, n.period));
+        ui.weak(node_labels::period_hint(n.frequency, n.period));
     }
 
     changed |= ui
@@ -152,8 +155,8 @@ fn noise_widgets(ui: &mut egui::Ui, id: LayerId, n: &mut Noise) -> bool {
             (id.0, "noise-fractal-mode"),
             "fbm",
             &mut n.fractal.mode,
-            noise_labels::FRACTAL_MODES,
-            noise_labels::fractal_mode,
+            node_labels::FRACTAL_MODES,
+            node_labels::fractal_mode,
         );
         changed |= ui
             .add(egui::Slider::new(&mut n.fractal.lacunarity, 1.0..=4.0).text("lacunarity"))
@@ -172,6 +175,42 @@ fn noise_widgets(ui: &mut egui::Ui, id: LayerId, n: &mut Noise) -> bool {
     changed
 }
 
+fn warp_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, w: &mut Warp) -> bool {
+    let mut changed = false;
+    if let Some(new) =
+        layer_ref::layer_ref_opt(ui, ("warp-src", id.0), "source", w.source, graph, Some(id))
+    {
+        w.source = new;
+        changed = true;
+    }
+    if let Some(new) =
+        layer_ref::layer_ref_opt(ui, ("warp-by", id.0), "by", w.by, graph, Some(id))
+    {
+        w.by = new;
+        changed = true;
+    }
+    changed |= enum_combo(
+        ui,
+        (id.0, "warp-mode"),
+        "mode",
+        &mut w.mode,
+        node_labels::WARP_MODES,
+        node_labels::warp_mode,
+    );
+    changed |= vec3_drag(ui, "amount", &mut w.amount, 0.005);
+    // `amount` is what the baker grows the source's domain by, so it is
+    // also where the warp stops having data to read.
+    ui.weak(
+        "displacement is the driver's value × amount; a driver outside \
+         [-1, 1] reaches past what the source was baked over and shows \
+         the missing grid",
+    );
+    if w.amount[2] != 0.0 {
+        ui.weak("w displacement is CPU-only — the GPU baker cannot re-sample a slice at another w");
+    }
+    changed
+}
+
 fn wave_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, w: &mut Wave) -> bool {
     let mut changed = false;
     changed |= scalar_input_widget(ui, graph, id, "input", &mut w.input);
@@ -180,8 +219,8 @@ fn wave_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, w: &mut Wave) -> 
         (id.0, "wave-shape"),
         "shape",
         &mut w.shape,
-        wave_labels::SHAPES,
-        wave_labels::shape,
+        node_labels::SHAPES,
+        node_labels::shape,
     );
     changed |= ui
         .add(
@@ -198,8 +237,8 @@ fn wave_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, w: &mut Wave) -> 
         (id.0, "wave-range"),
         "range",
         &mut w.range,
-        noise_labels::RANGES,
-        noise_labels::range,
+        node_labels::RANGES,
+        node_labels::range,
     );
     changed
 }

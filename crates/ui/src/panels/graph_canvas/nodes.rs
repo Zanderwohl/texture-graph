@@ -18,7 +18,7 @@ use crate::state::{
     EditCmd, NodeDrag, NodeRef, RampDrag, RampMenu, Renaming, UiState, WireDrag,
 };
 use crate::widgets::enum_combo::enum_combo;
-use crate::widgets::{noise_labels, wave_labels};
+use crate::widgets::node_labels;
 
 use super::layout::{socket_label, NodeLayout, ParamRow, Row};
 use super::ramp;
@@ -919,24 +919,24 @@ fn param_row(ui: &mut egui::Ui, id: LayerId, kind: &mut LayerKind, p: ParamRow) 
             salt("dims"),
             "dims",
             &mut n.dims,
-            noise_labels::DIMS,
-            noise_labels::dims,
+            node_labels::DIMS,
+            node_labels::dims,
         ),
         (LayerKind::Noise(n), ParamRow::NoiseOutput) => enum_combo(
             ui,
             salt("output"),
             "output",
             &mut n.output,
-            noise_labels::OUTPUTS,
-            noise_labels::output,
+            node_labels::OUTPUTS,
+            node_labels::output,
         ),
         (LayerKind::Noise(n), ParamRow::NoiseRange) => enum_combo(
             ui,
             salt("range"),
             "range",
             &mut n.range,
-            noise_labels::RANGES,
-            noise_labels::range,
+            node_labels::RANGES,
+            node_labels::range,
         ),
         (LayerKind::Noise(n), ParamRow::NoiseFrequency) => {
             ui.label("freq");
@@ -958,8 +958,8 @@ fn param_row(ui: &mut egui::Ui, id: LayerId, kind: &mut LayerKind, p: ParamRow) 
             salt("fractal-mode"),
             "fbm",
             &mut n.fractal.mode,
-            noise_labels::FRACTAL_MODES,
-            noise_labels::fractal_mode,
+            node_labels::FRACTAL_MODES,
+            node_labels::fractal_mode,
         ),
         (LayerKind::Noise(n), ParamRow::NoiseLacunarity) => {
             ui.label("lacunarity");
@@ -974,13 +974,24 @@ fn param_row(ui: &mut egui::Ui, id: LayerId, kind: &mut LayerKind, p: ParamRow) 
             ui.label("normalize");
             ui.checkbox(&mut n.fractal.normalize, "").changed()
         }
+        (LayerKind::Warp(w), ParamRow::WarpMode) => enum_combo(
+            ui,
+            salt("warp-mode"),
+            "mode",
+            &mut w.mode,
+            node_labels::WARP_MODES,
+            node_labels::warp_mode,
+        ),
+        (LayerKind::Warp(w), ParamRow::WarpAmount) => {
+            vec3_row(ui, "amount", &mut w.amount, 0.005)
+        }
         (LayerKind::Wave(w), ParamRow::WaveShape) => enum_combo(
             ui,
             salt("wave-shape"),
             "shape",
             &mut w.shape,
-            wave_labels::SHAPES,
-            wave_labels::shape,
+            node_labels::SHAPES,
+            node_labels::shape,
         ),
         (LayerKind::Wave(w), ParamRow::WaveFrequency) => {
             ui.label("freq");
@@ -996,8 +1007,8 @@ fn param_row(ui: &mut egui::Ui, id: LayerId, kind: &mut LayerKind, p: ParamRow) 
             salt("wave-range"),
             "range",
             &mut w.range,
-            noise_labels::RANGES,
-            noise_labels::range,
+            node_labels::RANGES,
+            node_labels::range,
         ),
         (LayerKind::ColorRamp(r), ParamRow::RampSpace) => {
             blend_space_combo(ui, salt("space"), &mut r.space)
@@ -1176,8 +1187,8 @@ fn noise_kernel_combo(
         salt,
         "kernel",
         &mut n.kernel,
-        noise_labels::KERNELS,
-        noise_labels::kernel,
+        node_labels::KERNELS,
+        node_labels::kernel,
     );
     if changed && n.kernel == NoiseKernel::Simplex {
         n.period = [0; 3];
@@ -1191,7 +1202,7 @@ fn noise_kernel_combo(
 fn noise_period_row(ui: &mut egui::Ui, n: &mut texture_graph_core::Noise) -> bool {
     let mut changed = false;
     ui.label("period")
-        .on_hover_text(noise_labels::period_hint(n.frequency, n.period));
+        .on_hover_text(node_labels::period_hint(n.frequency, n.period));
     for p in n.period.iter_mut() {
         changed |= ui.add(egui::DragValue::new(p).speed(0.25)).changed();
     }

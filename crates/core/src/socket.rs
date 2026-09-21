@@ -22,6 +22,8 @@ pub enum InputKey {
     MinMaxB,
     H2nSource,
     WaveInput,
+    WarpSource,
+    WarpBy,
     RampStop(usize),
     OutColor,
     OutRoughness,
@@ -146,6 +148,10 @@ impl LayerKind {
             LayerKind::Wave(w) => {
                 vec![sock(InputKey::WaveInput, "input", SocketValue::Scalar(w.input))]
             }
+            LayerKind::Warp(w) => vec![
+                sock(InputKey::WarpSource, "source", SocketValue::LayerOpt(w.source)),
+                sock(InputKey::WarpBy, "by", SocketValue::LayerOpt(w.by)),
+            ],
         }
     }
 
@@ -173,6 +179,8 @@ impl LayerKind {
                 Ok(set_opt(&mut h.source, target))
             }
             (LayerKind::Wave(w), InputKey::WaveInput) => Ok(set_scalar(&mut w.input, target)),
+            (LayerKind::Warp(w), InputKey::WarpSource) => Ok(set_opt(&mut w.source, target)),
+            (LayerKind::Warp(w), InputKey::WarpBy) => Ok(set_opt(&mut w.by, target)),
             (LayerKind::ColorRamp(r), InputKey::RampStop(i)) => match r.stops.get_mut(i) {
                 // A stop can vanish between drag start and drop (removed in
                 // the inspector) — report it rather than panic.
@@ -316,6 +324,11 @@ mod tests {
             LayerKind::Wave(crate::kind::Wave {
                 input: ScalarInput::Layer(id(13)),
                 ..crate::kind::Wave::default()
+            }),
+            LayerKind::Warp(crate::kind::Warp {
+                source: Some(id(14)),
+                by: Some(id(15)),
+                ..crate::kind::Warp::default()
             }),
         ]
     }

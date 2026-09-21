@@ -7,7 +7,7 @@ use texture_graph_core::{
     BlendMode, BlendSpace, Color, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion,
     EdgeMode, EvalCtx, Fractal, FractalMode, Graph, HeightToNormal, LayerId, LayerKind, Map,
     MinMax, MinMaxMode, Mix, Noise, NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, Output,
-    ScalarInput, Transform, Wave, WaveShape, color::to_srgb8,
+    ScalarInput, Transform, Warp, WarpMode, Wave, WaveShape, color::to_srgb8,
 };
 
 use crate::{Baker, DeviceCtx, ScalarFormat};
@@ -1904,4 +1904,147 @@ fn a_const_input_wave_bakes_flat() {
     assert!(px.iter().all(|p| *p == px[0]), "a constant input gave a varying field");
     // 0.125 × 2 cycles is sine's peak, so L = 1 — white.
     assert!(px[0][0] > 250, "expected the peak of the wave, got {:?}", px[0]);
+}
+
+// ---- Warp (§3) ----------------------------------------------------------
+
+/// The banded-planet shape, end to end: a ramp warped by a noise field,
+/// run through a wave. CPU against GPU over the whole frame.
+///
+/// The warp fetch is a texture read at a displaced UV, so this is really
+/// a test that the scheduler grew the source's bake domain far enough —
+/// a domain one texel short shows up here as the missing grid where the
+/// CPU has data.
+#[test]
+fn cpu_and_gpu_warp_agree() {
+    const RES: u32 = 64;
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+
+    for mode in [WarpMode::Scalar, WarpMode::Vector] {
+        let mut graph = Graph::new();
+        let ramp = graph.output.color.unwrap();
+        graph
+            .set_kind(
+                ramp,
+                LayerKind::ColorRamp(ColorRamp {
+                    stops: vec![
+                        ColorStop {
+                            t: 0.0,
+                            color: ColorInput::Const(Color::new(0.05, 0.0, 0.0, 1.0)),
+                        },
+                        ColorStop {
+                            t: 1.0,
+                            color: ColorInput::Const(Color::new(0.95, 0.0, 0.0, 1.0)),
+                        },
+                    ],
+                    space: BlendSpace::Oklch,
+                }),
+            )
+            .unwrap();
+        let driver = graph
+            .add_layer(
+                "driver",
+                LayerKind::Noise(Noise {
+                    dims: NoiseDims::D2,
+                    seed_offset: 4,
+                    frequency: 5.0,
+                    range: NoiseRange::Signed,
+                    // Vector mode wants three channels to read.
+                    output: match mode {
+                        WarpMode::Scalar => NoiseOutput::Grayscale,
+                        WarpMode::Vector => NoiseOutput::Color,
+                    },
+                    kernel: NoiseKernel::Value,
+                    ..Noise::default()
+                }),
+            )
+            .unwrap();
+        let warp = graph
+            .add_layer(
+                "warp",
+                LayerKind::Warp(Warp {
+                    source: Some(ramp),
+                    by: Some(driver),
+                    mode,
+                    // Only u and v: the GPU baker cannot displace w, and
+                    // `Warp`'s doc comment says so.
+                    amount: [0.15, 0.15, 0.0],
+                }),
+            )
+            .unwrap();
+        graph
+            .set_output(Output {
+                color: Some(warp),
+                roughness: ScalarInput::Const(0.5),
+                metallic: ScalarInput::Const(0.0),
+                normal: None,
+            })
+            .unwrap();
+
+        let eval = EvalCtx::default();
+        let out = baker.bake_output(&graph, (RES, RES), &eval, false).expect("bake");
+        let px = readback_all_pixels(&ctx, &out.color, (RES, RES));
+        let mut worst = 0u32;
+        for y in 0..RES {
+            for x in 0..RES {
+                let u = (x as f32 + 0.5) / RES as f32;
+                let v = (y as f32 + 0.5) / RES as f32;
+                let m = texture_graph_core::evaluate_material(
+                    &graph,
+                    texture_graph_core::Sample::new(u, v, texture_graph_core::FLAT_W),
+                    &eval,
+                );
+                let expected = to_srgb8(m.color);
+                let got = px[(y * RES + x) as usize];
+                for i in 0..3 {
+                    worst = worst.max((expected[i] as i32 - got[i] as i32).unsigned_abs());
+                }
+            }
+        }
+        // Looser than the noise contract: the GPU reads the source at the
+        // nearest texel of the displaced UV while the CPU evaluates it
+        // exactly there, so a warp across a steep gradient lands up to
+        // half a texel apart. Over a ramp this frame that is a few steps,
+        // not a different picture.
+        assert!(worst <= 6, "{mode:?}: worst sRGB delta {worst}");
+    }
+}
+
+/// The scheduler has to grow the warped source's bake domain by
+/// `|amount|`, or the fetch lands outside baked territory and the whole
+/// frame turns into the missing grid at the edges.
+#[test]
+fn a_warp_widens_its_sources_bake_domain() {
+    let mut graph = Graph::new();
+    let src = graph.output.color.unwrap();
+    let driver = add_mix(&mut graph, "driver", src, src);
+    let warp = graph
+        .add_layer(
+            "warp",
+            LayerKind::Warp(Warp {
+                source: Some(src),
+                by: Some(driver),
+                mode: WarpMode::Scalar,
+                amount: [0.3, 0.2, 0.0],
+            }),
+        )
+        .unwrap();
+    graph
+        .set_output(Output {
+            color: Some(warp),
+            roughness: ScalarInput::Const(0.5),
+            metallic: ScalarInput::Const(0.0),
+            normal: None,
+        })
+        .unwrap();
+    let sched = crate::schedule::schedule(&graph).expect("schedule");
+    let d = sched.domain_of[&src];
+    assert!((d.min[0] + 0.3).abs() < 1e-6, "u min {}", d.min[0]);
+    assert!((d.max[0] - 1.3).abs() < 1e-6, "u max {}", d.max[0]);
+    assert!((d.min[1] + 0.2).abs() < 1e-6, "v min {}", d.min[1]);
+    assert!((d.max[1] - 1.2).abs() < 1e-6, "v max {}", d.max[1]);
+    // The driver is read at the warp's own coordinates, so it stays put.
+    assert_eq!(sched.domain_of[&driver], crate::schedule::Domain::UNIT);
+    assert_eq!(sched.domain_of[&warp], crate::schedule::Domain::UNIT);
 }
