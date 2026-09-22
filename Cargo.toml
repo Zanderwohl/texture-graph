@@ -17,8 +17,8 @@ bytemuck = { version = "1.5", features = ["derive"] }
 
 palette = { version = "0.7", features = ["serializing"] }
 serde = { version = "1", features = ["derive"] }
-ron = "0.8"
-thiserror = "1"
+ron = "0.12"
+thiserror = "2"
 
 # wgpu, naga and egui are unusably slow unoptimized; our own crates stay
 # debuggable.

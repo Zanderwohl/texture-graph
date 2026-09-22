@@ -48,8 +48,8 @@ all unclaimed on crates.io as of 2026-09-21.
 - [ ] Review the public API of `core` and `gpu`: everything `pub` becomes a semver promise at
       0.1. Make internals `pub(crate)` where nothing outside needs them.
 - [ ] Consider `#[non_exhaustive]` on public enums that will grow (node kinds, params).
-- [ ] Bump older dependencies before they're locked into a public API: `thiserror` 1 → 2,
-      `ron` 0.8 → current.
+- [x] Bump older dependencies before they're locked into a public API: `thiserror` 1 → 2,
+      `ron` 0.8 → 0.12.
 - [ ] `cargo clippy --workspace --all-targets` clean.
 - [ ] Add CI (test, clippy, doc, a wasm32 build of `ui`).
 - [ ] Add a `CHANGELOG.md`.
