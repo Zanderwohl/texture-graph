@@ -16,6 +16,9 @@ struct Camera {
     // xyz = linear ambient tint. w = object-to-texture scale for the solid
     // variant (`tex = obj_pos * w + 0.5`).
     ambient: vec4<f32>,
+    // Solid variant only. x = strength, y = 1 to bump from the height
+    // volume, z = one height texel in texture coordinates.
+    bump: vec4<f32>,
 }
 
 struct VsIn {
@@ -113,16 +116,26 @@ fn shade(
     metal_enc: f32,
     n_encoded: vec3<f32>,
 ) -> vec4<f32> {
-    let base      = srgb_to_linear3(base_srgba.rgb);
-    let roughness = srgb_to_linear_c(rough_enc);
-    let metallic  = srgb_to_linear_c(metal_enc);
-    let n_tangent = normalize(n_encoded * 2.0 - vec3<f32>(1.0));
-
     // tangent_w flips the bitangent for mirrored UVs.
+    let n_tangent = normalize(n_encoded * 2.0 - vec3<f32>(1.0));
     let N_geo   = normalize(in.world_normal);
     let T       = normalize(in.world_tangent - N_geo * dot(N_geo, in.world_tangent));
     let B       = cross(N_geo, T) * in.tangent_w;
     let N       = normalize(mat3x3<f32>(T, B, N_geo) * n_tangent);
+    return shade_world(in, base_srgba, rough_enc, metal_enc, N);
+}
+
+// `shade` with the shading normal already in world space.
+fn shade_world(
+    in: VsOut,
+    base_srgba: vec4<f32>,
+    rough_enc: f32,
+    metal_enc: f32,
+    N: vec3<f32>,
+) -> vec4<f32> {
+    let base      = srgb_to_linear3(base_srgba.rgb);
+    let roughness = srgb_to_linear_c(rough_enc);
+    let metallic  = srgb_to_linear_c(metal_enc);
 
     let V       = normalize(camera.camera_pos.xyz - in.world_pos);
     let n_dot_v = max(dot(N, V), 1e-4);

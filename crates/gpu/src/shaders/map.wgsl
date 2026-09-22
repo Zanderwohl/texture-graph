@@ -1,5 +1,7 @@
 // LayerKind::Map. Take L from `value` at the current sample, then look up
-// `palette` at sample (t, 0, 0). Clamp-to-edge in u.
+// `palette` at sample (t, 0, 0). Clamp-to-edge in u, and linear between the
+// two nearest palette texels, so a remap does not quantize to one level per
+// texel: that would show as terraces once the result is a height.
 
 struct MapParams {
     size: vec2<u32>,
@@ -38,11 +40,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let uv = dom_uv(params.dom, gid.xy, params.size);
     let val = textureLoad(tex_value, dom_texel(params.dom_value, uv, params.size), 0);
     let t = clamp(val.x, 0.0, 1.0);
-    // The palette varies only in u.
+    // The palette varies only in u. Measured from texel centers.
+    let last = f32(params.size.x) - 1.0;
     let px = clamp(
-        (t - params.dom_palette.x) / params.dom_palette.z * f32(params.size.x),
-        0.0, f32(params.size.x) - 1.0,
+        (t - params.dom_palette.x) / params.dom_palette.z * f32(params.size.x) - 0.5,
+        0.0, last,
     );
-    let pal = textureLoad(tex_palette, vec2<i32>(i32(px), 0), 0);
-    textureStore(out_tex, coord, pal);
+    let i0 = floor(px);
+    let f = px - i0;
+    let a = textureLoad(tex_palette, vec2<i32>(i32(i0), 0), 0);
+    let b = textureLoad(tex_palette, vec2<i32>(i32(min(i0 + 1.0, last)), 0), 0);
+    // Oklch: hue takes the shorter way around.
+    var dh = b.z - a.z;
+    if (dh > 180.0) { dh = dh - 360.0; }
+    if (dh < -180.0) { dh = dh + 360.0; }
+    var h = a.z + dh * f;
+    if (h < 0.0) { h = h + 360.0; }
+    if (h >= 360.0) { h = h - 360.0; }
+    textureStore(out_tex, coord, vec4<f32>(mix(a.x, b.x, f), mix(a.y, b.y, f), h, mix(a.w, b.w, f)));
 }

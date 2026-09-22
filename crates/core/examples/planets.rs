@@ -1,0 +1,489 @@
+//! Write the sample planet graphs to `samples/planets/`.
+//!
+//! ```text
+//! cargo run -p texture-graph-core --example planets [out_dir]
+//! ```
+//!
+//! Each graph is a class of planet rather than one planet: every noise is 3D
+//! fbm on the sample point, so a sphere shows no seam or pole pinch, and
+//! `EvalCtx::seed` picks the member of the class. Parameters shift the class
+//! along its obvious axes (sea level, ice extent, and so on).
+//!
+//! Built here rather than by hand so the graphs stay reviewable as code; the
+//! `.tgraph` files are the output.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use texture_graph_core::color::oklcha;
+use texture_graph_core::*;
+
+fn main() {
+    let dir = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| "samples/planets".into()));
+    std::fs::create_dir_all(&dir).expect("create output directory");
+    for (file, name, description, graph) in [
+        (
+            "earthlike.tgraph",
+            "Earthlike",
+            "Oceans, continents with ridged ranges, climate-banded biomes and polar ice. \
+             Normal map on land only; oceans are flat and glossy.",
+            earthlike(),
+        ),
+        (
+            "earthlike-clouds.tgraph",
+            "Earthlike clouds",
+            "Translucent cloud deck for a shell drawn just above earthlike.tgraph.",
+            earthlike_clouds(),
+        ),
+        (
+            "marslike.tgraph",
+            "Marslike",
+            "Dry rust world: highland/lowland dichotomy, canyon networks, dark albedo \
+             provinces, small dusty polar caps.",
+            marslike(),
+        ),
+    ] {
+        let meta = FileMetadata {
+            name: name.into(),
+            description: Some(description.into()),
+            authors: vec![],
+            modified: String::new(),
+            written_by: "texture-graph-core examples/planets.rs".into(),
+        };
+        let path = dir.join(file);
+        save_to_path(&TextureGraphFile::new(meta, graph), &path).expect("write graph");
+        println!("wrote {}", path.display());
+    }
+}
+
+/// Sea level on the continent field, before the `ocean` parameter moves it.
+const EARTH_SEA: f32 = 0.545;
+
+fn earthlike() -> Graph {
+    let mut b = Builder::new();
+    b.param("ocean", -0.15, 0.15, 0.0, "Raises the sea: positive drowns land, negative exposes shelf.");
+    b.param("ice", -0.3, 0.3, 0.0, "Pushes polar ice toward the equator.");
+    b.param("aridity", -0.3, 0.3, 0.0, "Widens the desert belts.");
+
+    let continents = b.fbm("continents", 0, 1.3, 8, 0.52, FractalMode::Standard);
+    let ocean = b.param_gray("ocean level", "ocean");
+    let terrain_base = b.sub("terrain base", continents, ocean);
+    let inland = b.remap("inland", terrain_base, EARTH_SEA + 0.01, EARTH_SEA + 0.12);
+    let ridges = b.fbm("ridges", 1, 2.6, 7, 0.5, FractalMode::Ridged);
+    let ranges = b.mask("ranges", ridges, inland);
+    let ranges = b.scale("ranges scaled", ranges, 0.32);
+    let terrain = b.add("terrain", terrain_base, ranges);
+
+    // The ocean floor is clamped to sea level, so the normal map is flat there.
+    let sea = b.gray("sea level", EARTH_SEA);
+    let surface_height = b.max("surface height", terrain, sea);
+    let normal = b.add_layer(
+        "normal",
+        LayerKind::HeightToNormal(HeightToNormal { source: Some(surface_height), strength: 0.12 }),
+    );
+
+    let land = b.remap("land", terrain, EARTH_SEA - 0.002, EARTH_SEA + 0.004);
+    let elevation = b.remap("elevation", terrain, EARTH_SEA, EARTH_SEA + 0.42);
+    let depth = b.remap("depth", terrain, EARTH_SEA - 0.2, EARTH_SEA);
+
+    // Latitude: |y| on the sphere, 0 at the equator and 1 at the poles.
+    let y = b.add_layer("y", LayerKind::Coordinate(Coordinate { axis: Axis::V }));
+    let abs_lat = b.wave("abs latitude", y, WaveShape::Triangle, 1.0, 0.25);
+
+    // Deserts sit around |y| = 0.42 (about 25°), wet belts at the equator
+    // and in the temperate zone: minus a cosine of period 0.42 in v about
+    // v = 0.5, which is 2.38 cycles with phase -0.5·2.38 - 0.25.
+    let arid_belt = b.wave("arid belt", y, WaveShape::Sine, 2.38, -1.44);
+    let moisture = b.fbm("moisture", 2, 2.2, 6, 0.55, FractalMode::Standard);
+    let arid_param = b.param_gray("aridity level", "aridity");
+    let aridity = b.weighted_sum("aridity", &[(arid_belt, 0.55), (moisture, 0.8), (arid_param, 1.0)]);
+    let desert = b.remap("desert", aridity, 0.8, 0.92);
+
+    let ocean_palette = b.ramp(
+        "ocean palette",
+        &[
+            (0.0, oklcha(0.22, 0.07, 262.0, 1.0)),
+            (0.7, oklcha(0.31, 0.09, 250.0, 1.0)),
+            (0.93, oklcha(0.42, 0.10, 232.0, 1.0)),
+            (1.0, oklcha(0.56, 0.09, 205.0, 1.0)),
+        ],
+    );
+    let ocean_color = b.map("ocean color", depth, ocean_palette);
+    let lush_palette = b.ramp(
+        "lush palette",
+        &[
+            (0.0, oklcha(0.70, 0.06, 90.0, 1.0)),
+            (0.02, oklcha(0.50, 0.10, 138.0, 1.0)),
+            (0.25, oklcha(0.43, 0.09, 132.0, 1.0)),
+            (0.5, oklcha(0.47, 0.06, 95.0, 1.0)),
+            (0.72, oklcha(0.50, 0.04, 60.0, 1.0)),
+            (0.86, oklcha(0.60, 0.015, 60.0, 1.0)),
+            (0.93, oklcha(0.94, 0.005, 240.0, 1.0)),
+            (1.0, oklcha(0.97, 0.0, 0.0, 1.0)),
+        ],
+    );
+    let lush = b.map("lush", elevation, lush_palette);
+    let arid_palette = b.ramp(
+        "arid palette",
+        &[
+            (0.0, oklcha(0.78, 0.07, 85.0, 1.0)),
+            (0.3, oklcha(0.72, 0.09, 72.0, 1.0)),
+            (0.6, oklcha(0.58, 0.09, 50.0, 1.0)),
+            (0.86, oklcha(0.55, 0.04, 50.0, 1.0)),
+            (0.93, oklcha(0.94, 0.005, 240.0, 1.0)),
+            (1.0, oklcha(0.97, 0.0, 0.0, 1.0)),
+        ],
+    );
+    let arid = b.map("arid", elevation, arid_palette);
+    let land_color = b.blend("land color", lush, arid, desert);
+    let ground = b.blend("ground", ocean_color, land_color, land);
+
+    let ice_noise = b.fbm("ice noise", 3, 4.0, 6, 0.5, FractalMode::Standard);
+    let ice_param = b.param_gray("ice level", "ice");
+    let ice_drive = b.weighted_sum(
+        "ice drive",
+        &[(abs_lat, 1.0), (ice_noise, 0.22), (elevation, 0.12), (ice_param, 1.0)],
+    );
+    let ice = b.remap("ice", ice_drive, 0.97, 1.0);
+    let ice_color = b.gray_color("ice color", oklcha(0.95, 0.01, 230.0, 1.0));
+    let color = b.blend("color", ground, ice_color, ice);
+
+    let water_rough = b.gray("water roughness", 0.22);
+    let land_rough = b.gray("land roughness", 0.85);
+    let ice_rough = b.gray("ice roughness", 0.5);
+    let ground_rough = b.blend("ground roughness", water_rough, land_rough, land);
+    let roughness = b.blend("roughness", ground_rough, ice_rough, ice);
+
+    b.finish(color, roughness, Some(normal))
+}
+
+fn earthlike_clouds() -> Graph {
+    let mut b = Builder::new();
+    b.param("cover", -0.2, 0.2, 0.0, "More cloud when positive.");
+
+    let big = b.fbm("fronts", 20, 1.8, 7, 0.55, FractalMode::Standard);
+    let wisps = b.fbm("wisps", 21, 5.0, 6, 0.55, FractalMode::Turbulence);
+    // The desert belt's wave negated: cloudy at the equator and mid
+    // latitudes, clear in the subtropics.
+    let y = b.add_layer("y", LayerKind::Coordinate(Coordinate { axis: Axis::V }));
+    let belts = b.wave("belts", y, WaveShape::Sine, 2.38, -0.94);
+    let cover = b.param_gray("cover level", "cover");
+    let weather = b.weighted_sum("weather", &[(big, 0.8), (wisps, 0.5)]);
+    // Squash along y, about the equator, so systems stretch east-west as
+    // winds shear them.
+    let zonal = b.add_layer(
+        "zonal",
+        LayerKind::Transform(Transform {
+            source: Some(weather),
+            offset: [0.0, 0.5, 0.0],
+            rotate_uv: 0.0,
+            scale: [1.0, 1.8, 1.0],
+            coord_mode: CoordMode::Passthrough,
+            edge_mode: EdgeMode::Extend,
+        }),
+    );
+    let drive = b.weighted_sum("drive", &[(zonal, 1.0), (belts, 0.12), (cover, 1.0)]);
+    let density = b.remap("density", drive, 0.58, 0.8);
+    let palette = b.ramp(
+        "cloud palette",
+        &[
+            (0.0, oklcha(0.97, 0.0, 0.0, 0.0)),
+            (0.4, oklcha(0.95, 0.0, 0.0, 0.45)),
+            (1.0, oklcha(0.99, 0.0, 0.0, 0.92)),
+        ],
+    );
+    let color = b.map("clouds", density, palette);
+    let roughness = b.gray("roughness", 0.95);
+    b.finish(color, roughness, None)
+}
+
+fn marslike() -> Graph {
+    let mut b = Builder::new();
+    b.param("ice", -0.3, 0.3, 0.0, "Pushes the polar caps toward the equator.");
+    b.param("dark", -0.3, 0.3, 0.0, "More dark basaltic provinces when positive.");
+    b.param_color("dust", oklcha(0.63, 0.13, 50.0, 1.0), "Midland dust color.");
+
+    // Higher in the south, as on Mars.
+    let y = b.add_layer("y", LayerKind::Coordinate(Coordinate { axis: Axis::V }));
+    let base = b.fbm("base", 0, 1.1, 8, 0.55, FractalMode::Standard);
+    let dichotomy = b.fbm("dichotomy", 1, 0.55, 3, 0.5, FractalMode::Standard);
+    let south_up = b.scale("south up", y, -0.18);
+    let heights = b.weighted_sum("heights", &[(base, 1.0), (dichotomy, 0.35), (south_up, 1.0)]);
+
+    // The creases of ridged noise make canyon networks.
+    let creases = b.fbm("creases", 4, 1.7, 6, 0.5, FractalMode::Ridged);
+    let canyons = b.remap("canyons", creases, 0.72, 0.86);
+    let volcanic = b.fbm("volcanic", 6, 3.2, 6, 0.5, FractalMode::Ridged);
+    let terrain = b.weighted_sum(
+        "terrain",
+        &[(heights, 1.0), (canyons, -0.09), (volcanic, 0.07)],
+    );
+    let normal = b.add_layer(
+        "normal",
+        LayerKind::HeightToNormal(HeightToNormal { source: Some(terrain), strength: 0.14 }),
+    );
+
+    let elevation = b.remap("elevation", terrain, 0.48, 0.85);
+    let palette = b.ramp_inputs(
+        "rust palette",
+        &[
+            (0.0, ColorInput::Const(oklcha(0.40, 0.07, 38.0, 1.0))),
+            (0.35, ColorInput::Const(oklcha(0.56, 0.12, 44.0, 1.0))),
+            (0.6, ColorInput::Param("dust".into())),
+            (1.0, ColorInput::Const(oklcha(0.74, 0.10, 64.0, 1.0))),
+        ],
+    );
+    let rust = b.map("rust", elevation, palette);
+
+    // Dark albedo provinces, kept off the high ground where dust settles.
+    let albedo = b.fbm("albedo", 5, 1.9, 7, 0.55, FractalMode::Standard);
+    let dark_param = b.param_gray("dark level", "dark");
+    let dark_drive = b.weighted_sum("dark drive", &[(albedo, 1.0), (elevation, -0.25), (dark_param, 1.0)]);
+    let dark = b.remap("dark", dark_drive, 0.45, 0.55);
+    let basalt = b.gray_color("basalt", oklcha(0.36, 0.045, 38.0, 1.0));
+    let dark_mix = b.scale("dark amount", dark, 0.65);
+    let ground = b.blend("ground", rust, basalt, dark_mix);
+    let canyon_shade = b.gray_color("canyon floor", oklcha(0.33, 0.07, 32.0, 1.0));
+    let canyon_mix = b.scale("canyon amount", canyons, 0.6);
+    let ground = b.blend("ground with canyons", ground, canyon_shade, canyon_mix);
+
+    let abs_lat = b.wave("abs latitude", y, WaveShape::Triangle, 1.0, 0.25);
+    let ice_noise = b.fbm("ice noise", 3, 3.5, 6, 0.55, FractalMode::Standard);
+    let ice_param = b.param_gray("ice level", "ice");
+    // Kept under 1: the GPU Map clamps its value to [0, 1] before the lookup.
+    let ice_drive = b.weighted_sum("ice drive", &[(abs_lat, 0.8), (ice_noise, 0.24), (ice_param, 1.0)]);
+    let ice = b.remap("ice", ice_drive, 0.85, 0.875);
+    let ice_color = b.gray_color("ice color", oklcha(0.93, 0.025, 70.0, 1.0));
+    let color = b.blend("color", ground, ice_color, ice);
+
+    let dust_rough = b.gray("dust roughness", 0.92);
+    let ice_rough = b.gray("ice roughness", 0.55);
+    let roughness = b.blend("roughness", dust_rough, ice_rough, ice);
+
+    b.finish(color, roughness, Some(normal))
+}
+
+/// Terse graph construction. Every scalar is a gray's Oklch L; `Blend` in
+/// Oklch lerps L, so it doubles as the scalar arithmetic.
+struct Builder {
+    g: Graph,
+    black: Option<LayerId>,
+}
+
+impl Builder {
+    fn new() -> Self {
+        let mut g = Graph::new();
+        // `Graph::new` makes a placeholder output layer; nothing here uses it.
+        let placeholder = g.output.color.unwrap();
+        g.remove(placeholder).unwrap();
+        Self { g, black: None }
+    }
+
+    fn add_layer(&mut self, name: &str, kind: LayerKind) -> LayerId {
+        self.g.add_layer(name, kind).unwrap_or_else(|e| panic!("{name}: {e}"))
+    }
+
+    fn param(&mut self, name: &str, min: f32, max: f32, default: f32, description: &str) {
+        let mut d = ParamDecl::scalar(name, min, max, default);
+        d.description = Some(description.into());
+        self.g.declare_param(d).unwrap();
+    }
+
+    fn param_color(&mut self, name: &str, default: Color, description: &str) {
+        let mut d = ParamDecl::color(name, default);
+        d.description = Some(description.into());
+        self.g.declare_param(d).unwrap();
+    }
+
+    /// A gray whose L is the scalar parameter `param`.
+    fn param_gray(&mut self, name: &str, param: &str) -> LayerId {
+        let black = self.black();
+        let white = self.gray(&format!("{name} white"), 1.0);
+        self.add_layer(
+            name,
+            LayerKind::Mix(Mix {
+                a: Some(black),
+                b: Some(white),
+                mode: BlendMode::Blend,
+                factor: ScalarInput::Param(param.into()),
+                space: BlendSpace::Oklch,
+            }),
+        )
+    }
+
+    fn black(&mut self) -> LayerId {
+        if let Some(id) = self.black {
+            return id;
+        }
+        let id = self.gray("zero", 0.0);
+        self.black = Some(id);
+        id
+    }
+
+    fn gray(&mut self, name: &str, l: f32) -> LayerId {
+        self.gray_color(name, oklcha(l, 0.0, 0.0, 1.0))
+    }
+
+    fn gray_color(&mut self, name: &str, c: Color) -> LayerId {
+        self.add_layer(name, LayerKind::Color(c))
+    }
+
+    /// Unsigned, normalized 3D simplex fbm.
+    fn fbm(
+        &mut self,
+        name: &str,
+        seed_offset: u32,
+        frequency: f32,
+        octaves: u32,
+        gain: f32,
+        mode: FractalMode,
+    ) -> LayerId {
+        self.add_layer(
+            name,
+            LayerKind::Noise(Noise {
+                dims: NoiseDims::D3,
+                seed_offset,
+                frequency,
+                range: NoiseRange::Unsigned,
+                output: NoiseOutput::Grayscale,
+                kernel: NoiseKernel::Simplex,
+                period: [0; 3],
+                fractal: Fractal { octaves, lacunarity: 2.0, gain, mode, normalize: true },
+            }),
+        )
+    }
+
+    fn wave(&mut self, name: &str, input: LayerId, shape: WaveShape, frequency: f32, phase: f32) -> LayerId {
+        self.add_layer(
+            name,
+            LayerKind::Wave(Wave {
+                input: ScalarInput::Layer(input),
+                shape,
+                frequency,
+                phase,
+                range: NoiseRange::Unsigned,
+            }),
+        )
+    }
+
+    fn mix(&mut self, name: &str, a: LayerId, b: LayerId, mode: BlendMode, factor: ScalarInput) -> LayerId {
+        self.add_layer(
+            name,
+            LayerKind::Mix(Mix { a: Some(a), b: Some(b), mode, factor, space: BlendSpace::Oklch }),
+        )
+    }
+
+    fn add(&mut self, name: &str, a: LayerId, b: LayerId) -> LayerId {
+        self.mix(name, a, b, BlendMode::Add, ScalarInput::Const(0.0))
+    }
+
+    fn sub(&mut self, name: &str, a: LayerId, b: LayerId) -> LayerId {
+        self.mix(name, a, b, BlendMode::Subtract, ScalarInput::Const(0.0))
+    }
+
+    fn blend(&mut self, name: &str, a: LayerId, b: LayerId, factor: LayerId) -> LayerId {
+        self.mix(name, a, b, BlendMode::Blend, ScalarInput::Layer(factor))
+    }
+
+    /// `a * k`, as a lerp from zero.
+    fn scale(&mut self, name: &str, a: LayerId, k: f32) -> LayerId {
+        let black = self.black();
+        self.mix(name, black, a, BlendMode::Blend, ScalarInput::Const(k))
+    }
+
+    /// `a * mask`.
+    fn mask(&mut self, name: &str, a: LayerId, mask: LayerId) -> LayerId {
+        let black = self.black();
+        self.blend(name, black, a, mask)
+    }
+
+    /// `Σ kᵢ · aᵢ`, the intermediate terms named after `name`.
+    fn weighted_sum(&mut self, name: &str, terms: &[(LayerId, f32)]) -> LayerId {
+        let mut acc: Option<LayerId> = None;
+        for (i, &(id, k)) in terms.iter().enumerate() {
+            let last = i + 1 == terms.len();
+            let term = if k == 1.0 { id } else { self.scale(&format!("{name} term {i}"), id, k) };
+            acc = Some(match acc {
+                None => term,
+                Some(prev) => {
+                    let label = if last { name.to_string() } else { format!("{name} partial {i}") };
+                    self.add(&label, prev, term)
+                }
+            });
+        }
+        acc.expect("at least one term")
+    }
+
+    fn max(&mut self, name: &str, a: LayerId, b: LayerId) -> LayerId {
+        self.add_layer(
+            name,
+            LayerKind::MinMax(MinMax {
+                a: Some(a),
+                b: Some(b),
+                mode: MinMaxMode::Max,
+                criterion: Criterion::Luma,
+            }),
+        )
+    }
+
+    fn ramp(&mut self, name: &str, stops: &[(f32, Color)]) -> LayerId {
+        let stops: Vec<_> = stops.iter().map(|&(t, c)| (t, ColorInput::Const(c))).collect();
+        self.ramp_inputs(name, &stops)
+    }
+
+    fn ramp_inputs(&mut self, name: &str, stops: &[(f32, ColorInput)]) -> LayerId {
+        self.add_layer(
+            name,
+            LayerKind::ColorRamp(ColorRamp {
+                stops: stops.iter().map(|(t, c)| ColorStop { t: *t, color: c.clone() }).collect(),
+                space: BlendSpace::Oklch,
+            }),
+        )
+    }
+
+    fn map(&mut self, name: &str, value: LayerId, palette: LayerId) -> LayerId {
+        self.add_layer(name, LayerKind::Map(Map { value: Some(value), palette: Some(palette) }))
+    }
+
+    /// `(x - lo) / (hi - lo)`, clamped to `[0, 1]`.
+    fn remap(&mut self, name: &str, x: LayerId, lo: f32, hi: f32) -> LayerId {
+        let palette = self.ramp(
+            &format!("{name} ramp"),
+            &[(lo, oklcha(0.0, 0.0, 0.0, 1.0)), (hi, oklcha(1.0, 0.0, 0.0, 1.0))],
+        );
+        self.map(name, x, palette)
+    }
+
+    /// Sets the output and lays every layer out left to right by depth.
+    fn finish(mut self, color: LayerId, roughness: LayerId, normal: Option<LayerId>) -> Graph {
+        self.g
+            .set_output(Output {
+                color: Some(color),
+                roughness: ScalarInput::Layer(roughness),
+                metallic: ScalarInput::Const(0.0),
+                normal,
+            })
+            .unwrap();
+
+        let mut depth: HashMap<LayerId, usize> = HashMap::new();
+        // `layers` is id-ascending and inputs always predate their readers.
+        for l in &self.g.layers {
+            let d = l.kind.inputs().iter().map(|i| depth[i] + 1).max().unwrap_or(0);
+            depth.insert(l.id, d);
+        }
+        let mut rows: HashMap<usize, usize> = HashMap::new();
+        self.g.add_canvas("main").unwrap();
+        let ids: Vec<LayerId> = self.g.layers.iter().map(|l| l.id).collect();
+        for id in ids {
+            let col = depth[&id];
+            let row = rows.entry(col).or_default();
+            self.g
+                .set_position("main", id, [col as f32 * 260.0, *row as f32 * 150.0])
+                .unwrap();
+            *row += 1;
+        }
+        let last_col = depth.values().max().copied().unwrap_or(0) + 1;
+        self.g.set_output_position("main", [last_col as f32 * 260.0, 0.0]).unwrap();
+        self.g
+    }
+}

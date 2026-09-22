@@ -19,14 +19,15 @@ pub mod scene;
 pub mod schedule;
 
 pub use baker::{
-    BakeError, BakeOutput, Baker, ScalarCube, ScalarFormat, ScalarVolume, VolumeJob, VolumeOutput,
+    BakeError, BakeOutput, Baker, ScalarCube, ScalarFormat, ScalarVolume, SolidBump, VolumeJob,
+    VolumeOutput,
 };
 pub use device::DeviceCtx;
 pub use readback::{
     Image, ScalarImage, read_rgba8, read_rgba8_async, read_scalar, read_scalar_async,
     read_scalar_volume, read_scalar_volume_async,
 };
-pub use scene::{SceneCamera, SceneMaterial, SceneRenderer, SceneShape};
+pub use scene::{SceneBackground, SceneCamera, SceneLayer, SceneMaterial, SceneRenderer, SceneShape};
 pub use schedule::{
     OutputSlots, ScalarSlot, Schedule, ScheduleError, schedule, schedule_layer,
     schedule_no_reuse,

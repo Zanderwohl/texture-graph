@@ -114,6 +114,7 @@ fn solid_split_material(ctx: &DeviceCtx) -> VolumeOutput {
         metallic: make_volume(ctx, "vol-metal", R, |_, _, _| [0, 0, 0, 255]),
         normal: make_volume(ctx, "vol-normal", R, |_, _, _| [128, 128, 255, 255]),
         size: (R, R, R),
+        bump: None,
     }
 }
 
@@ -529,4 +530,82 @@ fn read_texture_2d(ctx: &DeviceCtx, tex: &wgpu::Texture, res: u32) -> Vec<u8> {
     let data = slice.get_mapped_range().to_vec();
     buf.unmap();
     data
+}
+
+fn gray_volume(ctx: &DeviceCtx, normal: [u8; 4]) -> VolumeOutput {
+    const R: u32 = 16;
+    VolumeOutput {
+        color: make_volume(ctx, "vol-gray", R, |_, _, _| [160, 160, 160, 255]),
+        roughness: make_volume(ctx, "vol-rough", R, |_, _, _| [200, 200, 200, 255]),
+        metallic: make_volume(ctx, "vol-metal", R, |_, _, _| [0, 0, 0, 255]),
+        normal: make_volume(ctx, "vol-normal", R, |_, _, _| normal),
+        size: (R, R, R),
+        bump: None,
+    }
+}
+
+/// Rises along w only. `R8Unorm` filters like the baker's `R16Float` and
+/// needs no f16 packing.
+fn w_ramp_height(ctx: &DeviceCtx) -> wgpu::Texture {
+    const R: u32 = 16;
+    let tex = ctx.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("vol-height"),
+        size: wgpu::Extent3d { width: R, height: R, depth_or_array_layers: R },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let data: Vec<u8> = (0..R * R * R).map(|i| ((i / (R * R)) * 255 / (R - 1)) as u8).collect();
+    ctx.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &data,
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(R), rows_per_image: Some(R) },
+        wgpu::Extent3d { width: R, height: R, depth_or_array_layers: R },
+    );
+    tex
+}
+
+fn luma(p: [u8; 4]) -> i32 {
+    p[0] as i32 + p[1] as i32 + p[2] as i32
+}
+
+/// A per-slice normal cannot see slope along w; the 3D bump must. The left
+/// flank is checked because on the right the tilt turns toward the rim
+/// light, which nearly cancels it.
+#[test]
+fn solid_bump_follows_slope_along_w() {
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless wgpu init");
+    let flat = gray_volume(&ctx, [128, 128, 255, 255]);
+    let mut bumped = gray_volume(&ctx, [128, 128, 255, 255]);
+    bumped.bump = Some(crate::SolidBump { height: w_ramp_height(&ctx), strength: 0.6 });
+
+    let flank = (SIZE / 2 - SIZE * 3 / 10, SIZE / 2);
+    let a = render_frame_with(&ctx, SceneShape::Sphere, 0.0, SceneMaterial::Solid(&flat));
+    let b = render_frame_with(&ctx, SceneShape::Sphere, 0.0, SceneMaterial::Solid(&bumped));
+    let (fa, fb) = (px(&a, flank.0, flank.1), px(&b, flank.0, flank.1));
+    eprintln!("flank flat={fa:?} bumped={fb:?}");
+    assert!(luma(fb) + 30 < luma(fa), "bump along w should darken the left flank: {fa:?} vs {fb:?}");
+}
+
+/// With a height bound, the per-slice normal volume is not used.
+#[test]
+fn solid_bump_replaces_the_normal_volume() {
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless wgpu init");
+    let flat = gray_volume(&ctx, [128, 128, 255, 255]);
+    let mut tilted = gray_volume(&ctx, [255, 128, 128, 255]);
+    tilted.bump = Some(crate::SolidBump { height: w_ramp_height(&ctx), strength: 0.0 });
+    let a = render_frame_with(&ctx, SceneShape::Sphere, 0.0, SceneMaterial::Solid(&flat));
+    let b = render_frame_with(&ctx, SceneShape::Sphere, 0.0, SceneMaterial::Solid(&tilted));
+    for (x, y) in [(SIZE / 2, SIZE / 2), (SIZE / 3, SIZE / 3), (SIZE * 2 / 3, SIZE / 2)] {
+        let (pa, pb) = (px(&a, x, y), px(&b, x, y));
+        assert!((luma(pa) - luma(pb)).abs() <= 3, "({x}, {y}): {pa:?} vs {pb:?}");
+    }
 }

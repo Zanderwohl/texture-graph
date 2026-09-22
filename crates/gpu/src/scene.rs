@@ -21,10 +21,29 @@ pub enum SceneShape {
 ///
 /// - `Uv`: 2D channels mapped by the mesh's UVs.
 /// - `Solid`: 3D volume channels sampled at object-space position, with no
-///   UV seams or pole pinching.
+///   UV seams or pole pinching. With [`VolumeOutput::bump`] set, the
+///   surface is bumped by that height's 3D gradient instead of by `normal`.
+#[derive(Copy, Clone)]
 pub enum SceneMaterial<'a> {
     Uv(&'a BakeOutput),
     Solid(&'a VolumeOutput),
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub enum SceneBackground {
+    /// The transparency checker, matching the flat preview's alpha backing.
+    #[default]
+    Checker,
+    /// One color, in sRGB-encoded `[0, 1]`, as the target stores it.
+    Solid([f32; 3]),
+}
+
+#[derive(Copy, Clone)]
+pub struct SceneLayer<'a> {
+    pub material: SceneMaterial<'a>,
+    /// Uniform. A later layer scaled a little larger wraps the earlier ones,
+    /// as a cloud deck does; its alpha shows them through.
+    pub scale: f32,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -60,6 +79,9 @@ struct SceneUniforms {
     /// xyz = linear ambient tint. w = object-to-texture scale for the solid
     /// variant (`tex = obj_pos * w + 0.5`).
     ambient: [f32; 4],
+    /// Solid variant only. x = bump strength, y = 1 when bumping from the
+    /// height volume, z = one height texel in texture coordinates.
+    bump: [f32; 4],
 }
 
 /// Offsets must stay (0, 12, 24, 40), as `vertex_attr_array!` computes them.
@@ -85,6 +107,8 @@ pub struct SceneRenderer {
     bgl_solid:      wgpu::BindGroupLayout,
     pipeline_bg: wgpu::RenderPipeline,
     sampler:  wgpu::Sampler,
+    /// Bound as the height of a solid material without one.
+    flat_height: wgpu::TextureView,
     sphere:   Mesh,
     cube:     Mesh,
     quad:     Mesh,
@@ -100,12 +124,14 @@ impl SceneRenderer {
             device,
             &src_uv,
             wgpu::TextureViewDimension::D2,
+            false,
             "scene-uv",
         );
         let (pipeline_solid, bgl_solid) = make_scene_pipeline(
             device,
             &src_solid,
             wgpu::TextureViewDimension::D3,
+            true,
             "scene-solid",
         );
 
@@ -121,8 +147,20 @@ impl SceneRenderer {
         });
 
         let pipeline_bg = make_bg_pipeline(device);
+        let flat_height = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("scene-flat-height"),
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::R16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let sphere = build_mesh(device, &sphere_verts_indices(48, 24), "sphere");
+        let sphere = build_mesh(device, &sphere_verts_indices(128, 64), "sphere");
         let cube   = build_mesh(device, &cube_verts_indices(),        "cube");
         let quad   = build_mesh(device, &quad_verts_indices(),        "quad");
 
@@ -133,6 +171,7 @@ impl SceneRenderer {
             bgl_solid,
             pipeline_bg,
             sampler,
+            flat_height,
             sphere,
             cube,
             quad,
@@ -171,10 +210,37 @@ impl SceneRenderer {
 
     /// The caller owns the targets so they last across frames and egui-wgpu
     /// does not re-register a texture every frame.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_into(
         &self,
         ctx: &DeviceCtx,
         material: SceneMaterial<'_>,
+        shape: SceneShape,
+        color_view: &wgpu::TextureView,
+        depth_view: &wgpu::TextureView,
+        size: (u32, u32),
+        camera: &SceneCamera,
+    ) {
+        self.render_layers(
+            ctx,
+            &[SceneLayer { material, scale: 1.0 }],
+            SceneBackground::Checker,
+            shape,
+            color_view,
+            depth_view,
+            size,
+            camera,
+        );
+    }
+
+    /// [`SceneRenderer::render_into`] with several meshes of the same shape,
+    /// drawn in order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_layers(
+        &self,
+        ctx: &DeviceCtx,
+        layers: &[SceneLayer<'_>],
+        background: SceneBackground,
         shape: SceneShape,
         color_view: &wgpu::TextureView,
         depth_view: &wgpu::TextureView,
@@ -204,49 +270,79 @@ impl SceneRenderer {
         );
         let view = Mat4::look_at_rh(cam_pos, Vec3::ZERO, Vec3::Y);
         let view_proj = proj * view;
-        let uniforms = SceneUniforms {
-            view_proj:   view_proj.to_cols_array_2d(),
-            model:       Mat4::from_quat(camera.orientation).to_cols_array_2d(),
-            camera_pos:  [cam_pos.x, cam_pos.y, cam_pos.z, 0.0],
-            lights:      three_point_rig(),
-            ambient:     [0.03, 0.03, 0.03, obj_scale],
-        };
-        let ubo = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("scene-uniforms"),
-            contents: bytemuck::bytes_of(&uniforms),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
 
-        let (pipeline, bgl, color_v, rough_v, metal_v, normal_v) = match material {
-            SceneMaterial::Uv(m) => (
-                &self.pipeline_uv,
-                &self.bgl_uv,
-                m.color.create_view(&wgpu::TextureViewDescriptor::default()),
-                m.roughness.create_view(&wgpu::TextureViewDescriptor::default()),
-                m.metallic.create_view(&wgpu::TextureViewDescriptor::default()),
-                m.normal.create_view(&wgpu::TextureViewDescriptor::default()),
-            ),
-            SceneMaterial::Solid(v) => (
-                &self.pipeline_solid,
-                &self.bgl_solid,
-                v.color.create_view(&wgpu::TextureViewDescriptor::default()),
-                v.roughness.create_view(&wgpu::TextureViewDescriptor::default()),
-                v.metallic.create_view(&wgpu::TextureViewDescriptor::default()),
-                v.normal.create_view(&wgpu::TextureViewDescriptor::default()),
-            ),
-        };
-        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("scene-bg"),
-            layout: bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: ubo.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&color_v)  },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&rough_v)  },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&metal_v)  },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&normal_v) },
-                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-            ],
-        });
+        let bind_groups: Vec<(&wgpu::RenderPipeline, wgpu::BindGroup)> = layers
+            .iter()
+            .map(|layer| {
+                let bump = match layer.material {
+                    SceneMaterial::Solid(VolumeOutput { bump: Some(b), size, .. }) => {
+                        [b.strength, 1.0, 1.0 / size.0.max(1) as f32, 0.0]
+                    }
+                    _ => [0.0; 4],
+                };
+                let model = Mat4::from_quat(camera.orientation)
+                    * Mat4::from_scale(Vec3::splat(layer.scale));
+                let uniforms = SceneUniforms {
+                    view_proj:   view_proj.to_cols_array_2d(),
+                    model:       model.to_cols_array_2d(),
+                    camera_pos:  [cam_pos.x, cam_pos.y, cam_pos.z, 0.0],
+                    lights:      three_point_rig(),
+                    ambient:     [0.03, 0.03, 0.03, obj_scale],
+                    bump,
+                };
+                let ubo = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("scene-uniforms"),
+                    contents: bytemuck::bytes_of(&uniforms),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+                let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
+                let (pipeline, bgl, color_v, rough_v, metal_v, normal_v, height_v) =
+                    match layer.material {
+                        SceneMaterial::Uv(m) => (
+                            &self.pipeline_uv,
+                            &self.bgl_uv,
+                            view(&m.color),
+                            view(&m.roughness),
+                            view(&m.metallic),
+                            view(&m.normal),
+                            None,
+                        ),
+                        SceneMaterial::Solid(v) => (
+                            &self.pipeline_solid,
+                            &self.bgl_solid,
+                            view(&v.color),
+                            view(&v.roughness),
+                            view(&v.metallic),
+                            view(&v.normal),
+                            Some(
+                                v.bump
+                                    .as_ref()
+                                    .map_or_else(|| self.flat_height.clone(), |b| view(&b.height)),
+                            ),
+                        ),
+                    };
+                let mut entries = vec![
+                    wgpu::BindGroupEntry { binding: 0, resource: ubo.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&color_v)  },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&rough_v)  },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&metal_v)  },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&normal_v) },
+                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                ];
+                if let Some(h) = &height_v {
+                    entries.push(wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(h),
+                    });
+                }
+                let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("scene-bg"),
+                    layout: bgl,
+                    entries: &entries,
+                });
+                (pipeline, bg)
+            })
+            .collect();
 
         let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("scene-enc"),
@@ -259,8 +355,11 @@ impl SceneRenderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.08, g: 0.08, b: 0.10, a: 1.0,
+                        load: wgpu::LoadOp::Clear(match background {
+                            SceneBackground::Checker => wgpu::Color { r: 0.08, g: 0.08, b: 0.10, a: 1.0 },
+                            SceneBackground::Solid([r, g, b]) => wgpu::Color {
+                                r: r as f64, g: g as f64, b: b as f64, a: 1.0,
+                            },
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -277,13 +376,17 @@ impl SceneRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipeline_bg);
-            pass.draw(0..3, 0..1);
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            if background == SceneBackground::Checker {
+                pass.set_pipeline(&self.pipeline_bg);
+                pass.draw(0..3, 0..1);
+            }
             pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
             pass.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            for (pipeline, bg) in &bind_groups {
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, bg, &[]);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
         }
         ctx.queue.submit([enc.finish()]);
     }
@@ -537,32 +640,37 @@ fn make_scene_pipeline(
     device: &wgpu::Device,
     shader_src: &str,
     tex_dim: wgpu::TextureViewDimension,
+    with_height: bool,
     label: &str,
 ) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+    let mut entries = vec![
+        wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        },
+        filterable_texture(1, tex_dim),
+        filterable_texture(2, tex_dim),
+        filterable_texture(3, tex_dim),
+        filterable_texture(4, tex_dim),
+        wgpu::BindGroupLayoutEntry {
+            binding: 5,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        },
+    ];
+    if with_height {
+        entries.push(filterable_texture(6, tex_dim));
+    }
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(&format!("{label}-bgl")),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            filterable_texture(1, tex_dim),
-            filterable_texture(2, tex_dim),
-            filterable_texture(3, tex_dim),
-            filterable_texture(4, tex_dim),
-            wgpu::BindGroupLayoutEntry {
-                binding: 5,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-        ],
+        entries: &entries,
     });
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(&format!("{label}-pl")),

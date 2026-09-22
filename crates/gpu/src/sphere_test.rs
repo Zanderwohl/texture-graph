@@ -311,3 +311,35 @@ fn sample_cubes(ctx: &DeviceCtx, cubes: &[wgpu::TextureView], dirs: &[[f32; 4]])
     let values: &[[f32; 4]] = bytemuck::cast_slice(&data);
     values.iter().map(|v| [v[0], v[1], v[2]]).collect()
 }
+
+/// A volume whose Output normal is a HeightToNormal carries that node's
+/// source as a height, for the solid preview to bump by.
+#[test]
+fn volume_bake_carries_the_height_under_a_height_to_normal() {
+    use texture_graph_core::{Axis, Coordinate, HeightToNormal, Output, ScalarInput};
+    let ctx = pollster::block_on(crate::DeviceCtx::request_headless()).expect("headless");
+    let mut baker = crate::Baker::new(ctx.clone());
+    let mut g = texture_graph_core::Graph::new();
+    let w = g.add_layer("w", LayerKind::Coordinate(Coordinate { axis: Axis::W })).unwrap();
+    let n = g
+        .add_layer("n", LayerKind::HeightToNormal(HeightToNormal { source: Some(w), strength: 3.0 }))
+        .unwrap();
+    let color = g.output.color;
+    g.set_output(Output { color, roughness: ScalarInput::Const(0.5), metallic: ScalarInput::Const(0.0), normal: Some(n) })
+        .unwrap();
+
+    const R: u32 = 16;
+    let vol = baker.bake_volume(&g, R, R, &EvalCtx::default()).expect("bake");
+    let bump = vol.bump.expect("a HeightToNormal output bakes a height");
+    assert_eq!(bump.strength, 3.0);
+    let h = crate::read_scalar_volume(&ctx, &bump.height, (R, R, R), crate::ScalarFormat::R16Float);
+    for z in [0, 7, 15] {
+        let want = (z as f32 + 0.5) / R as f32;
+        let got = h.value(5, 9, z).unwrap();
+        assert!((got - want).abs() < 2e-3, "z={z}: want {want}, got {got}");
+    }
+
+    g.set_output(Output { color, roughness: ScalarInput::Const(0.5), metallic: ScalarInput::Const(0.0), normal: None })
+        .unwrap();
+    assert!(baker.bake_volume(&g, R, R, &EvalCtx::default()).unwrap().bump.is_none());
+}

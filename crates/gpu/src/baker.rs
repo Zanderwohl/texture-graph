@@ -27,6 +27,9 @@ use crate::schedule::{
 };
 
 const MAX_RAMP_STOPS: usize = 16;
+/// Filterable on WebGPU, and unclamped, so a height past `[0, 1]` keeps its
+/// slope.
+const BUMP_FORMAT: ScalarFormat = ScalarFormat::R16Float;
 /// Bindings are declared at pipeline creation, so this is a hard cap.
 const MAX_RAMP_INPUTS: usize = 8;
 
@@ -49,6 +52,25 @@ pub struct VolumeOutput {
     pub normal: wgpu::Texture,
     /// (width, height, depth) in texels.
     pub size: (u32, u32, u32),
+    /// Set when the Output's normal is a [`HeightToNormal`]. `normal` is
+    /// baked per slice and has no slope along w, so a solid preview bumps
+    /// from this height instead.
+    pub bump: Option<SolidBump>,
+}
+
+pub struct SolidBump {
+    /// `R16Float`: the [`HeightToNormal`] source's L, unclamped.
+    pub height: wgpu::Texture,
+    /// [`HeightToNormal::strength`]: the slope scale per unit of sample space.
+    pub strength: f32,
+}
+
+struct BumpJob {
+    source: LayerId,
+    strength: f32,
+    slice: wgpu::Texture,
+    slice_view: wgpu::TextureView,
+    volume: wgpu::Texture,
 }
 
 /// A [`Baker::bake_volume`] in progress; see [`Baker::begin_volume`].
@@ -68,6 +90,7 @@ pub struct VolumeJob {
     slice_views: Vec<wgpu::TextureView>,
     volumes: Vec<wgpu::Texture>,
     chan_doms: [[f32; 4]; 4],
+    bump: Option<BumpJob>,
 }
 
 impl VolumeJob {
@@ -95,6 +118,7 @@ impl VolumeJob {
             metallic: it.next().unwrap(),
             normal: it.next().unwrap(),
             size: (self.res, self.res, self.depth),
+            bump: self.bump.map(|b| SolidBump { height: b.volume, strength: b.strength }),
         }
     }
 }
@@ -1130,6 +1154,23 @@ impl Baker {
             chan_dom(graph.output.normal),
         ];
 
+        let bump = graph
+            .output
+            .normal
+            .and_then(|id| match &graph.get(id)?.kind {
+                LayerKind::HeightToNormal(HeightToNormal { source: Some(src), strength }) => {
+                    Some((*src, *strength))
+                }
+                _ => None,
+            })
+            .map(|(source, strength)| {
+                let slice = make_scalar_texture(device, size, BUMP_FORMAT, "tg-vol-slice-height");
+                let slice_view = slice.create_view(&wgpu::TextureViewDescriptor::default());
+                let volume =
+                    make_scalar_volume_texture(device, res, depth, BUMP_FORMAT, "tg-vol-height");
+                BumpJob { source, strength, slice, slice_view, volume }
+            });
+
         Ok(VolumeJob {
             graph: graph.clone(),
             eval_ctx,
@@ -1144,6 +1185,7 @@ impl Baker {
             slice_views,
             volumes,
             chan_doms,
+            bump,
         })
     }
 
@@ -1159,6 +1201,7 @@ impl Baker {
         let t0 = BakeTimer::start();
         let first = job.next_z;
         let size = (job.res, job.res);
+        let bump_pipeline = job.bump.as_ref().map(|_| self.scalar_pipeline(BUMP_FORMAT));
         let stop = job.next_z.saturating_add(max_slices).min(job.depth);
         for z in job.next_z..stop {
             // One submit per slice. On Metal each compute pass is a command
@@ -1191,6 +1234,38 @@ impl Baker {
                     Slice::Plane { w },
                     &job.missing_view,
                 )?;
+                // A later layer may reuse the slot, so pack the height now.
+                if let (Some(bump), Some(pipeline)) = (&job.bump, &bump_pipeline)
+                    && bump.source == id
+                {
+                    draw_scalar_pack(
+                        &self.ctx,
+                        &mut encoder,
+                        pipeline,
+                        &self.scalar_bgl,
+                        &job.pool_views[slot],
+                        &bump.slice_view,
+                        size,
+                        domain_of(&job.sched, id),
+                    );
+                }
+            }
+            if let Some(bump) = &job.bump {
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &bump.slice,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &bump.volume,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x: 0, y: 0, z },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d { width: job.res, height: job.res, depth_or_array_layers: 1 },
+                );
             }
             for (i, channel) in CHANNELS.iter().enumerate() {
                 pack_channel(
