@@ -30,8 +30,10 @@ the whole sample set and contact sheets.
 
 ## Limits
 
-- The color graphs use ColorRamp and Map, so `Baker::bake_scalar_cube` refuses
-  them; they preview as solid (volume) textures. The mountain bump comes from the
-  HeightToNormal's source height, bumped by its 3D gradient in the solid preview.
+- `Baker::bake_color_cube` bakes the color graphs on a sphere: a Map's palette
+  bakes on a plane beside the faces, and the clouds' Transform moves its noise's
+  sample points. The normal output does not bake on a sphere; the mountain bump
+  comes from the HeightToNormal's source height, bumped by its 3D gradient in the
+  solid preview.
 - The GPU `Map` clamps its value to `[0, 1]` before the lookup and the CPU
   evaluator does not, so every remap here keeps its range inside `[0, 1]`.

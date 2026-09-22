@@ -245,6 +245,30 @@ pub async fn read_rgba8_async(ctx: &DeviceCtx, tex: &wgpu::Texture, size: (u32, 
     Image { width, height, pixels }
 }
 
+/// Copy the array layers of an `Rgba8Unorm` texture back to the CPU, as one
+/// image with the layers stacked top to bottom: `size.1 * size.2` rows.
+pub fn read_rgba8_layers(ctx: &DeviceCtx, tex: &wgpu::Texture, size: (u32, u32, u32)) -> Image {
+    let (buffer, padded_bpr) = copy_to_buffer(ctx, tex, size, 4);
+    map_blocking(ctx, &buffer);
+    stacked(&buffer, padded_bpr, size)
+}
+
+/// [`read_rgba8_layers`] without the device poll; see the module docs.
+pub async fn read_rgba8_layers_async(
+    ctx: &DeviceCtx,
+    tex: &wgpu::Texture,
+    size: (u32, u32, u32),
+) -> Image {
+    let (buffer, padded_bpr) = copy_to_buffer(ctx, tex, size, 4);
+    map_async_await(&buffer).await;
+    stacked(&buffer, padded_bpr, size)
+}
+
+fn stacked(buffer: &wgpu::Buffer, padded_bpr: u32, (width, height, layers): (u32, u32, u32)) -> Image {
+    let pixels = unpad(buffer, padded_bpr, width * 4, height * layers);
+    Image { width, height: height * layers, pixels }
+}
+
 /// Copy a single-channel texture back to the CPU.
 pub fn read_scalar(
     ctx: &DeviceCtx,

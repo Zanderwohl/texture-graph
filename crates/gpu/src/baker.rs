@@ -22,6 +22,7 @@ use texture_graph_core::{
 use texture_graph_core::EdgeMode;
 
 use crate::device::DeviceCtx;
+use crate::sphere::{self, Placement, PointMap};
 use crate::schedule::{
     Domain, OutputSlots, ScalarSlot, Schedule, schedule, schedule_layer, schedule_previews,
 };
@@ -166,10 +167,18 @@ pub struct ScalarCube {
     pub format: ScalarFormat,
 }
 
+/// A graph's color output on a sphere; see [`Baker::bake_color_cube`].
+pub struct ColorCube {
+    pub texture: wgpu::Texture,
+    /// Edge length of a face in texels.
+    pub face: u32,
+}
+
 #[derive(Copy, Clone, Debug)]
 enum Slice {
     Plane { w: f32 },
-    CubeFace(u32),
+    /// Face `face`, sampled at the point `map` moves each texel's to.
+    CubeFace { face: u32, map: PointMap },
 }
 
 impl Slice {
@@ -177,7 +186,14 @@ impl Slice {
     fn w(self) -> f32 {
         match self {
             Slice::Plane { w } => w,
-            Slice::CubeFace(_) => texture_graph_core::FLAT_W,
+            Slice::CubeFace { .. } => texture_graph_core::FLAT_W,
+        }
+    }
+
+    fn point_map(self) -> PointMap {
+        match self {
+            Slice::Plane { .. } => sphere::IDENTITY,
+            Slice::CubeFace { map, .. } => map,
         }
     }
 
@@ -185,28 +201,8 @@ impl Slice {
     fn face_code(self) -> u32 {
         match self {
             Slice::Plane { .. } => 0,
-            Slice::CubeFace(k) => k + 1,
+            Slice::CubeFace { face, .. } => face + 1,
         }
-    }
-}
-
-/// Refuses layers that re-sample an input at other (u, v). On a cube face
-/// (u, v) is not a position in the field, so they would bake a wrong result.
-fn sphere_supports(kind: &LayerKind) -> Result<(), BakeError> {
-    match kind {
-        LayerKind::Color(_)
-        | LayerKind::Noise(_)
-        | LayerKind::Coordinate(_)
-        | LayerKind::Mix(_)
-        | LayerKind::MinMax(_)
-        | LayerKind::Wave(_) => Ok(()),
-        LayerKind::ColorRamp(_) => Err(BakeError::Unsupported("ColorRamp in a sphere bake")),
-        LayerKind::Transform(_) => Err(BakeError::Unsupported("Transform in a sphere bake")),
-        LayerKind::Map(_) => Err(BakeError::Unsupported("Map in a sphere bake")),
-        LayerKind::HeightToNormal(_) => {
-            Err(BakeError::Unsupported("HeightToNormal in a sphere bake"))
-        }
-        LayerKind::Warp(_) => Err(BakeError::Unsupported("Warp in a sphere bake")),
     }
 }
 
@@ -514,6 +510,7 @@ impl Baker {
                     size,
                     w,
                     at.face_code(),
+                    at.point_map(),
                     own_dom,
                 );
             }
@@ -528,10 +525,28 @@ impl Baker {
                     size,
                     w,
                     at.face_code(),
+                    at.point_map(),
                     own_dom,
                 );
             }
             LayerKind::Transform(t) => {
+                // On a face the map already moved the source's points, so
+                // this is a copy.
+                let copy;
+                let t = match at {
+                    Slice::Plane { .. } => t,
+                    Slice::CubeFace { .. } => {
+                        copy = Transform {
+                            offset: [0.0; 3],
+                            rotate_uv: 0.0,
+                            scale: [1.0; 3],
+                            coord_mode: CoordMode::Passthrough,
+                            edge_mode: EdgeMode::Clamp,
+                            ..*t
+                        };
+                        &copy
+                    }
+                };
                 dispatch_transform(
                     &self.ctx,
                     encoder,
@@ -884,7 +899,7 @@ impl Baker {
             &sched,
             layer,
             size,
-            Slice::Plane { w: texture_graph_core::FLAT_W },
+            &|_| Slice::Plane { w: texture_graph_core::FLAT_W },
             format,
             &dst.create_view(&wgpu::TextureViewDescriptor::default()),
             eval_ctx,
@@ -925,7 +940,8 @@ impl Baker {
                 });
             let w = (z as f32 + 0.5) / depth as f32;
             self.record_scalar_slice(
-                &mut encoder, graph, &sched, layer, size, Slice::Plane { w }, format, &slice_view,
+                &mut encoder, graph, &sched, layer, size, &|_| Slice::Plane { w }, format,
+                &slice_view,
                 eval_ctx,
             )?;
             encoder.copy_texture_to_texture(
@@ -971,10 +987,7 @@ impl Baker {
     ) -> Result<ScalarCube, BakeError> {
         let t0 = BakeTimer::start();
         let eval_ctx = &graph.resolve_params(eval_ctx);
-        let sched = schedule_layer(graph, layer)?;
-        for &id in &sched.order {
-            sphere_supports(&graph.get(id).expect("scheduled layers exist").kind)?;
-        }
+        let (sched, placed) = Self::sphere_schedule(graph, layer)?;
         let size = (face, face);
         self.ensure_pool(size, sched.peak_slots.max(1));
 
@@ -987,25 +1000,14 @@ impl Baker {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("tg-bake-scalar-cube"),
             });
+            let at = |id: LayerId| match placed.get(&id) {
+                Some(Placement::Sphere(map)) => Slice::CubeFace { face: k, map: *map },
+                _ => Slice::Plane { w: texture_graph_core::FLAT_W },
+            };
             self.record_scalar_slice(
-                &mut encoder, graph, &sched, layer, size, Slice::CubeFace(k), format,
-                &slice_view, eval_ctx,
+                &mut encoder, graph, &sched, layer, size, &at, format, &slice_view, eval_ctx,
             )?;
-            encoder.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &slice,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d { x: 0, y: 0, z: k },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::Extent3d { width: face, height: face, depth_or_array_layers: 1 },
-            );
+            copy_face(&mut encoder, &slice, &texture, face, k);
             self.ctx.queue.submit([encoder.finish()]);
         }
 
@@ -1027,23 +1029,12 @@ impl Baker {
         sched: &Schedule,
         layer: LayerId,
         size: (u32, u32),
-        at: Slice,
+        at: &dyn Fn(LayerId) -> Slice,
         format: ScalarFormat,
         dst_view: &wgpu::TextureView,
         eval_ctx: &EvalCtx,
     ) -> Result<(), BakeError> {
-        let missing_view = self.missing_view.clone().expect("ensure_pool made one");
-        dispatch_missing(
-            &self.ctx, encoder, &self.missing_pipeline, &self.color_bgl,
-            &missing_view, size, at.w(),
-        );
-        for &id in &sched.order {
-            let slot = *sched.slot_of.get(&id).unwrap() as usize;
-            let l = graph.get(id).unwrap();
-            self.dispatch_kind(
-                encoder, l, eval_ctx, sched, &self.pool_views, size, slot, at, &missing_view,
-            )?;
-        }
+        self.record_layers(encoder, graph, sched, size, at, eval_ctx)?;
         let src_slot = *sched
             .slot_of
             .get(&layer)
@@ -1060,6 +1051,125 @@ impl Baker {
             domain_of(sched, layer),
         );
         Ok(())
+    }
+
+    /// Dispatch every scheduled layer, each at its own slice.
+    fn record_layers(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        graph: &Graph,
+        sched: &Schedule,
+        size: (u32, u32),
+        at: &dyn Fn(LayerId) -> Slice,
+        eval_ctx: &EvalCtx,
+    ) -> Result<(), BakeError> {
+        let missing_view = self.missing_view.clone().expect("ensure_pool made one");
+        let w = sched.order.first().map_or(texture_graph_core::FLAT_W, |&id| at(id).w());
+        dispatch_missing(
+            &self.ctx, encoder, &self.missing_pipeline, &self.color_bgl, &missing_view, size, w,
+        );
+        for &id in &sched.order {
+            let slot = *sched.slot_of.get(&id).unwrap() as usize;
+            let l = graph.get(id).unwrap();
+            self.dispatch_kind(
+                encoder, l, eval_ctx, sched, &self.pool_views, size, slot, at(id), &missing_view,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The schedule for a sphere bake of `root`, and where each layer
+    /// bakes. See [`crate::sphere`].
+    fn sphere_schedule(
+        graph: &Graph,
+        root: LayerId,
+    ) -> Result<(Schedule, HashMap<LayerId, Placement>), BakeError> {
+        let mut sched = schedule_layer(graph, root)?;
+        let placed = sphere::plan(graph, root)?;
+        // A face covers exactly its own (u, v); an Extend transform's wider
+        // domain is the plane's, and the point map has replaced it.
+        for (&id, at) in &placed {
+            if let Placement::Sphere(_) = at {
+                sched.domain_of.insert(id, Domain::UNIT);
+            }
+        }
+        Ok((sched, placed))
+    }
+
+    /// Bake the graph's color output on the sphere into a cubemap:
+    /// `Rgba8Unorm`, sRGB-encoded and with straight alpha, six array layers
+    /// in the order [`ScalarCube`] documents. Read it back with
+    /// [`crate::read_rgba8_layers`].
+    pub fn bake_color_cube(
+        &mut self,
+        graph: &Graph,
+        face: u32,
+        eval_ctx: &EvalCtx,
+    ) -> Result<ColorCube, BakeError> {
+        let t0 = BakeTimer::start();
+        let eval_ctx = &graph.resolve_params(eval_ctx);
+        let root = graph
+            .output
+            .color
+            .ok_or(BakeError::Unsupported("a color cube of a graph with no color output"))?;
+        let (sched, placed) = Self::sphere_schedule(graph, root)?;
+        let size = (face, face);
+        self.ensure_pool(size, sched.peak_slots.max(1));
+
+        let device = self.ctx.device.clone();
+        let slice = make_output_texture(&device, size, "tg-color-cube-face");
+        let slice_view = slice.create_view(&wgpu::TextureViewDescriptor::default());
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("tg-color-cube"),
+            size: wgpu::Extent3d {
+                width: face,
+                height: face,
+                depth_or_array_layers: texture_graph_core::CUBE_FACES,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let src_slot = *sched.slot_of.get(&root).expect("schedule_layer schedules its root");
+
+        for k in 0..texture_graph_core::CUBE_FACES {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("tg-bake-color-cube"),
+            });
+            let at = |id: LayerId| match placed.get(&id) {
+                Some(Placement::Sphere(map)) => Slice::CubeFace { face: k, map: *map },
+                _ => Slice::Plane { w: texture_graph_core::FLAT_W },
+            };
+            self.record_layers(&mut encoder, graph, &sched, size, &at, eval_ctx)?;
+            dispatch_pack(
+                &self.ctx,
+                &mut encoder,
+                &self.pack_pipeline,
+                &self.pack_bgl,
+                &self.pool_views[src_slot as usize],
+                &slice_view,
+                size,
+                0,
+                [0.0; 4],
+                true,
+                0,
+                Domain::UNIT.packed(),
+            );
+            copy_face(&mut encoder, &slice, &texture, face, k);
+            self.ctx.queue.submit([encoder.finish()]);
+        }
+
+        log::debug!(
+            "bake_color_cube 6×{face}²: layers/face={} record+submit={:?}",
+            sched.order.len(),
+            t0.elapsed(),
+        );
+        Ok(ColorCube { texture, face })
     }
 
     /// Returns a clone (an `Arc` bump) so `self` is not borrowed afterwards.
@@ -1352,6 +1462,7 @@ struct NoiseParams {
     /// 0 for a plane; `k + 1` for cube face `k`.
     face: u32,
     _pad: [u32; 2],
+    point_map: PointMap,
 }
 
 #[repr(C)]
@@ -2069,6 +2180,7 @@ struct CoordinateParams {
     dom: [f32; 4],
     w_coord: f32,
     _pad: [u32; 3],
+    point_map: PointMap,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2082,6 +2194,7 @@ fn dispatch_coordinate(
     size: (u32, u32),
     w: f32,
     face: u32,
+    point_map: PointMap,
     dom: [f32; 4],
 ) {
     let params = CoordinateParams {
@@ -2095,6 +2208,7 @@ fn dispatch_coordinate(
         dom,
         w_coord: w,
         _pad: [0; 3],
+        point_map,
     };
     let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "coordinate-params");
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2155,6 +2269,7 @@ fn dispatch_noise(
     size: (u32, u32),
     w: f32,
     face: u32,
+    point_map: PointMap,
     dom: [f32; 4],
 ) {
     let dims = match n.dims {
@@ -2198,6 +2313,7 @@ fn dispatch_noise(
         kernel,
         face,
         _pad: [0; 2],
+        point_map,
     };
     let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "noise-params");
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2642,6 +2758,30 @@ fn make_scalar_texture(
             | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     })
+}
+
+fn copy_face(
+    encoder: &mut wgpu::CommandEncoder,
+    face_texture: &wgpu::Texture,
+    cube: &wgpu::Texture,
+    face: u32,
+    k: u32,
+) {
+    encoder.copy_texture_to_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: face_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyTextureInfo {
+            texture: cube,
+            mip_level: 0,
+            origin: wgpu::Origin3d { x: 0, y: 0, z: k },
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::Extent3d { width: face, height: face, depth_or_array_layers: 1 },
+    );
 }
 
 fn make_scalar_cube_texture(

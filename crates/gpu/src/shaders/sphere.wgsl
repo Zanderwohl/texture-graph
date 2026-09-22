@@ -18,6 +18,13 @@ fn cube_direction(face: u32, u: f32, v: f32) -> vec3<f32> {
     }
 }
 
+// Rows of the affine map a sphere bake pushes down from a Transform: the
+// point that `p` moves to. The identity everywhere else.
+fn map_point(m: array<vec4<f32>, 3>, p: vec3<f32>) -> vec3<f32> {
+    let h = vec4<f32>(p, 1.0);
+    return vec3<f32>(dot(m[0], h), dot(m[1], h), dot(m[2], h));
+}
+
 fn sample_point(face: u32, dom: vec4<f32>, gid: vec2<u32>, size: vec2<u32>, w: f32) -> vec3<f32> {
     let u = dom.x + (f32(gid.x) + 0.5) / f32(size.x) * dom.z;
     let v = dom.y + (f32(gid.y) + 0.5) / f32(size.y) * dom.w;

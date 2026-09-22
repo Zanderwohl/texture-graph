@@ -343,3 +343,102 @@ fn volume_bake_carries_the_height_under_a_height_to_normal() {
         .unwrap();
     assert!(baker.bake_volume(&g, R, R, &EvalCtx::default()).unwrap().bump.is_none());
 }
+
+/// A Map through a ColorRamp palette, over noise moved by a Transform: the
+/// palette bakes on a plane and the Transform's map moves the noise's points.
+#[test]
+fn a_color_cube_holds_the_cpu_color_through_a_palette_and_a_transform() {
+    use texture_graph_core::{ColorInput, ColorRamp, ColorStop, Map, color::to_srgb8};
+    const FACE: u32 = 32;
+    let mut g = Graph::new();
+    let n = g
+        .add_layer(
+            "n",
+            LayerKind::Noise(Noise {
+                dims: NoiseDims::D3,
+                frequency: 2.3,
+                fractal: Fractal { octaves: 3, ..Default::default() },
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    let moved = g
+        .add_layer(
+            "moved",
+            LayerKind::Transform(Transform {
+                source: Some(n),
+                offset: [0.1, 0.5, 0.2],
+                rotate_uv: 0.4,
+                scale: [1.0, 1.8, 0.7],
+                coord_mode: CoordMode::Passthrough,
+                edge_mode: EdgeMode::Extend,
+            }),
+        )
+        .unwrap();
+    let stop = |t, l, c, h| ColorStop { t, color: ColorInput::Const(oklcha(l, c, h, 1.0)) };
+    let ramp = g
+        .add_layer(
+            "ramp",
+            LayerKind::ColorRamp(ColorRamp {
+                stops: vec![stop(0.0, 0.3, 0.05, 250.0), stop(1.0, 0.8, 0.1, 60.0)],
+                space: BlendSpace::Oklch,
+            }),
+        )
+        .unwrap();
+    let out = g
+        .add_layer("out", LayerKind::Map(Map { value: Some(moved), palette: Some(ramp) }))
+        .unwrap();
+    g.output.color = Some(out);
+
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let cube = Baker::new(ctx.clone())
+        .bake_color_cube(&g, FACE, &EvalCtx::default())
+        .expect("bake_color_cube");
+    let img = crate::read_rgba8_layers(&ctx, &cube.texture, (FACE, FACE, 6));
+
+    let mut worst = 0u8;
+    for face in 0..6 {
+        for y in 0..FACE {
+            for x in 0..FACE {
+                let (u, v) = ((x as f32 + 0.5) / FACE as f32, (y as f32 + 0.5) / FACE as f32);
+                let want =
+                    to_srgb8(eval::evaluate(&g, out, cube_sample(face, u, v), &EvalCtx::default()));
+                let got = img.pixel(x, face * FACE + y).unwrap();
+                for c in 0..3 {
+                    worst = worst.max(got[c].abs_diff(want[c]));
+                }
+            }
+        }
+    }
+    // The GPU reads the palette from texels and interpolates between them.
+    assert!(worst <= 3, "worst channel delta over the sphere: {worst}");
+}
+
+/// Two Transforms reaching one noise would need it baked twice.
+#[test]
+fn a_sphere_bake_refuses_a_layer_moved_two_ways() {
+    let mut g = Graph::new();
+    let n = g.add_layer("n", LayerKind::Noise(Noise::default())).unwrap();
+    let moved = |g: &mut Graph, name, s| {
+        g.add_layer(
+            name,
+            LayerKind::Transform(Transform {
+                source: Some(n),
+                offset: [0.0; 3],
+                rotate_uv: 0.0,
+                scale: [s; 3],
+                coord_mode: CoordMode::Passthrough,
+                edge_mode: EdgeMode::Extend,
+            }),
+        )
+        .unwrap()
+    };
+    let a = moved(&mut g, "a", 2.0);
+    let b = moved(&mut g, "b", 3.0);
+    let both = blend(&mut g, "both", a, b, 0.5);
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let refused = Baker::new(ctx)
+        .bake_scalar_cube(&g, both, 8, ScalarFormat::R8Unorm, &EvalCtx::default())
+        .err();
+    assert!(matches!(refused, Some(BakeError::Unsupported(_))), "got {refused:?}");
+}

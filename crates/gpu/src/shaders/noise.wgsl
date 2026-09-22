@@ -25,9 +25,10 @@ struct NoiseParams {
     normalize: u32,       // 0 = raw sum, 1 = divide by the amplitude sum
     kernel: u32,          // 0=Simplex, 1=Value
     face: u32,            // 0 = plane; k + 1 = cube face k. See sphere.wgsl.
-    // Scalars, not a vec2: the struct must stay 96 bytes to match Rust.
+    // Scalars, not a vec2: the Rust layout puts point_map at byte 96.
     _pad1: u32,
     _pad2: u32,
+    point_map: array<vec4<f32>, 3>,
 }
 
 // Mirrors `core::noise::MAX_OCTAVES`. Bounds the loop so a bad uniform
@@ -345,7 +346,7 @@ const CHROMA_SCALE: f32 = 0.15;
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.size.x || gid.y >= params.size.y) { return; }
-    let p = sample_point(params.face, params.dom, gid.xy, params.size, params.w_coord);
+    let p = map_point(params.point_map, sample_point(params.face, params.dom, gid.xy, params.size, params.w_coord));
     let u = p.x;
     let v = p.y;
     let w = p.z;

@@ -17,14 +17,15 @@ pub mod device;
 pub mod readback;
 pub mod scene;
 pub mod schedule;
+mod sphere;
 
 pub use baker::{
-    BakeError, BakeOutput, Baker, ScalarCube, ScalarFormat, ScalarVolume, SolidBump, VolumeJob,
+    BakeError, BakeOutput, Baker, ColorCube, ScalarCube, ScalarFormat, ScalarVolume, SolidBump, VolumeJob,
     VolumeOutput,
 };
 pub use device::DeviceCtx;
 pub use readback::{
-    Image, ScalarImage, read_rgba8, read_rgba8_async, read_scalar, read_scalar_async,
+    Image, ScalarImage, read_rgba8, read_rgba8_async, read_rgba8_layers, read_rgba8_layers_async, read_scalar, read_scalar_async,
     read_scalar_volume, read_scalar_volume_async,
 };
 pub use scene::{SceneBackground, SceneCamera, SceneLayer, SceneMaterial, SceneRenderer, SceneShape};
