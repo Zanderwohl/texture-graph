@@ -99,13 +99,16 @@ fn earthlike() -> Graph {
     let aridity = b.weighted_sum("aridity", &[(arid_belt, 0.55), (moisture, 0.8), (arid_param, 1.0)]);
     let desert = b.remap("desert", aridity, 0.8, 0.92);
 
+    // Deep ocean to cloud is kept to about 3.5 stops, the look of a photograph of
+    // Earth rather than its true 6: a renderer with a narrow tone window clips a
+    // darker ocean to black.
     let ocean_palette = b.ramp(
         "ocean palette",
         &[
-            (0.0, oklcha(0.22, 0.07, 262.0, 1.0)),
-            (0.7, oklcha(0.31, 0.09, 250.0, 1.0)),
-            (0.93, oklcha(0.42, 0.10, 232.0, 1.0)),
-            (1.0, oklcha(0.56, 0.09, 205.0, 1.0)),
+            (0.0, oklcha(0.42, 0.08, 258.0, 1.0)),
+            (0.7, oklcha(0.47, 0.09, 248.0, 1.0)),
+            (0.93, oklcha(0.55, 0.10, 230.0, 1.0)),
+            (1.0, oklcha(0.64, 0.09, 205.0, 1.0)),
         ],
     );
     let ocean_color = b.map("ocean color", depth, ocean_palette);
@@ -113,13 +116,13 @@ fn earthlike() -> Graph {
         "lush palette",
         &[
             (0.0, oklcha(0.70, 0.06, 90.0, 1.0)),
-            (0.02, oklcha(0.50, 0.10, 138.0, 1.0)),
-            (0.25, oklcha(0.43, 0.09, 132.0, 1.0)),
-            (0.5, oklcha(0.47, 0.06, 95.0, 1.0)),
-            (0.72, oklcha(0.50, 0.04, 60.0, 1.0)),
-            (0.86, oklcha(0.60, 0.015, 60.0, 1.0)),
-            (0.93, oklcha(0.94, 0.005, 240.0, 1.0)),
-            (1.0, oklcha(0.97, 0.0, 0.0, 1.0)),
+            (0.02, oklcha(0.54, 0.10, 138.0, 1.0)),
+            (0.25, oklcha(0.50, 0.09, 132.0, 1.0)),
+            (0.5, oklcha(0.53, 0.06, 95.0, 1.0)),
+            (0.72, oklcha(0.55, 0.04, 60.0, 1.0)),
+            (0.86, oklcha(0.64, 0.015, 60.0, 1.0)),
+            (0.93, oklcha(0.90, 0.005, 240.0, 1.0)),
+            (1.0, oklcha(0.92, 0.0, 0.0, 1.0)),
         ],
     );
     let lush = b.map("lush", elevation, lush_palette);
@@ -130,8 +133,8 @@ fn earthlike() -> Graph {
             (0.3, oklcha(0.72, 0.09, 72.0, 1.0)),
             (0.6, oklcha(0.58, 0.09, 50.0, 1.0)),
             (0.86, oklcha(0.55, 0.04, 50.0, 1.0)),
-            (0.93, oklcha(0.94, 0.005, 240.0, 1.0)),
-            (1.0, oklcha(0.97, 0.0, 0.0, 1.0)),
+            (0.93, oklcha(0.90, 0.005, 240.0, 1.0)),
+            (1.0, oklcha(0.92, 0.0, 0.0, 1.0)),
         ],
     );
     let arid = b.map("arid", elevation, arid_palette);
@@ -145,7 +148,7 @@ fn earthlike() -> Graph {
         &[(abs_lat, 1.0), (ice_noise, 0.22), (elevation, 0.12), (ice_param, 1.0)],
     );
     let ice = b.remap("ice", ice_drive, 0.97, 1.0);
-    let ice_color = b.gray_color("ice color", oklcha(0.95, 0.01, 230.0, 1.0));
+    let ice_color = b.gray_color("ice color", oklcha(0.91, 0.01, 230.0, 1.0));
     let color = b.blend("color", ground, ice_color, ice);
 
     let water_rough = b.gray("water roughness", 0.22);
@@ -187,9 +190,9 @@ fn earthlike_clouds() -> Graph {
     let palette = b.ramp(
         "cloud palette",
         &[
-            (0.0, oklcha(0.97, 0.0, 0.0, 0.0)),
-            (0.4, oklcha(0.95, 0.0, 0.0, 0.45)),
-            (1.0, oklcha(0.99, 0.0, 0.0, 0.92)),
+            (0.0, oklcha(0.92, 0.0, 0.0, 0.0)),
+            (0.4, oklcha(0.91, 0.0, 0.0, 0.45)),
+            (1.0, oklcha(0.94, 0.0, 0.0, 0.92)),
         ],
     );
     let color = b.map("clouds", density, palette);
@@ -227,7 +230,7 @@ fn marslike() -> Graph {
     let palette = b.ramp_inputs(
         "rust palette",
         &[
-            (0.0, ColorInput::Const(oklcha(0.40, 0.07, 38.0, 1.0))),
+            (0.0, ColorInput::Const(oklcha(0.46, 0.07, 38.0, 1.0))),
             (0.35, ColorInput::Const(oklcha(0.56, 0.12, 44.0, 1.0))),
             (0.6, ColorInput::Param("dust".into())),
             (1.0, ColorInput::Const(oklcha(0.74, 0.10, 64.0, 1.0))),
@@ -240,10 +243,10 @@ fn marslike() -> Graph {
     let dark_param = b.param_gray("dark level", "dark");
     let dark_drive = b.weighted_sum("dark drive", &[(albedo, 1.0), (elevation, -0.25), (dark_param, 1.0)]);
     let dark = b.remap("dark", dark_drive, 0.45, 0.55);
-    let basalt = b.gray_color("basalt", oklcha(0.36, 0.045, 38.0, 1.0));
+    let basalt = b.gray_color("basalt", oklcha(0.43, 0.045, 38.0, 1.0));
     let dark_mix = b.scale("dark amount", dark, 0.65);
     let ground = b.blend("ground", rust, basalt, dark_mix);
-    let canyon_shade = b.gray_color("canyon floor", oklcha(0.33, 0.07, 32.0, 1.0));
+    let canyon_shade = b.gray_color("canyon floor", oklcha(0.40, 0.07, 32.0, 1.0));
     let canyon_mix = b.scale("canyon amount", canyons, 0.6);
     let ground = b.blend("ground with canyons", ground, canyon_shade, canyon_mix);
 
