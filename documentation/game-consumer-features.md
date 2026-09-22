@@ -54,7 +54,7 @@ have yet, in the order it blocks work.
 
 ```rust
 pub enum NoiseKernel {
-    /// Gustavson simplex. Today's behaviour; the default a file without the
+    /// Gustavson simplex. Today's behavior; the default a file without the
     /// field loads as.
     Simplex,
     /// Trilinear value noise on an integer lattice, smoothstep weights.
@@ -86,7 +86,7 @@ contract, the CPU and WGSL kernels are twins and must land in the same commit. T
 hash matters: use an integer hash, not a float one, so the two sides are
 bit-exact rather than within-one-sRGB-step. The consumer's plume hash is a good
 one — `(x, y, z mod period)` mixed with 1597334677 / 3812015801 / 2654435761, then
-the xor-shift finaliser `>>15 *2246822519`, `>>13 *3266489917`, `>>16`.
+the xor-shift finalizer `>>15 *2246822519`, `>>13 *3266489917`, `>>16`.
 
 **Test:** `f(x) == f(x + period / frequency)` exactly, on both backends, and the
 existing `cpu_and_gpu_noise_agree` extended over the new kernel.
@@ -213,7 +213,7 @@ impl Baker {
         ctx: &EvalCtx,
     ) -> Result<wgpu::Texture, BakeError>;
 
-    /// The same over a volume. `res³` sampled at slice centres, as bake_volume.
+    /// The same over a volume. `res³` sampled at slice centers, as bake_volume.
     pub fn bake_scalar_volume(
         &mut self,
         graph: &Graph,

@@ -7,11 +7,10 @@
 //! Oklcha; only the four final PBR channels are packed to `Rgba8UnormSrgb`
 //! and handed back for display.
 //!
-//! This crate stays independent of eframe/egui — the UI crate re-registers
-//! the returned `wgpu::Texture`s via `egui_wgpu::Renderer::register_native_texture`.
-//! `examples/bake.rs` is the headless path end to end, and is what keeps that
-//! independence honest: it compiles under `cargo test`, so a stray editor
-//! dependency would break the build rather than go unnoticed.
+//! This crate does not depend on eframe/egui; the UI crate registers the
+//! returned `wgpu::Texture`s with `egui_wgpu::Renderer::register_native_texture`.
+//! `examples/bake.rs` compiles under `cargo test`, so an editor dependency
+//! added here breaks the build.
 
 pub mod baker;
 pub mod device;

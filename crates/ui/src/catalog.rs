@@ -1,11 +1,8 @@
-//! The node catalog the editor offers: what the add-node menu and the
-//! variant switcher list, in what order, and what a new node starts as.
+//! The node catalog: what the add-node menu and the variant switcher list,
+//! in what order, and what a new node starts as.
 //!
-//! Separate from [`texture_graph_core::LayerKind`] on purpose. That type
-//! says what a node *is*; this one says what the menu calls it and what it
-//! looks like untouched, which is an editor question — a Noise node at
-//! frequency 4.0 is a nicer first impression than one at 0.0, and neither
-//! is more correct.
+//! Kept apart from [`texture_graph_core::LayerKind`] because menu labels and
+//! starting values are editor choices, not properties of the node.
 
 use texture_graph_core::color::oklcha;
 use texture_graph_core::{
@@ -17,14 +14,12 @@ use texture_graph_core::{
 
 /// One entry in the add-node menu and the variant switcher.
 pub struct Variant {
-    /// Menu text.
     pub label: &'static str,
     /// Matched instead of the label, so editing menu text can't change what
     /// an entry adds.
     pub kind: Kind,
 }
 
-/// The node an entry adds, independent of what the menu calls it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Kind {
     Color,
@@ -41,10 +36,9 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// Exhaustive over [`LayerKind`], so a new kind in core won't compile
-    /// without an answer here, and
-    /// [`tests::every_kind_is_offered_in_the_menu`] then forces it into
-    /// [`VARIANTS`].
+    /// Exhaustive over [`LayerKind`] so a new kind in core must be added
+    /// here; [`tests::every_kind_is_offered_in_the_menu`] then forces it
+    /// into [`VARIANTS`].
     pub fn of(kind: &LayerKind) -> Kind {
         match kind {
             LayerKind::Color(_) => Kind::Color,
@@ -62,11 +56,8 @@ impl Kind {
     }
 }
 
-/// Every node the editor offers, in menu order.
-///
-/// Flat rather than grouped: eleven entries still fit in one menu, and five
-/// submenus of two would cost a hover and a pointer trip to reach any of
-/// them. Group them when the catalog outgrows a single list.
+/// Menu order. Flat rather than grouped while the list fits in one menu,
+/// since submenus cost an extra hover per entry.
 pub const VARIANTS: &[Variant] = &[
     Variant { label: "Color", kind: Kind::Color },
     Variant { label: "Noise", kind: Kind::Noise },
@@ -81,11 +72,8 @@ pub const VARIANTS: &[Variant] = &[
     Variant { label: "Coordinate", kind: Kind::Coordinate },
 ];
 
-/// What a node of this variant looks like the moment it is added.
-///
-/// Layer inputs start unconnected (`None`) — they render as the
-/// missing-texture grid until the user picks a source, and can never trip
-/// the cycle check on creation.
+/// Layer inputs start unconnected so creation can never trip the cycle
+/// check.
 pub fn default_kind(kind: Kind) -> LayerKind {
     match kind {
         Kind::Color => LayerKind::Color(oklcha(0.5, 0.0, 0.0, 1.0)),
@@ -146,9 +134,7 @@ pub fn unique_name(graph: &Graph, base: &str) -> String {
 mod tests {
     use super::*;
 
-    /// A default built for the wrong variant is invisible: the menu entry
-    /// says one thing and adds another, and the inspector then shows the
-    /// switcher pointing somewhere the user did not click.
+    /// Otherwise a menu entry silently adds a different node than it names.
     #[test]
     fn every_default_is_the_variant_it_was_asked_for() {
         for v in VARIANTS {
@@ -161,10 +147,7 @@ mod tests {
         }
     }
 
-    /// `Kind::of` is exhaustive over `LayerKind`, so the compiler catches a
-    /// new node kind that has no `Kind`. Nothing catches one that has a
-    /// `Kind` but never made it into the menu — it would simply be
-    /// unaddable, with no error anywhere.
+    /// A `Kind` missing from `VARIANTS` would be unaddable, with no error.
     #[test]
     fn every_kind_is_offered_in_the_menu() {
         const ALL: &[Kind] = &[
@@ -189,8 +172,7 @@ mod tests {
         assert_eq!(VARIANTS.len(), ALL.len(), "a variant is listed twice");
     }
 
-    /// Every default has to be addable, or the menu offers nodes the graph
-    /// refuses.
+    /// Otherwise the menu offers nodes the graph refuses.
     #[test]
     fn every_default_can_actually_be_added() {
         let mut graph = Graph::new();

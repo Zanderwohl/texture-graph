@@ -1,4 +1,4 @@
-//! Labelled enum combo, shared by the inspector and the graph canvas.
+//! Labeled enum combo, shared by the inspector and the graph canvas.
 
 /// `id_salt` must uniquely identify this widget's slot (typically
 /// `(layer_id.0, "field")`) so egui's per-widget memory doesn't bleed

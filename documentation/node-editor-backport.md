@@ -95,7 +95,7 @@ choice (the parity test skips out-of-gamut samples and says so).
 
 **What cannot go exact here at all:** tolerances like the extend-transform
 test's `max_delta <= 14` are not arithmetic. The GPU bakes into intermediate
-textures and resamples them at texel centres while the CPU evaluates
+textures and resamples them at texel centers while the CPU evaluates
 analytically. MBG's flat-buffer compute design makes that cell-for-cell exact;
 our render-to-texture pipeline does not, and closing it would mean the kernel
 rewrite described above.
@@ -397,9 +397,9 @@ subtitle. That one is the model describing itself and is fine where it is.
 `wires::eligible(graph, node, src) -> bool` became
 `wires::refusal(graph, node, src) -> Option<String>`. Both the socket ring
 (`socket_style` / `output_socket_style` in `nodes.rs`) and the drop-time status
-message read from it, so the colour and the sentence cannot disagree about
+message read from it, so the color and the sentence cannot disagree about
 what is wrong — previously the message was a hardcoded string sitting a hundred
-lines away from the check that decided the colour.
+lines away from the check that decided the color.
 
 **A cycle is still the only thing a wire drop can be refused for**, and that is
 a fact about the model rather than a gap here. `Graph::set_kind` can return

@@ -1,14 +1,13 @@
 // Shared WGSL helpers: Oklch <-> Oklab <-> LinSrgb <-> sRGB.
 //
-// Constants match Björn Ottosson's original Oklab publication and match
-// `palette`'s implementation to within f32 ULP. The CPU-vs-GPU diff harness
-// uses a 1/255 tolerance which absorbs any residual difference.
+// Constants are Ottosson's Oklab constants; they match `palette` to within
+// an f32 ULP, well inside the 1/255 CPU-vs-GPU test tolerance.
 
 const PI: f32 = 3.14159265358979323846;
 const DEG_TO_RAD: f32 = PI / 180.0;
 const RAD_TO_DEG: f32 = 180.0 / PI;
 
-// Oklcha (l, chroma, hue-degrees, alpha) as stored in intermediate textures.
+// (l, chroma, hue in degrees, alpha), as stored in intermediate textures.
 struct Oklcha {
     l: f32,
     c: f32,
@@ -24,12 +23,10 @@ fn oklcha_to_vec4(c: Oklcha) -> vec4<f32> {
     return vec4<f32>(c.l, c.c, c.h_deg, c.a);
 }
 
-// Perceptual scalar-from-color rule; matches core::color::scalar_of.
+// Must match core::color::scalar_of.
 fn scalar_of(v: vec4<f32>) -> f32 {
     return v.x;
 }
-
-// --- Oklch <-> Oklab ---------------------------------------------------
 
 fn oklch_to_oklab(l: f32, c: f32, h_deg: f32) -> vec3<f32> {
     let h_rad = h_deg * DEG_TO_RAD;
@@ -42,8 +39,6 @@ fn oklab_to_oklch(l: f32, a: f32, b: f32) -> vec3<f32> {
     if (h < 0.0) { h = h + 360.0; }
     return vec3<f32>(l, c, h);
 }
-
-// --- Oklab <-> Linear sRGB (Ottosson constants) ------------------------
 
 fn oklab_to_linear_srgb(l: f32, a: f32, b: f32) -> vec3<f32> {
     let l_ = l + 0.3963377774 * a + 0.2158037573 * b;
@@ -73,8 +68,6 @@ fn linear_srgb_to_oklab(r: f32, g: f32, b: f32) -> vec3<f32> {
     );
 }
 
-// --- Linear sRGB <-> sRGB (piecewise gamma) ----------------------------
-
 fn linear_to_srgb_component(x: f32) -> f32 {
     let clamped = clamp(x, 0.0, 1.0);
     if (clamped <= 0.0031308) {
@@ -92,7 +85,7 @@ fn linear_to_srgb(lin: vec3<f32>) -> vec3<f32> {
     );
 }
 
-// Oklcha (unclamped) -> sRGB8-ready floats [0,1] with alpha preserved.
+// Unclamped Oklcha to sRGB in [0, 1], alpha kept.
 fn oklcha_to_srgb(v: vec4<f32>) -> vec4<f32> {
     let l_clamped = clamp(v.x, 0.0, 1.0);
     let c_clamped = max(v.y, 0.0);

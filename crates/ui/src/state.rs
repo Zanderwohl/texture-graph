@@ -2,8 +2,7 @@
 //!
 //! Panels render against a shared `&Graph`, so edits become `EditCmd`s on
 //! [`UiState::pending`] rather than mutations. The app drains them once every
-//! panel has drawn, which keeps the borrow checker happy and puts error
-//! handling in one place.
+//! panel has drawn, so error handling is in one place.
 
 use std::collections::{HashMap, HashSet};
 
@@ -18,8 +17,8 @@ pub struct UiState {
     pub last_loaded_name: Option<String>,
     /// Read by the preview panel to decide whether to re-bake.
     pub dirty: bool,
-    /// Anything cached from what the graph *produces* is good for one
-    /// revision, so a cache stores this alongside what it computed.
+    /// Bumped by edits that change evaluation. Caches of graph output store
+    /// the revision they were computed at.
     pub revision: u64,
     /// Layers whose thumbnails the last frame's edits could have changed,
     /// consumers folded in. `None` means all of them.
@@ -74,8 +73,8 @@ pub struct RampDrag {
     pub node: LayerId,
     /// Follows a crossing swap, which reorders the stops vec.
     pub stop: usize,
-    /// `stop_t - pointer_t` at press. Fixed for the drag, so an indicator
-    /// grabbed off-centre travels with the cursor instead of snapping to it.
+    /// `stop_t - pointer_t` at press, so an indicator grabbed off-center
+    /// does not snap to the cursor.
     pub grab_dt: f32,
 }
 
@@ -87,28 +86,23 @@ pub struct RampMenu {
     pub stop: usize,
 }
 
-/// A wire drag. Which end the pointer grabbed decides only what the drag
-/// hunts for; the connection it makes is the same either way.
+/// The end grabbed decides only what the drag looks for; the connection it
+/// makes is the same either way.
 #[derive(Copy, Clone, Debug)]
 pub enum WireDrag {
-    /// Pulled from an output; looking for an input to land on.
     FromOutput {
         src: LayerId,
-        /// Set when the drag started by pulling an existing wire off an
-        /// input. That edge is hidden while dragging; no `EditCmd` fires
-        /// until drop, so a cancelled drag causes zero rebakes.
+        /// Set when an existing wire was pulled off an input. The edge is
+        /// hidden while dragging, and no `EditCmd` fires until drop, so a
+        /// canceled drag causes no rebake.
         detached_from: Option<(NodeRef, InputKey)>,
     },
-    /// Pulled from an *unconnected* input; looking for an output.
-    ///
-    /// Only unconnected inputs start this: dragging a connected one means
-    /// "take this wire off", which is [`WireDrag::FromOutput`] with the far
-    /// end still anchored.
+    /// Only from an unconnected input. Dragging a connected one detaches
+    /// its wire, which is [`WireDrag::FromOutput`].
     FromInput { node: NodeRef, key: InputKey },
 }
 
 impl WireDrag {
-    /// The edge this drag detached, hidden until the drop resolves.
     pub fn detached_from(self) -> Option<(NodeRef, InputKey)> {
         match self {
             WireDrag::FromOutput { detached_from, .. } => detached_from,
@@ -233,8 +227,7 @@ impl UiState {
         if evaluated {
             self.revision += 1;
         }
-        // Cleared by the next edit that lands, so a refusal doesn't sit in
-        // the status row describing something long since worked around.
+        // A refusal stays shown until an edit lands cleanly.
         if changed && !refused {
             self.last_error = None;
         }
@@ -254,7 +247,6 @@ impl UiState {
         self.saved_consts.clear();
         self.ctx_menu_world = None;
         self.preview_target = None;
-        // Nothing baked from the old graph is about anything in this one.
         self.dirty_previews = None;
     }
 
@@ -332,7 +324,6 @@ fn dirty_roots(cmd: &EditCmd) -> Option<Vec<LayerId>> {
     match cmd {
         EditCmd::AddLayer { .. } => Some(Vec::new()),
         EditCmd::Remove(id) | EditCmd::SetKind(id, _) => Some(vec![*id]),
-        // No thumbnail of its own, and nothing reads it.
         EditCmd::SetOutput(_) => Some(Vec::new()),
         // Layout only; `affects_evaluation` means these never get here, but
         // a total match forces a new command to state its answer.
@@ -345,8 +336,7 @@ fn dirty_roots(cmd: &EditCmd) -> Option<Vec<LayerId>> {
         // The ids either side of this aren't about the same layers.
         EditCmd::Replace(_) => None,
         // A parameter can be read anywhere, and `remove_param` rewrites
-        // sockets across the graph. Cheaper to rebake than to work out
-        // which layers were touched.
+        // sockets across the graph; rebaking all is cheaper than tracking.
         EditCmd::DeclareParam(_)
         | EditCmd::SetParamDecl(_, _)
         | EditCmd::RenameParam { .. }
@@ -488,9 +478,8 @@ mod tests {
         assert!(dirty.contains(&reader), "the layer left pointing at nothing kept its picture");
     }
 
-    /// Dragging emits a position command every frame; counting those would
-    /// rebake every thumbnail for the length of the drag,
-    /// and the revision counter has to respect it too.
+    /// Dragging emits a position command every frame; counting it as an
+    /// evaluation change would rebake thumbnails for the whole drag.
     #[test]
     fn moving_a_node_is_not_an_evaluation_change() {
         let mut graph = Graph::new();

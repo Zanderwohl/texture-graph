@@ -7,8 +7,7 @@
 
 use std::sync::Arc;
 
-/// Wrapper around the wgpu handles the baker needs. Cheap to clone —
-/// wgpu resources are `Arc`-backed under the hood.
+/// The wgpu handles the baker needs. Cheap to clone.
 #[derive(Clone)]
 pub struct DeviceCtx {
     pub adapter: Arc<wgpu::Adapter>,
@@ -17,10 +16,8 @@ pub struct DeviceCtx {
 }
 
 impl DeviceCtx {
-    /// Build a `DeviceCtx` from handles the caller already owns (e.g. the
-    /// ones eframe hands out in `CreationContext::wgpu_render_state`).
-    /// The wgpu `Instance` is not required — it's only used during initial
-    /// adapter enumeration.
+    /// Wrap handles the caller already owns, e.g. from eframe's
+    /// `CreationContext::wgpu_render_state`. No `Instance` is needed.
     pub fn from_shared(
         adapter: Arc<wgpu::Adapter>,
         device: Arc<wgpu::Device>,
@@ -29,8 +26,7 @@ impl DeviceCtx {
         Self { adapter, device, queue }
     }
 
-    /// Async headless init. Picks a HighPerformance adapter with no surface.
-    /// Used by unit tests and any future CLI bake tool.
+    /// Picks a high-performance adapter with no surface.
     pub async fn request_headless() -> Result<Self, DeviceInitError> {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = wgpu::Backends::PRIMARY;

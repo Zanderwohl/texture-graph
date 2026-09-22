@@ -1,13 +1,8 @@
-// LayerKind::Wave. A periodic waveform over a scalar input.
+// LayerKind::Wave. Twin of `eval_wave` / `wave_cycle` in `core::eval`.
+// `sin` differs between backends, so they agree to one sRGB step, not bit
+// for bit.
 //
-// Twin of `eval_wave` / `wave_cycle` in `core::eval`, but NOT under the
-// noise op-order contract: `Sine` is transcendental, so the two backends
-// agree to within one sRGB step rather than bit for bit, and the parity
-// test asserts that looser bound rather than pretending otherwise.
-//
-// `input_is_layer == 0` means the input is a constant and `src` is bound
-// to an arbitrary texture that this shader never reads — the same
-// placeholder trick `mix.wgsl` uses for its factor.
+// When `input_is_layer == 0`, `src` is a placeholder and is not read.
 
 struct WaveParams {
     size: vec2<u32>,
@@ -18,7 +13,7 @@ struct WaveParams {
     input_const: f32,
     input_is_layer: u32,  // 0=Const, 1=Layer
     dom: vec4<f32>,       // own bake domain (min_u, min_v, ext_u, ext_v)
-    dom_input: vec4<f32>, // the input layer's bake domain
+    dom_input: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> params: WaveParams;
@@ -43,9 +38,8 @@ fn dom_texel(dom: vec4<f32>, uv: vec2<f32>, size: vec2<u32>) -> vec2<i32> {
     );
 }
 
-// `x - floor(x)`, spelled out for the same reason core::noise spells it
-// out: Rust's `f32::fract` truncates toward zero and this does not, so a
-// negative input would disagree.
+// Not `fract`: Rust's `f32::fract` truncates toward zero, which differs
+// for negative input.
 fn frac(x: f32) -> f32 {
     return x - floor(x);
 }
@@ -79,7 +73,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var x = params.input_const;
     if (params.input_is_layer == 1u) {
         let uv = dom_uv(params.dom, gid.xy, params.size);
-        // Scalar-from-color is the Oklch L, matching core::color::scalar_of.
+        // L, as core::color::scalar_of.
         x = textureLoad(src, dom_texel(params.dom_input, uv, params.size), 0).x;
     }
 

@@ -15,11 +15,9 @@ use super::{world_to_screen, BOTTOM_PAD, HEADER_H, NODE_WIDTH, RAMP_BAR_H, ROW_H
 pub enum Row {
     /// Socket on the left edge; label and widget when unconnected.
     Socket(InputKey),
-    /// No socket — a literal parameter row.
     Param(ParamRow),
 }
 
-/// Fixed-height literal parameter rows, per kind.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum ParamRow {
     ColorValue,
@@ -32,8 +30,7 @@ pub enum ParamRow {
     /// Only shown for the value kernel — simplex has no lattice to wrap.
     NoisePeriod,
     NoiseOctaves,
-    /// The four rows below only appear once there is more than one octave;
-    /// at one they describe a stack that does not exist.
+    /// This and the next three rows only appear with more than one octave.
     NoiseFractalMode,
     NoiseLacunarity,
     NoiseGain,
@@ -126,10 +123,9 @@ pub fn rows_for(kind: &LayerKind) -> Vec<Row> {
             if matches!(m.mode, BlendMode::Blend) {
                 rows.push(Row::Param(ParamRow::MixSpace));
             }
-            // Only Blend reads the factor, but the socket exists in every
-            // mode and stays a real edge across a mode switch. Hiding an
-            // attached one strands the wire: no anchor to draw it from, and
-            // the inspector hides it too, so nothing could reach it again.
+            // Only Blend reads the factor, but a wired factor stays an edge in
+            // every mode. Without a row its wire has no anchor, and the
+            // inspector hides it too, so nothing could reach it.
             if matches!(m.mode, BlendMode::Blend)
                 || matches!(m.factor, ScalarInput::Layer(_))
             {
@@ -168,7 +164,6 @@ pub fn rows_for(kind: &LayerKind) -> Vec<Row> {
     rows
 }
 
-/// Row table for the material Output pseudo-node.
 pub fn rows_for_output() -> Vec<Row> {
     vec![
         Row::Socket(InputKey::OutColor),
@@ -178,7 +173,6 @@ pub fn rows_for_output() -> Vec<Row> {
     ]
 }
 
-/// Display label next to a socket circle.
 pub fn socket_label(key: InputKey) -> &'static str {
     match key {
         InputKey::TransformSource | InputKey::H2nSource | InputKey::WarpSource => "source",
@@ -200,7 +194,7 @@ pub fn socket_label(key: InputKey) -> &'static str {
 /// One input socket resolved to screen geometry.
 pub struct SocketLayout {
     pub key: InputKey,
-    /// Circle centre, on the left edge and centred in its row.
+    /// Circle center, on the left edge and centerd in its row.
     pub center: egui::Pos2,
     pub value: SocketValue,
 }
@@ -218,7 +212,6 @@ pub struct NodeLayout {
     pub output_socket: Option<egui::Pos2>,
 }
 
-/// `ROW_H` for everything but the ColorRamp bar.
 pub fn row_height(row: &Row) -> f32 {
     match row {
         Row::Param(ParamRow::RampBar) => RAMP_BAR_H,
@@ -226,7 +219,7 @@ pub fn row_height(row: &Row) -> f32 {
     }
 }
 
-/// Node height in world units for a given row table.
+/// World units.
 pub fn node_height(rows: &[Row], thumb: bool) -> f32 {
     HEADER_H
         + if thumb { THUMB_H } else { 0.0 }
@@ -234,7 +227,6 @@ pub fn node_height(rows: &[Row], thumb: bool) -> f32 {
         + BOTTOM_PAD
 }
 
-/// Build layouts for every layer node plus the Output pseudo-node.
 pub fn compute_layouts(
     graph: &Graph,
     state: &UiState,
@@ -344,12 +336,10 @@ mod tests {
         Axis, BlendMode, ColorInput, ColorStop, CoordMode, Graph, RadialDim, ScalarInput,
     };
 
-    /// The graph's Output as a fresh graph has it.
     fn output() -> texture_graph_core::Output {
         Graph::new().output
     }
 
-    /// The socket keys `rows_for` lays out, in order.
     fn laid_out(kind: &LayerKind) -> Vec<InputKey> {
         rows_for(kind)
             .into_iter()
@@ -360,29 +350,20 @@ mod tests {
             .collect()
     }
 
-    /// The socket keys the model reports, in order.
-    fn modelled(kind: &LayerKind) -> Vec<InputKey> {
+    fn modeled(kind: &LayerKind) -> Vec<InputKey> {
         kind.input_sockets().into_iter().map(|s| s.key).collect()
     }
 
-    /// A socket the layout draws but the model doesn't report has no wire
-    /// anchor, so its edge silently vanishes; a socket the model reports
-    /// but the layout omits cannot be connected at all. Neither shows up as
-    /// an error — the node just quietly loses an input.
-    ///
-    /// Exact equality holds for the catalog's defaults, which is what a
-    /// freshly added node is. It is deliberately *not* the general rule:
-    /// `Mix` reports a factor socket in every mode but only shows a row for
-    /// it when Blend reads it or something is wired to it. The invariant
-    /// that does hold everywhere is
-    /// [`a_connected_socket_always_has_a_row_to_hang_its_wire_on`].
+    /// A socket drawn but not modeled loses its wire; one modeled but not
+    /// drawn cannot be connected. Exact equality holds only for catalog
+    /// defaults, since `Mix` hides an unwired factor outside Blend.
     #[test]
     fn every_node_lays_out_exactly_the_sockets_it_has() {
         for variant in catalog::VARIANTS {
             let kind = catalog::default_kind(variant.kind);
             assert_eq!(
                 laid_out(&kind),
-                modelled(&kind),
+                modeled(&kind),
                 "{} lays out the wrong sockets",
                 variant.label
             );
@@ -401,15 +382,12 @@ mod tests {
                 Row::Param(_) => None,
             })
             .collect();
-        let modelled: Vec<InputKey> =
+        let modeled: Vec<InputKey> =
             output.input_sockets().into_iter().map(|s| s.key).collect();
-        assert_eq!(laid_out, modelled);
+        assert_eq!(laid_out, modeled);
     }
 
-    /// Row labels are written out here rather than read from the model, so
-    /// they can drift from it. A wire labelled "source" landing in a socket
-    /// the model calls "value" is the kind of thing nobody notices until
-    /// they're debugging the wrong node.
+    /// Row labels are written out here, so they can drift from the model's.
     #[test]
     fn socket_labels_say_what_the_model_says() {
         for variant in catalog::VARIANTS {
@@ -429,9 +407,8 @@ mod tests {
         }
     }
 
-    /// Height is meant to be a pure function of the kind. If a conditional
-    /// row were forgotten in `rows_for`, the node would draw a widget
-    /// outside its own body — visible, but only for the kinds that have one.
+    /// A conditional row missing from `rows_for` would draw a widget outside
+    /// the node body.
     #[test]
     fn conditional_rows_change_the_height_they_are_on() {
         // Mix: Blend adds a space row and a factor socket.
@@ -457,9 +434,7 @@ mod tests {
         );
     }
 
-    /// A ColorRamp's sockets are its stops, so adding one has to add a row
-    /// — the keys are positional, and a stop with no row is a stop that
-    /// cannot be wired.
+    /// A stop with no row cannot be wired.
     #[test]
     fn a_ramp_lays_out_one_socket_per_stop() {
         let LayerKind::ColorRamp(mut r) = catalog::default_kind(Kind::ColorRamp) else {
@@ -471,16 +446,11 @@ mod tests {
             color: ColorInput::Const(oklcha(0.5, 0.0, 0.0, 1.0)),
         });
         let kind = LayerKind::ColorRamp(r);
-        assert_eq!(laid_out(&kind), modelled(&kind));
+        assert_eq!(laid_out(&kind), modeled(&kind));
     }
 
-    /// The invariant that survives conditional rows: a socket with a wire
-    /// in it must have somewhere to draw that wire. `Mix` reports its
-    /// factor socket in every mode — `LayerKind::inputs` counts it as a
-    /// dependency and `Graph::remove` scrubs it through `input_sockets` —
-    /// so a factor wired up in Blend and then switched to Add is still a
-    /// real edge. Without a row it has no anchor: it disappears from the
-    /// canvas, the inspector hides it too, and there is no way left to
+    /// A factor wired in Blend and switched to Add is still an edge. Without
+    /// a row it vanishes from the canvas and the inspector, with no way to
     /// reach it.
     #[test]
     fn a_connected_socket_always_has_a_row_to_hang_its_wire_on() {

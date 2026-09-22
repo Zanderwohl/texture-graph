@@ -1,8 +1,5 @@
 //! 3D preview renderer: draws a `BakeOutput` onto a lit sphere, cube or quad
 //! and into an `Rgba8Unorm` texture for egui-wgpu.
-//!
-//! Cook-Torrance BRDF, tangent-space normal mapping, Reinhard tonemap,
-//! gamma-correct sRGB out.
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec3};
@@ -22,22 +19,20 @@ pub enum SceneShape {
 
 /// What the mesh is textured with.
 ///
-/// - `Uv`: 2D channels wrapped by the mesh's UVs.
-/// - `Solid`: 3D volume channels sampled at object-space position, so the
-///   mesh looks carved from the material — no seams, no pole pinching.
+/// - `Uv`: 2D channels mapped by the mesh's UVs.
+/// - `Solid`: 3D volume channels sampled at object-space position, with no
+///   UV seams or pole pinching.
 pub enum SceneMaterial<'a> {
     Uv(&'a BakeOutput),
     Solid(&'a VolumeOutput),
 }
 
-/// Orbit camera and light rig, driven entirely by the caller.
 #[derive(Copy, Clone, Debug)]
 pub struct SceneCamera {
-    /// Spins the model; the camera and lights stay put.
+    /// Rotates the model; the camera and lights stay fixed.
     pub orientation: Quat,
     /// Radians around the model's local X axis, positive tipping toward the camera.
     pub pitch: f32,
-    /// Distance from the model's origin to the camera.
     pub distance: f32,
     /// Vertical field of view, radians.
     pub fov_y: f32,
@@ -60,16 +55,14 @@ struct SceneUniforms {
     view_proj: [[f32; 4]; 4],
     model:     [[f32; 4]; 4],
     camera_pos: [f32; 4],
-    /// Three-point rig: xyz = normalized surface-to-light direction, w = intensity.
+    /// xyz = surface-to-light direction, w = intensity.
     lights: [[f32; 4]; 3],
-    /// xyz = linear ambient tint. w = object-space → texture-space scale
-    /// used by the solid-material variant (`tex = obj_pos * w + 0.5`).
+    /// xyz = linear ambient tint. w = object-to-texture scale for the solid
+    /// variant (`tex = obj_pos * w + 0.5`).
     ambient: [f32; 4],
 }
 
-/// 48-byte packed vertex. Field offsets must stay at (0, 12, 24, 40) to match
-/// what `vertex_attr_array!` computes below: any padding and the GPU reads
-/// normal, tangent and uv from the wrong bytes.
+/// Offsets must stay (0, 12, 24, 40), as `vertex_attr_array!` computes them.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct Vertex {
@@ -86,13 +79,10 @@ struct Mesh {
 }
 
 pub struct SceneRenderer {
-    /// UV-mapped material path (2D channel textures).
     pipeline_uv: wgpu::RenderPipeline,
     bgl_uv:      wgpu::BindGroupLayout,
-    /// Solid material path (3D volume channels sampled by object pos).
     pipeline_solid: wgpu::RenderPipeline,
     bgl_solid:      wgpu::BindGroupLayout,
-    /// Fullscreen transparency-checker background, drawn before the mesh.
     pipeline_bg: wgpu::RenderPipeline,
     sampler:  wgpu::Sampler,
     sphere:   Mesh,
@@ -102,8 +92,6 @@ pub struct SceneRenderer {
 
 impl SceneRenderer {
     pub fn new(device: &wgpu::Device) -> Self {
-        // Both variants share scene_common.wgsl and append their own material
-        // bindings and fs_main.
         let common = include_str!("shaders/scene_common.wgsl");
         let src_uv = format!("{common}{}", include_str!("shaders/scene_uv.wgsl"));
         let src_solid = format!("{common}{}", include_str!("shaders/scene_solid.wgsl"));
@@ -151,8 +139,8 @@ impl SceneRenderer {
         }
     }
 
-    /// Allocate a scene color target. The caller keeps it alive and
-    /// re-registers with egui-wgpu on every recreate.
+    /// The caller keeps it alive and re-registers it with egui-wgpu each time
+    /// it is recreated.
     pub fn make_color_target(&self, device: &wgpu::Device, size: (u32, u32)) -> wgpu::Texture {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some("scene-color"),
@@ -168,7 +156,6 @@ impl SceneRenderer {
         })
     }
 
-    /// Matching depth target, private to the scene pass.
     pub fn make_depth_target(&self, device: &wgpu::Device, size: (u32, u32)) -> wgpu::Texture {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some("scene-depth"),
@@ -182,9 +169,8 @@ impl SceneRenderer {
         })
     }
 
-    /// Render `material` onto `shape` into an existing color+depth pair. The
-    /// caller owns both so they survive across frames; reallocating would
-    /// re-register a texture with egui-wgpu every frame.
+    /// The caller owns the targets so they last across frames and egui-wgpu
+    /// does not re-register a texture every frame.
     pub fn render_into(
         &self,
         ctx: &DeviceCtx,
@@ -200,8 +186,7 @@ impl SceneRenderer {
             SceneShape::Cube   => &self.cube,
             SceneShape::Quad   => &self.quad,
         };
-        // Object-space → [0,1]³ texture-space scale for solid sampling.
-        // Sphere spans [-1,1] (radius 1); cube and quad span [-0.5,0.5].
+        // Sphere spans [-1,1]; cube and quad span [-0.5,0.5].
         let obj_scale = match shape {
             SceneShape::Sphere => 0.5f32,
             SceneShape::Cube | SceneShape::Quad => 1.0f32,
@@ -209,12 +194,9 @@ impl SceneRenderer {
 
         let aspect  = size.0 as f32 / size.1 as f32;
         let proj    = Mat4::perspective_rh(camera.fov_y, aspect, 0.1, 20.0);
-        // Turntable/orbit: the CAMERA stays fixed on the +Z side and
-        // `orientation` spins the MODEL. The three-point rig is world-fixed
-        // around the camera, so the surface facing the viewer is always the
-        // lit one. (Orbiting the camera instead sends the viewer around to
-        // the rig's shadow side for half of every revolution — the model
-        // goes near-black.)
+        // The camera is fixed and `orientation` rotates the model, so the
+        // side facing the viewer is always lit. Orbiting the camera puts the
+        // viewer on the unlit side for half a turn.
         let cam_pos = Vec3::new(
             0.0,
             camera.distance * camera.pitch.sin(),
@@ -295,8 +277,6 @@ impl SceneRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            // Transparency checker first (ignores depth), then the mesh
-            // blends over it.
             pass.set_pipeline(&self.pipeline_bg);
             pass.draw(0..3, 0..1);
             pass.set_pipeline(pipeline);
@@ -309,35 +289,22 @@ impl SceneRenderer {
     }
 }
 
-// ---- Lighting -----------------------------------------------------------
-
-/// Classic three-point studio rig, all pure white with staggered
-/// intensities — as if the same 5600K bulb were mounted on three C-stands.
-///
-/// - **Key**   — front-right, elevated ~35°, strongest.
-/// - **Fill**  — front-left, gentle, roughly half the key's intensity to
-///   fill shadows without erasing form.
-/// - **Back**  — behind the subject, above, offset to the key's side; picks
-///   out the rim without ever hitting the camera-facing surface directly.
-///
-/// Each entry: `[dx, dy, dz, intensity]` where `(dx,dy,dz)` is the
-/// normalized world-space direction FROM the surface TOWARD the light.
+/// White key, fill and rim lights. Each entry is `[dx, dy, dz, intensity]`,
+/// with the world-space direction from the surface toward the light.
 fn three_point_rig() -> [[f32; 4]; 3] {
     let normalize4 = |v: [f32; 3], i: f32| -> [f32; 4] {
         let mag = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
         [v[0] / mag, v[1] / mag, v[2] / mag, i]
     };
     [
-        // Key — right, above, in front.
+        // Key
         normalize4([ 1.0, 0.9,  1.2], 3.2),
-        // Fill — left, slightly above, in front.
+        // Fill
         normalize4([-1.1, 0.3,  0.8], 1.2),
-        // Back / rim — right-behind, high.
+        // Rim
         normalize4([ 0.4, 1.0, -1.3], 2.2),
     ]
 }
-
-// ---- Mesh construction --------------------------------------------------
 
 fn build_mesh(
     device: &wgpu::Device,
@@ -357,9 +324,8 @@ fn build_mesh(
     Mesh { vbuf, ibuf, index_count: src.1.len() as u32 }
 }
 
-/// Latitude/longitude sphere. Poles collapse to a shared vertex per pole,
-/// which pinches the texture there — acceptable for preview. Seam at
-/// theta = 0 = 2π shows as a visible line if the texture doesn't tile.
+/// Latitude/longitude sphere. The texture pinches at the poles and shows a
+/// seam at theta = 0 unless it tiles.
 fn sphere_verts_indices(sectors: u32, rings: u32) -> (Vec<Vertex>, Vec<u32>) {
     let mut verts = Vec::with_capacity(((sectors + 1) * (rings + 1)) as usize);
     for r in 0..=rings {
@@ -371,7 +337,7 @@ fn sphere_verts_indices(sectors: u32, rings: u32) -> (Vec<Vertex>, Vec<u32>) {
             let theta = u * std::f32::consts::TAU;
             let (sin_theta, cos_theta) = theta.sin_cos();
             let pos = [sin_phi * cos_theta, cos_phi, sin_phi * sin_theta];
-            // Tangent along +u = ∂pos/∂theta, normalized.
+            // ∂pos/∂theta, normalized.
             let tangent = [-sin_theta, 0.0, cos_theta];
             verts.push(Vertex {
                 pos,
@@ -389,23 +355,17 @@ fn sphere_verts_indices(sectors: u32, rings: u32) -> (Vec<Vertex>, Vec<u32>) {
             let b = a + 1;
             let c = a + stride;
             let d = c + 1;
-            // CCW winding when viewed from outside. With this
-            // parameterization (+u runs +X → +Z), walking `a → b` moves
-            // along +theta and `a → c` moves down toward the -Y pole, so
-            // the outside-CCW triangles are [a, b, c] and [b, d, c].
-            // ([a, c, b] winds the other way — that renders the sphere
-            // inside-out: near faces culled, camera sees the far
-            // hemisphere. Caught by `scene_test`.)
+            // CCW from outside: `a → b` is +theta (+X toward +Z) and
+            // `a → c` is toward -Y. [a, c, b] renders the sphere inside-out.
             indices.extend_from_slice(&[a, b, c, b, d, c]);
         }
     }
     (verts, indices)
 }
 
-/// 24-vertex cube: 4 vertices per face so each face gets its own normal /
-/// tangent / UV. Winding is CCW as viewed from outside each face.
+/// 4 vertices per face so each face has its own normal, tangent and UV.
 fn cube_verts_indices() -> (Vec<Vertex>, Vec<u32>) {
-    // face: (normal, tangent, quad_corners as (pos, uv))
+    // ((normal, tangent), [(pos, uv); 4])
     let faces: [(([f32; 3], [f32; 3]), [([f32; 3], [f32; 2]); 4]); 6] = [
         // +X
         (
@@ -480,20 +440,15 @@ fn cube_verts_indices() -> (Vec<Vertex>, Vec<u32>) {
                 uv: *uv,
             });
         }
-        // CCW-from-outside triangulation of the quad. Each face's four
-        // corners are laid out (0=BL, 1=BR, 2=TR, 3=TL) from the outside
-        // viewer's POV, so `0 → 1 → 2` and `0 → 2 → 3` walk them
-        // counterclockwise. Matches the pipeline's `front_face: Ccw` +
-        // back-face culling. This is also the sphere's winding pattern.
+        // Corners are BL, BR, TR, TL seen from outside, so this is CCW for
+        // the pipeline's `front_face: Ccw` with back-face culling.
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
     (verts, indices)
 }
 
-/// A 1×1 quad lying flat on the ground: XZ plane at Y = 0, spanning
-/// [-0.5, 0.5] on both axes, normal +Y, tangent +X. Corners and winding
-/// mirror the cube's +Y (top) face, so it's CCW as viewed from above and
-/// its normal-map handedness matches the cube's top.
+/// Same corners and winding as the cube's +Y face, at Y = 0, so its
+/// normal-map handedness matches the cube's top.
 fn quad_verts_indices() -> (Vec<Vertex>, Vec<u32>) {
     let normal = [0.0, 1.0, 0.0];
     let tangent = [1.0, 0.0, 0.0, 1.0];
@@ -526,9 +481,7 @@ fn filterable_texture(
     }
 }
 
-/// Fullscreen transparency-checker background. No bind groups, no vertex
-/// buffers; depth is neither tested nor written so the mesh always draws
-/// over it.
+/// Depth is neither tested nor written, so the mesh always draws over it.
 fn make_bg_pipeline(device: &wgpu::Device) -> wgpu::RenderPipeline {
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("scene-bg-pl"),
@@ -580,9 +533,6 @@ fn make_bg_pipeline(device: &wgpu::Device) -> wgpu::RenderPipeline {
     })
 }
 
-/// Build one scene pipeline variant (UV or solid) from its concatenated
-/// WGSL source. The two variants differ only in the material bindings'
-/// view dimension (D2 vs D3) and their fs_main sampling code.
 fn make_scene_pipeline(
     device: &wgpu::Device,
     shader_src: &str,
@@ -648,9 +598,7 @@ fn make_scene_pipeline(
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: wgpu::TextureFormat::Rgba8Unorm,
-                // Straight-alpha blend so an object-alpha bake shows the
-                // model itself translucent over the scene background.
-                // Opaque materials (alpha = 1) are unaffected.
+                // Lets an object-alpha bake show the model translucent.
                 blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],

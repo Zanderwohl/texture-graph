@@ -1,11 +1,9 @@
 use palette::{Hsv, IntoColor, LinSrgb, Oklch, Srgb, WithAlpha};
 use serde::{Deserialize, Serialize};
 
-/// Working color type. Oklch + alpha, all f32. Values are NOT clamped
-/// between layers — L, C may sit outside their nominal ranges to allow
-/// signed noise, additive octaves, etc. Clamping happens at `Output`.
-///
-/// Hue is stored in degrees via `palette::OklabHue`.
+/// Working color type: Oklch + alpha, hue in degrees. Not clamped between
+/// layers, so L and C may leave their nominal ranges (signed noise, additive
+/// octaves). Clamping happens at [`Output`](crate::Output).
 pub type Color = palette::Oklcha<f32>;
 
 /// Space in which two colors are interpolated.
@@ -13,9 +11,9 @@ pub type Color = palette::Oklcha<f32>;
 pub enum BlendSpace {
     /// Perceptually uniform. Default.
     Oklch,
-    /// Linear-light sRGB — physically correct for optical mixing.
+    /// Linear-light sRGB, physically correct for optical mixing.
     LinearSrgb,
-    /// HSV of gamma-encoded sRGB. Familiar from Photoshop.
+    /// HSV of gamma-encoded sRGB.
     Hsv,
 }
 
@@ -25,8 +23,8 @@ impl Default for BlendSpace {
     }
 }
 
-/// Interpolate `a` and `b` at `t ∈ [0, 1]` in the given space.
-/// `t` is not clamped — extrapolation is allowed.
+/// Interpolate `a` and `b` at `t ∈ [0, 1]`. `t` is not clamped, so this
+/// extrapolates outside that range.
 pub fn blend(a: Color, b: Color, t: f32, space: BlendSpace) -> Color {
     let alpha = lerp(a.alpha, b.alpha, t);
     match space {
@@ -87,15 +85,14 @@ fn lerp_hue_deg(a: f32, b: f32, t: f32) -> f32 {
     a + d * t
 }
 
-/// L component in Oklch — used as a scalar wherever `ScalarInput::Layer`
-/// needs a number from a color. Perceptually linear.
+/// Oklch L, the scalar read from a color by
+/// [`ScalarInput::Layer`](crate::ScalarInput::Layer).
 pub fn scalar_of(c: Color) -> f32 {
     c.l
 }
 
-/// Convert a working Color to 8-bit sRGB for pixel output. Clamps L, C to
-/// display range; alpha is clamped to [0, 1]. Out-of-gamut colors are
-/// clipped by palette's Oklch→sRGB path.
+/// Convert to 8-bit sRGBA, clamping L, C and alpha to display range and
+/// clipping out-of-gamut channels.
 pub fn to_srgb8(c: Color) -> [u8; 4] {
     let clamped = Oklch::new(c.l.clamp(0.0, 1.0), c.chroma.max(0.0), c.hue);
     let srgb: Srgb = clamped.into_color();
@@ -106,14 +103,13 @@ pub fn to_srgb8(c: Color) -> [u8; 4] {
     [r, g, b, a]
 }
 
-/// Convenience: build an Oklcha from L, C, hue-degrees, alpha.
+/// Hue in degrees.
 pub fn oklcha(l: f32, chroma: f32, hue_deg: f32, alpha: f32) -> Color {
     Color::new(l, chroma, hue_deg, alpha)
 }
 
-/// Interpret a "normal vector" (tangent-space, components in [-1, 1]) as a
-/// Color by encoding into sRGB via the standard `n * 0.5 + 0.5` convention
-/// and converting to Oklch storage.
+/// Encode a tangent-space normal (components in [-1, 1]) as sRGB
+/// `n * 0.5 + 0.5`.
 pub fn normal_to_color(n: [f32; 3]) -> Color {
     let s = Srgb::new(n[0] * 0.5 + 0.5, n[1] * 0.5 + 0.5, n[2] * 0.5 + 0.5);
     let ok: Oklch = s.into_color();

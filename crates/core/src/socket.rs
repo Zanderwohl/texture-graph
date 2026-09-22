@@ -48,7 +48,6 @@ impl SocketValue {
             SocketValue::LayerOpt(opt) => *opt,
             SocketValue::Color(ColorInput::Layer(id)) => Some(*id),
             SocketValue::Scalar(ScalarInput::Layer(id)) => Some(*id),
-            // A constant and a parameter are both "not wired to a layer".
             SocketValue::Color(ColorInput::Const(_) | ColorInput::Param(_)) => None,
             SocketValue::Scalar(ScalarInput::Const(_) | ScalarInput::Param(_)) => None,
         }
@@ -90,10 +89,8 @@ pub enum ConstValue {
 fn disconnect_color() -> Color {
     crate::color::oklcha(0.5, 0.0, 0.0, 1.0)
 }
-/// Const value a `ScalarInput` socket falls back to on disconnect.
 const DISCONNECT_SCALAR: f32 = 0.5;
 
-/// Write `target` into a socket slot, returning what was there before.
 fn set_opt(slot: &mut Option<LayerId>, target: Option<LayerId>) -> SocketValue {
     SocketValue::LayerOpt(std::mem::replace(slot, target))
 }
@@ -115,7 +112,7 @@ fn set_scalar(slot: &mut ScalarInput, target: Option<LayerId>) -> SocketValue {
 }
 
 impl LayerKind {
-    /// Ordered list of connectable input sockets (top-to-bottom node order).
+    /// Connectable inputs in top-to-bottom node order.
     pub fn input_sockets(&self) -> Vec<InputSocket> {
         let sock = |key, label, value| InputSocket { key, label, value };
         match self {
@@ -166,10 +163,8 @@ impl LayerKind {
         }
     }
 
-    /// Connect or disconnect one socket. A disconnected
-    /// `ColorInput`/`ScalarInput` falls back to a `Const` default —
-    /// callers that want to restore a previous const value can do so from
-    /// the returned replaced [`SocketValue`].
+    /// Connect or disconnect one socket, returning the replaced value. A
+    /// disconnected `ColorInput`/`ScalarInput` falls back to a `Const` default.
     pub fn set_input(
         &mut self,
         key: InputKey,
@@ -193,8 +188,7 @@ impl LayerKind {
             (LayerKind::Warp(w), InputKey::WarpSource) => Ok(set_opt(&mut w.source, target)),
             (LayerKind::Warp(w), InputKey::WarpBy) => Ok(set_opt(&mut w.by, target)),
             (LayerKind::ColorRamp(r), InputKey::RampStop(i)) => match r.stops.get_mut(i) {
-                // A stop can vanish between drag start and drop (removed in
-                // the inspector) — report it rather than panic.
+                // A stop can be removed in the inspector during a drag.
                 Some(stop) => Ok(set_color(&mut stop.color, target)),
                 None => Err(SocketError::NoSuchSocket),
             },
@@ -203,11 +197,8 @@ impl LayerKind {
     }
 
     /// Bind a `ColorInput`/`ScalarInput` socket to a named parameter.
-    /// Errors on plain-layer sockets.
-    ///
-    /// Whether `name` is declared, and whether its kind suits this socket,
-    /// is [`crate::Graph`]'s business — it holds the declarations, and it
-    /// is the one that has to refuse the edit.
+    /// Errors on plain-layer sockets. Does not check that `name` is declared
+    /// or of a suitable kind; [`crate::Graph`] holds the declarations.
     pub fn set_param(&mut self, key: InputKey, name: impl Into<String>) -> Result<(), SocketError> {
         let name = name.into();
         match (self, key) {
@@ -257,7 +248,7 @@ impl LayerKind {
 }
 
 impl Output {
-    /// The material output's input sockets, top-to-bottom.
+    /// Top-to-bottom order.
     pub fn input_sockets(&self) -> Vec<InputSocket> {
         vec![
             InputSocket {
@@ -283,7 +274,6 @@ impl Output {
         ]
     }
 
-    /// Connect or disconnect one output socket.
     pub fn set_input(
         &mut self,
         key: InputKey,
@@ -404,7 +394,6 @@ mod tests {
     fn set_input_round_trips_every_socket() {
         for mut kind in connected_samples() {
             for sock in kind.clone().input_sockets() {
-                // Rewire to a fresh id.
                 let prev = kind.set_input(sock.key, Some(id(99))).unwrap();
                 assert_eq!(prev.connected_to(), sock.value.connected_to());
                 let read = kind
@@ -414,7 +403,6 @@ mod tests {
                     .unwrap();
                 assert_eq!(read.value.connected_to(), Some(id(99)));
 
-                // Disconnect.
                 kind.set_input(sock.key, None).unwrap();
                 let read = kind
                     .input_sockets()
@@ -469,8 +457,6 @@ mod tests {
             metallic: ScalarInput::Const(0.0),
             normal: None,
         };
-        // Color is nullable like any other input — `None` renders as the
-        // missing-texture grid.
         out.set_input(InputKey::OutColor, None).unwrap();
         assert_eq!(out.color, None);
         out.set_input(InputKey::OutColor, Some(id(2))).unwrap();

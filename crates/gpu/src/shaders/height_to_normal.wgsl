@@ -1,28 +1,21 @@
-// LayerKind::HeightToNormal. Compute a tangent-space normal from a source
-// layer's L channel via central-difference gradient, then encode the normal
-// through the `normal_to_color` path (sRGB → LinSrgb → Oklab → Oklch) so
-// the intermediate texture can flow through any downstream node the same
-// way any other Color-producing layer does.
+// LayerKind::HeightToNormal. Central-difference normal from the source's L,
+// encoded as a color through the `normal_to_color` path.
 //
-// GPU discretization: uses ±1 pixel neighbors regardless of
-// `EvalCtx::normal_epsilon`. The CPU eval uses a floating-point epsilon so
-// the exact numbers differ, but for reasonable bake resolutions the
-// slope direction and magnitude are visually equivalent.
+// Uses ±1 pixel neighbors, not `EvalCtx::normal_epsilon` as the CPU eval
+// does, so the numbers differ from the CPU but look the same.
 
 struct H2NParams {
     size: vec2<u32>,
     strength: f32,
     _pad: u32,
     dom: vec4<f32>,      // own bake domain (min_u, min_v, ext_u, ext_v)
-    dom_src: vec4<f32>,  // source's bake domain
+    dom_src: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> params: H2NParams;
 @group(0) @binding(1) var out_tex: texture_storage_2d<rgba32float, write>;
 @group(0) @binding(2) var src: texture_2d<f32>;
 
-// Map this dispatch's texel to its UV within the layer's bake domain
-// (dom = (min_u, min_v, ext_u, ext_v)).
 fn dom_uv(dom: vec4<f32>, gid: vec2<u32>, size: vec2<u32>) -> vec2<f32> {
     return vec2<f32>(
         dom.x + (f32(gid.x) + 0.5) / f32(size.x) * dom.z,
@@ -64,7 +57,6 @@ fn linear_srgb_to_oklab(r: f32, g: f32, b: f32) -> vec3<f32> {
 }
 
 fn normal_to_oklch(n: vec3<f32>) -> vec3<f32> {
-    // n*0.5+0.5 into sRGB, then sRGB → LinSrgb → Oklab → Oklch.
     let s = n * 0.5 + vec3<f32>(0.5);
     let lin = vec3<f32>(
         srgb_to_linear_component(s.x),
@@ -87,7 +79,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.size.x || gid.y >= params.size.y) { return; }
     let sx = i32(params.size.x);
     let sy = i32(params.size.y);
-    // Center texel in the source's bake domain, then ±1 source texels.
     let uv = dom_uv(params.dom, gid.xy, params.size);
     let c = dom_texel(params.dom_src, uv, params.size);
     let x = c.x;
@@ -96,8 +87,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let l_nx = textureLoad(src, vec2<i32>(clamp_i(x - 1, 0, sx - 1), y), 0).x;
     let l_py = textureLoad(src, vec2<i32>(x, clamp_i(y + 1, 0, sy - 1)), 0).x;
     let l_ny = textureLoad(src, vec2<i32>(x, clamp_i(y - 1, 0, sy - 1)), 0).x;
-    // Per-pixel finite difference converted to UV-space: one source texel
-    // spans ext/size UV units.
+    // One source texel spans ext/size in UV.
     let dhdx = (l_px - l_nx) * f32(sx) / params.dom_src.z * 0.5;
     let dhdy = (l_py - l_ny) * f32(sy) / params.dom_src.w * 0.5;
     var n = vec3<f32>(-dhdx * params.strength, -dhdy * params.strength, 1.0);

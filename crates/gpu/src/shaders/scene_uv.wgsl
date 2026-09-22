@@ -1,5 +1,5 @@
-// UV-mapped material variant: the four PBR channels are flat 2D textures
-// wrapped around the mesh by its vertex UVs. Appended to scene_common.wgsl.
+// UV-mapped material: 2D PBR textures sampled at vertex UVs. Appended to
+// scene_common.wgsl.
 
 @group(0) @binding(1) var color_tex:  texture_2d<f32>;
 @group(0) @binding(2) var rough_tex:  texture_2d<f32>;

@@ -1,18 +1,12 @@
-// LayerKind::Noise. The GPU twin of `core::noise` — that module is the
-// spec, this is its transcription, function for function, and the two must
-// change in the same commit. Needs `sphere.wgsl` prepended.
+// LayerKind::Noise. A function-for-function port of `core::noise`, which is
+// the spec; change both together. Needs `sphere.wgsl` prepended.
 //
-// Two kernels:
+// - Simplex: Gustavson's textureless simplex. Aperiodic.
+// - Value: trilinear value noise, cell index modulo a per-axis period. The
+//   hash is pure u32, so corners match the CPU bit for bit and a periodic
+//   field tiles exactly.
 //
-// - Simplex: Stefan Gustavson's textureless simplex (permutation-polynomial
-//   gradient hash), all f32 polynomial arithmetic. Aperiodic.
-// - Value: trilinear value noise on an integer lattice, with the cell index
-//   taken modulo a per-axis period. The hash is pure u32, so corner values
-//   match the CPU's bit for bit and a periodic field seams against itself
-//   exactly.
-//
-// Both run under the same fractal octave loop. Range mapping and the
-// Grayscale/Color output modes match `eval_noise` in `core::eval` verbatim.
+// Range mapping and output modes match `eval_noise` in `core::eval`.
 
 struct NoiseParams {
     size: vec2<u32>,
@@ -31,13 +25,13 @@ struct NoiseParams {
     normalize: u32,       // 0 = raw sum, 1 = divide by the amplitude sum
     kernel: u32,          // 0=Simplex, 1=Value
     face: u32,            // 0 = plane; k + 1 = cube face k. See sphere.wgsl.
-    // Scalars, not a vec2: the struct has to stay 96 bytes, as its Rust twin.
+    // Scalars, not a vec2: the struct must stay 96 bytes to match Rust.
     _pad1: u32,
     _pad2: u32,
 }
 
-// Mirrors `core::noise::MAX_OCTAVES`. The loop is bounded so a bad uniform
-// costs a fixed ceiling rather than a hung dispatch.
+// Mirrors `core::noise::MAX_OCTAVES`. Bounds the loop so a bad uniform
+// cannot hang the dispatch.
 const MAX_OCTAVES: u32 = 8u;
 
 // Mirrors `core::noise::OCTAVE_SEED_STRIDE`.
@@ -45,8 +39,6 @@ const OCTAVE_SEED_STRIDE: u32 = 0x9E3779B9u;
 
 @group(0) @binding(0) var<uniform> params: NoiseParams;
 @group(0) @binding(1) var out_tex: texture_storage_2d<rgba32float, write>;
-
-// ---- Permutation helpers ----------------------------------------------
 
 fn permute3(x: vec3<f32>) -> vec3<f32> {
     return (((x * 34.0) + 1.0) * x) % vec3<f32>(289.0);
@@ -60,7 +52,7 @@ fn taylor_inv_sqrt4(r: vec4<f32>) -> vec4<f32> {
     return 1.79284291400159 - 0.85373472095314 * r;
 }
 
-// ---- 2D simplex noise (Gustavson) — returns roughly [-1, 1] ----------
+// Roughly [-1, 1].
 
 fn snoise2(v: vec2<f32>) -> f32 {
     let C = vec4<f32>(
@@ -101,7 +93,7 @@ fn snoise2(v: vec2<f32>) -> f32 {
     return 130.0 * dot(m, g);
 }
 
-// ---- 3D simplex noise (Gustavson) — returns roughly [-1, 1] ----------
+// Roughly [-1, 1].
 
 fn snoise3(v: vec3<f32>) -> f32 {
     let C = vec2<f32>(1.0 / 6.0, 1.0 / 3.0);
@@ -154,12 +146,6 @@ fn snoise3(v: vec3<f32>) -> f32 {
     return 42.0 * dot(m * m, vec4<f32>(dot(p0, x0), dot(p1, x1), dot(p2, x2), dot(p3, x3)));
 }
 
-// ---- Sampling ---------------------------------------------------------
-
-// Seed mixed into the input as a translation. Not cryptographic — different
-// (seed, seed_offset) pairs produce visually distinct noise, which is
-// what the UI needs. Wanghash of the raw seed provides three independent
-// low-bit-mixed offsets.
 fn wang_hash(seed: u32) -> u32 {
     var x = seed;
     x = (x ^ 61u) ^ (x >> 16u);
@@ -171,13 +157,12 @@ fn wang_hash(seed: u32) -> u32 {
 }
 
 fn hash_to_float01(x: u32) -> f32 {
-    // Map to [0, 1) by taking the top 24 bits into an f32 mantissa.
+    // Top 24 bits, so the result is exact in f32 and below 1.
     return f32(x >> 8u) * (1.0 / 16777216.0);
 }
 
-// The translation the simplex kernel applies for a given seed — twin of
-// `seed_offsets`. Takes the seed itself rather than an offset from
-// `params`, because each octave runs under its own.
+// Simplex seeds by translating the input; twin of `seed_offsets`. Takes the
+// seed because each octave has its own.
 fn seeded_uv_for(u: f32, v: f32, s: u32) -> vec2<f32> {
     let ox = hash_to_float01(wang_hash(s ^ 0xA1B2C3D4u)) * 256.0;
     let oy = hash_to_float01(wang_hash(s ^ 0x51F0E7A9u)) * 256.0;
@@ -191,10 +176,7 @@ fn seeded_uvw_for(u: f32, v: f32, w: f32, s: u32) -> vec3<f32> {
     return vec3<f32>(u + ox, v + oy, w + oz);
 }
 
-// ---- Value noise ------------------------------------------------------
-
-// Twin of `lattice_hash` in core::noise. Integer end to end, so a corner
-// value is the same bits on both backends.
+// Twin of `lattice_hash` in core::noise.
 fn lattice_hash(cell: vec3<i32>, seed: u32) -> u32 {
     var h = (u32(cell.x) * 1597334677u)
           ^ (u32(cell.y) * 3812015801u)
@@ -259,12 +241,8 @@ fn value_noise(p: vec3<f32>, period: vec3<u32>, seed: u32) -> f32 {
     return lerp1(c0, c1, w.z);
 }
 
-// ---- Octaves ----------------------------------------------------------
-
-// One raw octave in the kernel's own roughly-[-1, 1] convention; twin of
-// `octave`. The value kernel leaves the coordinates alone and seeds
-// through the hash, or the lattice would slide off the integers and the
-// period would stop meaning anything.
+// Twin of `octave`. The value kernel seeds through the hash, not by
+// translating, so the lattice stays on integers and the period holds.
 fn noise_octave(
     u: f32, v: f32, w: f32,
     seed: u32,
@@ -288,7 +266,6 @@ fn noise_octave(
     }
     switch params.dims {
         case 0u: {
-            // D1: sample 2D with y=0.
             let sh = seeded_uv_for(u, 0.0, seed);
             return snoise2(vec2<f32>(sh.x * f, sh.y));
         }
@@ -296,7 +273,6 @@ fn noise_octave(
             return snoise3(seeded_uvw_for(u, v, w, seed) * f);
         }
         default: {
-            // D2 (and any other value).
             return snoise2(seeded_uv_for(u, v, seed) * f);
         }
     }
@@ -353,13 +329,11 @@ fn sample_noise(u: f32, v: f32, w: f32, extra_seed_offset: u32) -> f32 {
     if (params.normalize == 1u && amplitude_sum > 0.0) {
         acc = sum / amplitude_sum;
     }
-    // Turbulence and Ridged land in [0, 1]; stretch them into the signed
-    // convention so one range rule covers every mode.
+    // Turbulence and Ridged are in [0, 1]; move them to [-1, 1] first.
     var signed_value = acc;
     if (params.fractal_mode != 0u) {
         signed_value = acc * 2.0 - 1.0;
     }
-    // range: 0=Unsigned -> [0,1], 1=Signed -> [-1, 1].
     if (params.range == 0u) {
         return signed_value * 0.5 + 0.5;
     }

@@ -1,6 +1,6 @@
 //! The sphere bake: that it holds the CPU's field, that its faces are where
-//! the GPU's own cube sampler looks for them, and that it refuses what it
-//! cannot mean.
+//! the GPU's cube sampler looks for them, and that it refuses unsupported
+//! layers.
 
 use texture_graph_core::{
     Axis, BlendMode, BlendSpace, Coordinate, EvalCtx, Fractal, Graph, LayerId,
@@ -24,9 +24,8 @@ fn blend(g: &mut Graph, name: &str, a: LayerId, b: LayerId, factor: f32) -> Laye
     .unwrap()
 }
 
-/// Bands in latitude, bent by fractal noise and stretched past `[0, 1]` —
-/// the shape a gas giant's surface takes, and every kind a sphere bake
-/// allows.
+/// Latitude bands bent by noise and stretched past `[0, 1]`, using every
+/// kind a sphere bake allows.
 fn banded() -> (Graph, LayerId) {
     let mut g = Graph::new();
     let height = g.add_layer("height", LayerKind::Coordinate(Coordinate { axis: Axis::V })).unwrap();
@@ -87,16 +86,14 @@ fn a_sphere_bake_holds_the_cpu_field_on_every_face() {
             }
         }
     }
-    // Loose as the Wave's own parity is: `sin` is transcendental.
+    // `sin` differs between backends.
     assert!(worst <= 2.0 / 255.0, "worst delta over the sphere: {worst}");
-    // The stretch pushes past both ends, which is what proves the factor
-    // is not clamped on the way through.
+    // Proves the factor is not clamped on the way through.
     assert!(lo < -0.05 && hi > 1.05, "field spans {lo}..{hi}");
 }
 
-/// Sample the three coordinate cubes through a real `Cube` view at known
-/// directions. A face stored mirrored, rotated or in the wrong layer passes
-/// every CPU-side test and fails here.
+/// A face stored mirrored, rotated or in the wrong layer passes every
+/// CPU-side test and fails here.
 #[test]
 fn faces_land_where_the_gpu_cube_sampler_looks_for_them() {
     const FACE: u32 = 32;
@@ -168,7 +165,6 @@ fn a_sphere_bake_refuses_what_has_no_meaning_on_a_sphere() {
     assert!(matches!(refused, Some(BakeError::Unsupported(_))), "got {refused:?}");
 }
 
-/// On a plane the Coordinate node is just the pixel's own (u, v, w).
 #[test]
 fn a_coordinate_on_a_plane_is_the_pixel() {
     const SIZE: u32 = 16;
@@ -193,8 +189,7 @@ fn a_coordinate_on_a_plane_is_the_pixel() {
     }
 }
 
-/// `textureSampleLevel` on three cube views at each of `dirs`, nearest
-/// filtering: one `[u, v, w]` per direction.
+/// One `[u, v, w]` per direction, nearest filtering.
 fn sample_cubes(ctx: &DeviceCtx, cubes: &[wgpu::TextureView], dirs: &[[f32; 4]]) -> Vec<[f32; 3]> {
     const SHADER: &str = r#"
         @group(0) @binding(0) var cube_u: texture_cube<f32>;

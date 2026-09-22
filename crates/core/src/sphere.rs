@@ -1,24 +1,21 @@
 //! Sampling a graph on a sphere rather than a plane.
 //!
-//! A sphere bake evaluates the graph at points on the sphere inscribed in
-//! the unit cube — centre `(0.5, 0.5, 0.5)`, radius 0.5 — so a graph looks
-//! exactly as it does in a volume bake, restricted to that shell. That is
-//! what lets one graph be authored and previewed as a solid and then baked
-//! as a cubemap: the cubemap holds the same field, at far higher resolution
-//! for the same memory, because it spends none of it on the interior.
+//! A sphere bake samples the sphere inscribed in the unit cube (center
+//! `(0.5, 0.5, 0.5)`, radius 0.5), so it matches a volume bake restricted to
+//! that shell. A cubemap stores that field at higher resolution than a volume
+//! of the same memory, since it stores no interior.
 //!
-//! Faces are laid out as WebGPU (and Vulkan, and D3D) sample a cube view:
-//! layer order `+X, -X, +Y, -Y, +Z, -Z`, and within a face `u` runs right
-//! and `v` runs *down*. Getting this wrong does not fail anything — it
-//! rotates or mirrors whole faces — so `bake_test` checks it against the
-//! GPU's own cube sampler rather than against this table.
+//! Faces follow the WebGPU/Vulkan/D3D cube layout: layer order
+//! `+X, -X, +Y, -Y, +Z, -Z`, and within a face `u` runs right and `v` runs
+//! down. A mistake here mirrors or rotates faces without failing anything, so
+//! `bake_test` checks it against the GPU's cube sampler.
 
 use crate::eval::Sample;
 
 pub const CUBE_FACES: u32 = 6;
 
 /// The unnormalized direction a cube face's `(u, v)` looks along, with
-/// `u, v ∈ [0, 1]`. The major axis has magnitude one.
+/// `u, v ∈ [0, 1]`. The major axis has magnitude one. Panics if `face >= 6`.
 pub fn cube_direction(face: u32, u: f32, v: f32) -> [f32; 3] {
     let s = 2.0 * u - 1.0;
     let t = 2.0 * v - 1.0;
@@ -45,10 +42,9 @@ pub fn cube_sample(face: u32, u: f32, v: f32) -> Sample {
 mod tests {
     use super::*;
 
-    /// Each face's centre looks straight down its own axis, in the order
-    /// the layers are stored.
+    /// Face centers point along the axes in layer order.
     #[test]
-    fn face_centres_are_the_six_axes() {
+    fn face_centers_are_the_six_axes() {
         let axes = [
             [1.0, 0.0, 0.0],
             [-1.0, 0.0, 0.0],
@@ -62,9 +58,8 @@ mod tests {
         }
     }
 
-    /// Adjacent faces meet: every edge of every face is shared with exactly
-    /// one other face, along the same line of directions. A mirrored face
-    /// would still have the right centre and fail this.
+    /// Every face edge is shared with another face. A mirrored face would
+    /// pass the center test and fail this.
     #[test]
     fn edges_are_shared_between_faces() {
         let key = |d: [f32; 3]| d.map(|c| (c * 1000.0).round() as i32);

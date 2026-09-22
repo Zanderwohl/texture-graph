@@ -1,8 +1,7 @@
 //! Picking a declared parameter for a `ScalarInput` / `ColorInput` socket.
 //!
-//! A socket only offers parameters of the sort it can read — the graph
-//! rejects the other kind anyway, and a combo listing choices that will be
-//! refused is worse than one that is short.
+//! A socket only offers parameters of the sort it can read, since the graph
+//! rejects the other kind.
 
 use texture_graph_core::{Graph, ParamKind, ParamUse};
 
@@ -15,18 +14,14 @@ pub fn usable(graph: &Graph, want: ParamUse) -> impl Iterator<Item = &str> {
         .map(|d| d.name.as_str())
 }
 
-/// The name a "use parameter" button should switch to: the first one this
-/// socket can read. `None` when the graph declares none, and the button
-/// should not be drawn at all.
+/// `None` when the graph declares no usable parameter; the "use parameter"
+/// button should then not be drawn.
 pub fn first(graph: &Graph, want: ParamUse) -> Option<String> {
     usable(graph, want).next().map(str::to_string)
 }
 
-/// Combo over the usable parameters. `Some` when the selection changed.
-///
-/// A `current` that is not in the list still shows — a graph loaded from
-/// elsewhere may name something this build cannot offer, and silently
-/// showing the first entry instead would look like the binding changed.
+/// `Some` when the selection changed. A `current` not in the list still
+/// shows, so a loaded graph naming an unknown parameter does not look rebound.
 pub fn param_ref(
     ui: &mut egui::Ui,
     id_source: impl std::hash::Hash + std::fmt::Debug,
@@ -49,8 +44,7 @@ pub fn param_ref(
     picked
 }
 
-/// The range a scalar parameter declares, for a slider that edits its
-/// value. Falls back to `0..=1`, which is what most of this UI uses.
+/// Falls back to `0..=1`, which is what most of this UI uses.
 pub fn scalar_range(graph: &Graph, name: &str) -> std::ops::RangeInclusive<f32> {
     match graph.params.get(name).map(|d| d.kind) {
         Some(ParamKind::Scalar { min, max }) if max > min => min..=max,
@@ -58,14 +52,9 @@ pub fn scalar_range(graph: &Graph, name: &str) -> std::ops::RangeInclusive<f32> 
     }
 }
 
-/// Compact "constant or parameter" control for a node-body row.
-///
-/// A `Layer` binding draws nothing — the wire on the canvas already says
-/// so, and a node row is too narrow to repeat it.
-///
-/// `draw_const` is the caller's own editor for the constant case, because
-/// a Mix factor wants a `0..=1` slider and a Wave input wants an unbounded
-/// drag.
+/// "Constant or parameter" control for a node-body row. A `Layer` binding
+/// draws nothing because the wire on the canvas already shows it.
+/// `draw_const` is supplied by the caller because sockets differ in range.
 pub fn scalar_socket(
     ui: &mut egui::Ui,
     graph: &Graph,
@@ -77,7 +66,7 @@ pub fn scalar_socket(
     use texture_graph_core::ScalarInput;
 
     let mut changed = false;
-    // A mode switch replaces the enum the arm below is borrowing.
+    // A mode switch replaces the enum the match arm is borrowing.
     let mut swap_to: Option<ScalarInput> = None;
     match si {
         ScalarInput::Const(v) => {

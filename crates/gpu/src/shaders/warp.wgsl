@@ -1,17 +1,12 @@
-// LayerKind::Warp. Read `source` at a coordinate displaced by what `by`
-// says there. Twin of `eval_warp` in `core::eval`.
+// LayerKind::Warp: `source` displaced by `by`. Twin of `eval_warp` in
+// `core::eval`.
 //
-// The fetch is the same machinery an `EdgeMode::Extend` Transform uses:
-// the scheduler has already grown `source`'s bake domain by |amount| on
-// each axis (capped at core's EXTEND_LIMIT box), so a displacement within
-// the promised [-1, 1] always lands on real data. Anything further is
-// outside baked territory and shows the missing-texture grid, exactly as
-// an over-reaching extend does.
+// As with an Extend transform, the scheduler grows `source`'s bake domain
+// by |amount| (capped at EXTEND_LIMIT), so a displacement in [-1, 1] lands
+// on baked data; beyond that shows the missing-texture grid.
 //
-// Known limitation, shared with the flat GPU path in general: `amount.z`
-// does nothing here. Each slice only has its inputs baked at that slice's
-// w, so no downstream node can re-sample them at another one. The CPU
-// evaluator does honour it — see `Warp`'s doc comment.
+// `amount.z` is ignored: each slice's inputs are baked only at that slice's
+// w. The CPU evaluator does apply it; see `Warp`'s doc comment.
 
 struct WarpParams {
     size: vec2<u32>,
@@ -19,8 +14,8 @@ struct WarpParams {
     _pad0: u32,
     amount: vec4<f32>,    // (u, v, w, _)
     dom: vec4<f32>,       // own bake domain (min_u, min_v, ext_u, ext_v)
-    dom_src: vec4<f32>,   // source's bake domain, already grown by |amount|
-    dom_by: vec4<f32>,    // displacement field's bake domain
+    dom_src: vec4<f32>,   // already grown by |amount|
+    dom_by: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> params: WarpParams;
@@ -44,8 +39,7 @@ fn dom_texel(dom: vec4<f32>, uv: vec2<f32>, size: vec2<u32>) -> vec2<i32> {
     );
 }
 
-// The missing-texture grid at a sample point — mirrors `missing_texture`
-// in core::eval and missing.wgsl (16 cells/unit, magenta/black, 3D).
+// Keep in sync with `missing_texture` in core::eval and missing.wgsl.
 const MISSING_CELLS: f32 = 16.0;
 
 fn missing_color(p: vec3<f32>) -> vec4<f32> {
@@ -60,9 +54,7 @@ fn missing_color(p: vec3<f32>) -> vec4<f32> {
     return vec4<f32>(0.0, 0.0, 0.0, 1.0);
 }
 
-// Twin of `warp_displacement`. Oklcha is stored (l, chroma, hue_deg, a),
-// so `Scalar` is the L channel and `Vector` reads the first three with
-// hue put over a full turn.
+// Twin of `warp_displacement`. Vector mode scales hue degrees to [0, 1).
 fn displacement(by: vec4<f32>) -> vec3<f32> {
     if (params.mode == 1u) {
         return vec3<f32>(by.x, by.y, by.z / 360.0);

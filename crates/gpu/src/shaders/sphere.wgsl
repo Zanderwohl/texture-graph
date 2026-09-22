@@ -1,10 +1,9 @@
-// Where a stage that generates coordinates samples the graph. Prepended to
-// those stages' sources; the twin of `core::sphere`.
+// Sample point for stages that generate coordinates. Prepended to their
+// sources; must match `core::sphere`.
 //
-// `face` is 0 for a plane or a volume slice, where the point is the pixel's
-// (u, v) and the pass's w. For cube face `k` it is `k + 1`, and the point is
-// that face's direction on the sphere inscribed in the unit cube — so a
-// sphere bake is the volume's field restricted to that shell.
+// `face` is 0 for a plane or a volume slice: the point is the pixel's (u, v)
+// and the pass's w. For cube face `k` it is `k + 1`: the point is that face's
+// direction on the sphere inscribed in the unit cube.
 
 fn cube_direction(face: u32, u: f32, v: f32) -> vec3<f32> {
     let s = 2.0 * u - 1.0;

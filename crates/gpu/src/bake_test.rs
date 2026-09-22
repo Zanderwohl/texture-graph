@@ -50,11 +50,8 @@ fn add_transform(
     .unwrap()
 }
 
-/// Every pixel of an Rgba8Unorm texture, as `[r, g, b, a]`.
-///
-/// Wraps the public [`crate::readback::read_rgba8`], so these tests exercise
-/// the path a headless caller takes and there is no second copy of the
-/// row-padding arithmetic to get wrong.
+/// Uses the public [`crate::readback::read_rgba8`], so tests exercise the
+/// headless caller's path.
 fn readback_all_pixels(ctx: &DeviceCtx, tex: &wgpu::Texture, size: (u32, u32)) -> Vec<[u8; 4]> {
     crate::readback::read_rgba8(ctx, tex, size)
         .pixels
@@ -113,7 +110,6 @@ fn color_layer_matches_cpu_to_srgb8() {
     let mut baker = Baker::new(ctx.clone());
 
     let mut graph = Graph::new();
-    // Overwrite the auto-created base color's kind with a specific value.
     let base = graph.output.color;
     graph
         .set_kind(base.unwrap(), LayerKind::Color(Color::new(0.6, 0.15, 40.0, 1.0)))
@@ -142,7 +138,6 @@ fn color_layer_matches_cpu_to_srgb8() {
         );
     }
 
-    // Roughness const: uniform gray at sRGB(0.5).
     let rough_expected_lin = 0.5f32;
     let rough_expected_srgb = if rough_expected_lin <= 0.0031308 {
         12.92 * rough_expected_lin
@@ -156,11 +151,9 @@ fn color_layer_matches_cpu_to_srgb8() {
         assert!(d <= 1, "rough channel {i}: expect {rough_expected} got {} (delta {d})", rough[i]);
     }
 
-    // Metallic const 0.0 → sRGB(0.0) = 0.
     let metal = readback_first_pixel(&ctx, &out.metallic);
     assert!(metal[0] <= 1 && metal[1] <= 1 && metal[2] <= 1);
 
-    // Absent normal → flat blue [128, 128, 255, 255].
     let normal = readback_first_pixel(&ctx, &out.normal);
     for (i, want) in [128u8, 128, 255, 255].iter().enumerate() {
         let d = (*want as i32 - normal[i] as i32).abs();
@@ -202,7 +195,6 @@ fn noise_layer_has_variance_and_is_deterministic() {
     }
     assert!(max as i32 - min as i32 > 40, "noise output has too little variance (min={min} max={max})");
 
-    // Determinism: baking again with an identical graph must produce identical pixels.
     let out2 = baker
         .bake_output(&graph, size, &EvalCtx::default(), false)
         .expect("bake noise 2");
@@ -240,7 +232,6 @@ fn mix_add_of_two_colors_matches_cpu() {
     let out = baker.bake_output(&graph, SIZE, &EvalCtx::default(), false).expect("bake");
     let gpu = readback_first_pixel(&ctx, &out.color);
 
-    // CPU reference — evaluate the mix directly.
     let cpu_material = texture_graph_core::evaluate_material(
         &graph, texture_graph_core::Sample::uv(0.5, 0.5), &EvalCtx::default(),
     );
@@ -277,8 +268,7 @@ fn ramp_black_to_white_at_midpoint_is_gray() {
 
     let out = baker.bake_output(&graph, SIZE, &EvalCtx::default(), false).expect("bake ramp");
     let px = readback_all_pixels(&ctx, &out.color, SIZE);
-    // Middle column should be roughly the sRGB encoding of Oklch L=0.5 gray.
-    // Pixel-center convention: u = (x + 0.5) / 8. The 4th column is u = 0.5625.
+    // Pixel centers: column 4 is u = 4.5 / 8 = 0.5625.
     let mid_col = 4;
     let mid_pixel = px[(SIZE.1 / 2) as usize * SIZE.0 as usize + mid_col];
     let expected = to_srgb8(Color::new(0.5625, 0.0, 0.0, 1.0));
@@ -286,7 +276,6 @@ fn ramp_black_to_white_at_midpoint_is_gray() {
         let d = (expected[i] as i32 - mid_pixel[i] as i32).abs();
         assert!(d <= 3, "ramp mid pixel channel {i}: expect {} got {} (delta {d})", expected[i], mid_pixel[i]);
     }
-    // Left edge dark, right edge light.
     let left = px[0][0];
     let right = px[SIZE.0 as usize - 1][0];
     assert!(left < right, "ramp left {left} not < right {right}");
@@ -294,9 +283,6 @@ fn ramp_black_to_white_at_midpoint_is_gray() {
 
 #[test]
 fn ramp_with_layer_ref_stops_reads_from_source_layers() {
-    // Ramp with two stops, both layer-refs. Stop 0 points at "black" layer,
-    // stop 1 points at "white" layer. Baked into a 16-wide texture — middle
-    // column should read as gray L≈0.5.
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
     let mut baker = Baker::new(ctx.clone());
     let mut graph = Graph::new();
@@ -326,14 +312,13 @@ fn ramp_with_layer_ref_stops_reads_from_source_layers() {
 
     let out = baker.bake_output(&graph, (16, 16), &EvalCtx::default(), false).expect("bake");
     let px = readback_all_pixels(&ctx, &out.color, (16, 16));
-    // Column 8 is u = 8.5/16 = 0.53125 → L ≈ 0.53125.
+    // Column 8 is u = 8.5/16 = 0.53125.
     let mid_pixel = px[16 * 8 + 8];
     let expected = to_srgb8(Color::new(0.53125, 0.0, 0.0, 1.0));
     for i in 0..3 {
         let d = (expected[i] as i32 - mid_pixel[i] as i32).abs();
         assert!(d <= 3, "layer-ref ramp mid channel {i}: expect {} got {} (delta {d})", expected[i], mid_pixel[i]);
     }
-    // Left edge should read the black layer (~0), right edge the white (~255).
     let left = px[16 * 8][0];
     let right = px[16 * 8 + 15][0];
     assert!(left < 30, "left edge should read black layer, got {left}");
@@ -345,7 +330,7 @@ fn ramp_rejects_more_than_eight_unique_layer_stops() {
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
     let mut baker = Baker::new(ctx.clone());
     let mut graph = Graph::new();
-    // Auto-created base color layer + 8 more colors = 9 distinct layers.
+    // Base color + 8 more = 9 layers, one over MAX_RAMP_INPUTS.
     let mut layer_ids = vec![graph.output.color];
     for i in 0..8u32 {
         layer_ids.push(
@@ -422,10 +407,8 @@ fn map_gray_value_through_bw_ramp_matches_ramp_lookup() {
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
     let mut baker = Baker::new(ctx.clone());
     let mut graph = Graph::new();
-    // value layer: uniform L=0.5.
     let value = graph.output.color;
     graph.set_kind(value.unwrap(), LayerKind::Color(Color::new(0.5, 0.0, 0.0, 1.0))).unwrap();
-    // palette: black-to-white ramp.
     let palette = graph.add_layer(
         "palette",
         LayerKind::ColorRamp(ColorRamp {
@@ -448,9 +431,7 @@ fn map_gray_value_through_bw_ramp_matches_ramp_lookup() {
     }).unwrap();
     let out = baker.bake_output(&graph, (16, 16), &EvalCtx::default(), false).expect("bake map");
     let px = readback_first_pixel(&ctx, &out.color);
-    // Map samples palette at t=L(value)=0.5. The 16-wide palette baked with
-    // pixel-center convention: nearest column is 8 → u=(8+0.5)/16=0.53125,
-    // ramp gives L=0.53125.
+    // t = 0.5 lands on palette column 8, whose center is u = 0.53125.
     let expected = to_srgb8(Color::new(0.53125, 0.0, 0.0, 1.0));
     for i in 0..3 {
         let d = (expected[i] as i32 - px[i] as i32).abs();
@@ -458,11 +439,7 @@ fn map_gray_value_through_bw_ramp_matches_ramp_lookup() {
     }
 }
 
-/// Timing observation, not an assertion: five 1024² bakes of a 15-octave
-/// fractal stack, reporting median record-and-submit latency and the
-/// scheduler's peak_slots. Measuring GPU wall time would need timestamp
-/// queries.
-///
+/// Prints timing; asserts nothing.
 /// `cargo test -p texture-graph-gpu perf_fractal -- --nocapture`
 #[test]
 fn perf_fractal_stack_1024() {
@@ -523,7 +500,7 @@ fn perf_fractal_stack_1024() {
         })
         .unwrap();
 
-    // Warmup — first bake compiles pipelines on some drivers.
+    // Some drivers compile pipelines on the first bake.
     let _ = baker
         .bake_output(&graph, (1024, 1024), &EvalCtx::default(), false)
         .expect("warmup bake");
@@ -534,7 +511,6 @@ fn perf_fractal_stack_1024() {
         let _ = baker
             .bake_output(&graph, (1024, 1024), &EvalCtx::default(), false)
             .expect("bake");
-        // Measure through GPU completion, not just command recording.
         ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
         times.push(t0.elapsed());
     }
@@ -542,14 +518,11 @@ fn perf_fractal_stack_1024() {
     let median = times[times.len() / 2];
     let layers = graph.layers.len();
     eprintln!("perf_fractal_stack_1024: layers={} median={:?}", layers, median);
-    // Not asserted — human reads the number.
 }
 
 #[test]
 fn min_max_by_luma_picks_brighter_pixel_whole() {
-    // Two Color layers: (L=0.2, C=0, h=0) and (L=0.8, C=0.15, h=200).
-    // Max by Luma should propagate the bright layer's pixel — including its
-    // chroma and hue, not just its L.
+    // The winner's chroma and hue must come through, not only its L.
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
     let mut baker = Baker::new(ctx.clone());
     let mut graph = Graph::new();
@@ -577,7 +550,6 @@ fn min_max_by_luma_picks_brighter_pixel_whole() {
     }).unwrap();
     let out = baker.bake_output(&graph, SIZE, &EvalCtx::default(), false).expect("bake");
     let gpu = readback_first_pixel(&ctx, &out.color);
-    // Winner is the bright layer — compare against its packed sRGB.
     let expect = to_srgb8(Color::new(0.8, 0.15, 200.0, 1.0));
     for i in 0..4 {
         let d = (expect[i] as i32 - gpu[i] as i32).abs();
@@ -587,10 +559,8 @@ fn min_max_by_luma_picks_brighter_pixel_whole() {
 
 #[test]
 fn min_max_matches_cpu_over_all_criteria() {
-    // GPU against CPU per criterion, on a fixed pair of opaque colors, so
-    // drift in either `criterion_of` shows up. Alpha needs its own test:
-    // non-1.0 alpha would trip the display-side gray checker compositing
-    // and make packed-pixel equality meaningless.
+    // Opaque colors only: alpha < 1 is composited over the checker, so Alpha
+    // has its own test.
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
     let mut baker = Baker::new(ctx.clone());
     let a_col = Color::new(0.3, 0.2, 100.0, 1.0);
@@ -644,9 +614,7 @@ fn min_max_matches_cpu_over_all_criteria() {
 
 #[test]
 fn min_max_by_alpha_picks_correct_layer() {
-    // Distinct L, distinct alpha; both opaque enough that the alpha checker
-    // barely nudges the display value. Test asserts the *winning L* — using
-    // the higher-alpha layer's L when Max, lower-alpha layer's L when Min.
+    // Alphas near 1 so the checker barely changes the displayed L.
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
     let mut baker = Baker::new(ctx.clone());
     let low = Color::new(0.2, 0.0, 0.0, 0.98);
@@ -673,8 +641,7 @@ fn min_max_by_alpha_picks_correct_layer() {
         }).unwrap();
         let out = baker.bake_output(&graph, SIZE, &EvalCtx::default(), false).expect("bake");
         let gpu = readback_first_pixel(&ctx, &out.color);
-        // Winning color's rough sRGB grayscale target (allow slack because
-        // low.alpha=0.98 lets a hint of gray leak in).
+        // Slack for the checker showing through alpha 0.98.
         let expect = to_srgb8(Color::new(expected_l, 0.0, 0.0, 1.0));
         let d = (expect[0] as i32 - gpu[0] as i32).abs();
         assert!(d <= 5, "MinMax(Alpha, {mode:?}) expect~{} got {} (delta {d})", expect[0], gpu[0]);
@@ -683,9 +650,6 @@ fn min_max_by_alpha_picks_correct_layer() {
 
 #[test]
 fn alpha_lt_one_shows_gray_checker_backing() {
-    // Color layer with alpha = 0.5. Every pixel should be a blend between
-    // the color's sRGB and one of two gray checker cells — never the pure
-    // solid color and never the magenta out-of-range checker.
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
     let mut baker = Baker::new(ctx.clone());
     let mut graph = Graph::new();
@@ -700,24 +664,17 @@ fn alpha_lt_one_shows_gray_checker_backing() {
     let size = (24u32, 24u32);
     let out = baker.bake_output(&graph, size, &EvalCtx::default(), false).expect("bake");
     let px = readback_all_pixels(&ctx, &out.color, size);
-    // Solid opaque sRGB of L=0.5 gray:
     let solid = to_srgb8(Color::new(0.5, 0.0, 0.0, 1.0))[0];
-    // Never see the magenta out-of-range marker.
     for p in &px {
         assert!(
             !(p[0] == 255 && p[1] == 0 && p[2] == 255),
             "alpha < 1 should not trip the out-of-range checker: {:?}",
             p,
         );
-        // Alpha channel always fully opaque after compositing.
         assert_eq!(p[3], 255, "output alpha should be 1 after alpha compositing");
     }
-    // At least two distinct pixel values appear — the two checker cells
-    // blend to different results.
     let unique: std::collections::HashSet<u8> = px.iter().map(|p| p[0]).collect();
     assert!(unique.len() >= 2, "expected multiple values from checker blend, got {unique:?}");
-    // Every displayed value falls between the blended-with-lightgray and
-    // blended-with-darkgray endpoints.
     let light_end = ((solid as f32) * 0.5 + 0.75 * 255.0 * 0.5).round() as i32;
     let dark_end  = ((solid as f32) * 0.5 + 0.55 * 255.0 * 0.5).round() as i32;
     let lo = light_end.min(dark_end) - 4;
@@ -733,9 +690,6 @@ fn alpha_lt_one_shows_gray_checker_backing() {
 
 #[test]
 fn out_of_range_l_paints_magenta_black_checker() {
-    // Color layer with L = -0.5 (well outside [0,1]). Every pixel is out of
-    // range, so every cell should be one of the two checker colors: bright
-    // magenta (255, 0, 255) or black (0, 0, 0). No other colors allowed.
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
     let mut baker = Baker::new(ctx.clone());
     let mut graph = Graph::new();
@@ -752,7 +706,6 @@ fn out_of_range_l_paints_magenta_black_checker() {
     let size = (40u32, 40u32);
     let out = baker.bake_output(&graph, size, &EvalCtx::default(), false).expect("bake");
     let px = readback_all_pixels(&ctx, &out.color, size);
-    // Every pixel is either magenta or black.
     let mut magentas = 0usize;
     let mut blacks = 0usize;
     for p in &px {
@@ -766,18 +719,15 @@ fn out_of_range_l_paints_magenta_black_checker() {
         if is_magenta { magentas += 1; }
         if is_black { blacks += 1; }
     }
-    // Both colors should be present.
     assert!(magentas > 0, "no magenta cells");
     assert!(blacks > 0, "no black cells");
-    // 10-px cells on a 40-px image → 4x4 = 16 cells; roughly balanced.
+    // 10-px cells on a 40-px image: 16 cells.
     assert!(magentas > 500, "too few magenta pixels: {magentas}");
     assert!(blacks > 500, "too few black pixels: {blacks}");
 }
 
 #[test]
 fn in_range_color_does_not_trigger_checker() {
-    // Regression: a normal in-range color must not accidentally show the
-    // checker. Uses the same L=0.6 the color_layer test does.
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
     let mut baker = Baker::new(ctx.clone());
     let mut graph = Graph::new();
@@ -793,7 +743,6 @@ fn in_range_color_does_not_trigger_checker() {
     }).unwrap();
     let out = baker.bake_output(&graph, (16, 16), &EvalCtx::default(), false).expect("bake");
     let px = readback_all_pixels(&ctx, &out.color, (16, 16));
-    // No pixel should be exactly bright magenta.
     for p in &px {
         assert!(
             !(p[0] == 255 && p[1] == 0 && p[2] == 255),
@@ -805,8 +754,7 @@ fn in_range_color_does_not_trigger_checker() {
 
 #[test]
 fn bake_previews_returns_one_texture_per_authored_layer() {
-    // Includes unreachable layers — the no-reuse schedule adds every authored
-    // layer, not just those wired to Output.
+    // Includes layers not wired to Output.
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
     let mut baker = Baker::new(ctx.clone());
     let mut graph = Graph::new();
@@ -819,7 +767,6 @@ fn bake_previews_returns_one_texture_per_authored_layer() {
     let previews =
         baker.bake_previews(&graph, &EvalCtx::default(), None).expect("bake previews");
     assert_eq!(previews.len(), 3, "expected one preview per authored layer");
-    // Sanity: each output is 128² Rgba8Unorm.
     for (_, tex) in &previews {
         assert_eq!(tex.width(), 128);
         assert_eq!(tex.height(), 128);
@@ -827,11 +774,8 @@ fn bake_previews_returns_one_texture_per_authored_layer() {
     }
 }
 
-/// Asking for a subset must hand back exactly that subset. A layer that
-/// came along only because something wanted reads it is dispatched, but it
-/// is not packed and not returned — the caller is still showing the texture
-/// it already had for that one, and handing it a second would leak the
-/// first.
+/// A layer dispatched only because a wanted layer reads it must not be
+/// returned; the caller would leak the texture it already holds.
 #[test]
 fn bake_previews_returns_only_the_layers_that_were_asked_for() {
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
@@ -840,8 +784,6 @@ fn bake_previews_returns_only_the_layers_that_were_asked_for() {
     let base = graph.output.color.unwrap();
     graph.set_kind(base, LayerKind::Color(Color::new(0.5, 0.0, 0.0, 1.0))).unwrap();
     let b = graph.add_layer("b", LayerKind::Color(Color::new(0.3, 0.1, 60.0, 1.0))).unwrap();
-    // `mixed` reads both, so asking for it schedules them without packing
-    // them.
     let mixed = add_mix(&mut graph, "mixed", base, b);
     let untouched = graph
         .add_layer("untouched", LayerKind::Color(Color::new(0.9, 0.05, 200.0, 1.0)))
@@ -855,12 +797,8 @@ fn bake_previews_returns_only_the_layers_that_were_asked_for() {
     assert!(!previews.contains_key(&untouched), "an unrelated layer was baked");
 }
 
-/// A thumbnail must be the same picture whichever way it was baked. The
-/// trap is bake domains: they are decided by a layer's *consumers*, so a
-/// subset schedule that only walked the subset would give a layer a
-/// narrower domain whenever the consumer that widened it was clean, and
-/// its thumbnail would come back at a different effective resolution
-/// depending on what else happened to be stale.
+/// A subset bake must use domains from the whole graph, or a layer widened
+/// by an unwanted consumer gets a different thumbnail.
 #[test]
 fn a_subset_bake_gives_the_same_picture_as_a_full_one() {
     use texture_graph_core::EdgeMode;
@@ -881,8 +819,7 @@ fn a_subset_bake_gives_the_same_picture_as_a_full_one() {
             }),
         )
         .unwrap();
-    // The extend transform is what widens `src`'s bake domain past the
-    // unit square. It is not in `wanted` below.
+    // Widens `src`'s domain; not in `wanted`.
     let _zoom = add_transform(&mut graph, "zoom", src, [0.25, 0.25, 1.0], EdgeMode::Extend);
 
     let full = baker.bake_previews(&graph, &EvalCtx::default(), None).expect("full");
@@ -898,7 +835,6 @@ fn a_subset_bake_gives_the_same_picture_as_a_full_one() {
 
 #[test]
 fn h2n_on_flat_source_gives_flat_normal() {
-    // Uniform source → zero gradient → normal = (0, 0, 1) → sRGB (128, 128, 255).
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
     let mut baker = Baker::new(ctx.clone());
     let mut graph = Graph::new();
@@ -914,10 +850,6 @@ fn h2n_on_flat_source_gives_flat_normal() {
         normal: Some(n),
     }).unwrap();
     let out = baker.bake_output(&graph, (16, 16), &EvalCtx::default(), false).expect("bake h2n");
-    // Sample a pixel in the interior, not the edge — clamped neighbors at
-    // the edge give a phantom gradient because the "outside" is a copy of
-    // the edge and adjacent-inside pixels differ; on uniform input they
-    // agree but the pixel-center convention still yields a clean interior.
     let px = readback_all_pixels(&ctx, &out.normal, (16, 16));
     let interior = px[8 * 16 + 8];
     for (i, want) in [128u8, 128, 255, 255].iter().enumerate() {
@@ -928,9 +860,6 @@ fn h2n_on_flat_source_gives_flat_normal() {
 
 #[test]
 fn h2n_on_horizontal_ramp_tilts_normal_toward_negative_u() {
-    // Horizontal ramp: L increases along u. Central-difference gradient is
-    // positive in u, zero in v. Normal = (-slope, 0, 1)/norm, so x-channel
-    // of the encoded sRGB should read *less than* 128 (nx < 0 → n*0.5+0.5 < 0.5).
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
     let mut baker = Baker::new(ctx.clone());
     let mut graph = Graph::new();
@@ -958,8 +887,7 @@ fn h2n_on_horizontal_ramp_tilts_normal_toward_negative_u() {
     let out = baker.bake_output(&graph, (32, 32), &EvalCtx::default(), false).expect("bake h2n ramp");
     let px = readback_all_pixels(&ctx, &out.normal, (32, 32));
     let interior = px[16 * 32 + 16];
-    // Encoded (n*0.5 + 0.5). Slope is positive in u, so nx < 0 → r < 128.
-    // v-gradient is 0 → g ≈ 128. Blue always ≥ 128 (nz always ≥ 0).
+    // L rises along u, so nx < 0 and r < 128; g ≈ 128; nz ≥ 0 so b ≥ 128.
     assert!(interior[0] < 120, "expected r < 120 (tilted normal), got {}", interior[0]);
     assert!(interior[1] >= 125 && interior[1] <= 130, "g ≈ 128, got {}", interior[1]);
     assert!(interior[2] >= 128, "b >= 128, got {}", interior[2]);
@@ -967,8 +895,6 @@ fn h2n_on_horizontal_ramp_tilts_normal_toward_negative_u() {
 
 #[test]
 fn noise_signed_range_lifts_grays_around_50pct() {
-    // Signed range maps [-1,1] straight into L. After Oklch->sRGB clamp+gamma
-    // that maps roughly around mid-gray for the center of the distribution.
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
     let mut baker = Baker::new(ctx.clone());
     let size = (32u32, 32u32);
@@ -989,9 +915,6 @@ fn noise_signed_range_lifts_grays_around_50pct() {
         .unwrap();
     let out = baker.bake_output(&graph, size, &EvalCtx::default(), false).expect("bake");
     let px = readback_all_pixels(&ctx, &out.color, size);
-    // Signed noise produces L both negative and positive; pack clamps to
-    // [0,1], so we expect at least one pixel darker than mid-gray and one
-    // near or above mid-gray.
     let (mut min, mut max) = (255u8, 0u8);
     for p in &px { min = min.min(p[0]); max = max.max(p[0]); }
     assert!(min < 140 && max > 100, "range spread looks wrong (min={min} max={max})");
@@ -1000,9 +923,8 @@ fn noise_signed_range_lifts_grays_around_50pct() {
 
 #[test]
 fn null_inputs_render_missing_texture_grid() {
-    // A multi-input kind on a single-layer graph must not default its inputs
-    // to the only layer available — itself — and die on "would create a
-    // cycle". They default to None and render as the missing grid.
+    // Inputs must default to None, not to the only layer (itself), which
+    // would be a cycle.
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
     let mut baker = Baker::new(ctx.clone());
 
@@ -1015,9 +937,7 @@ fn null_inputs_render_missing_texture_grid() {
         .bake_output(&graph, (64, 64), &EvalCtx::default(), false)
         .expect("null-input Map bakes");
 
-    // Passthrough Transform of a null source shows the grid verbatim:
-    // 16 cells across [0,1]² → 4-px cells at 64². Every pixel is either
-    // magenta or black, and adjacent cells alternate.
+    // 16 cells across [0,1]² → 4-px cells at 64².
     graph
         .set_kind(
             base.unwrap(),
@@ -1049,7 +969,6 @@ fn null_inputs_render_missing_texture_grid() {
     let b = px[1 * 64 + 5];
     assert_ne!(is_magenta(&a), is_magenta(&b), "adjacent 4-px cells must alternate");
 
-    // CPU evaluator agrees pixel-for-pixel on the grid's layout.
     let cpu = texture_graph_core::evaluate(
         &graph,
         base.unwrap(),
@@ -1066,8 +985,7 @@ fn null_inputs_render_missing_texture_grid() {
 
 #[test]
 fn null_output_color_bakes_missing_grid() {
-    // Disconnecting the Output's color socket is legal; the material's
-    // base color becomes the missing-texture grid instead of an error.
+    // An unconnected Output color is the missing grid, not an error.
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
     let mut baker = Baker::new(ctx.clone());
 
@@ -1089,7 +1007,6 @@ fn null_output_color_bakes_missing_grid() {
     );
     assert!(magenta > 0 && black > 0, "grid should contain both colors");
 
-    // CPU material evaluation agrees.
     let m = texture_graph_core::evaluate_material(
         &graph,
         texture_graph_core::Sample::new(1.5 / 64.0, 1.5 / 64.0, 0.5),
@@ -1103,10 +1020,8 @@ fn null_output_color_bakes_missing_grid() {
     );
 }
 
-/// Extend-mode transform: the source is baked over the transform's real
-/// sampling domain, so out-of-[0,1] samples hit real data and match CPU
-/// eval. The inner radial transform makes the field genuinely different
-/// from what Clamp mode would produce.
+/// Extend samples outside [0,1] must hit baked data and match CPU eval. The
+/// inner radial transform makes Clamp give a different image.
 #[test]
 fn extend_transform_matches_cpu_beyond_unit_square() {
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
@@ -1182,12 +1097,10 @@ fn extend_transform_matches_cpu_beyond_unit_square() {
             }
         }
     }
-    // Nearest-texel resampling across the widened domain quantizes the
-    // smooth field slightly; anything small proves extend samples real
-    // data (clamp-vs-extend differs by ~100+ sRGB steps mid-frame).
+    // Nearest-texel resampling of the widened domain costs a few steps;
+    // clamp vs extend differs by 100+ mid-frame.
     assert!(max_delta <= 14, "extend parity max delta {max_delta}");
 
-    // Sanity: switching the outer transform to Clamp changes the image.
     graph
         .set_kind(
             outer,
@@ -1210,8 +1123,7 @@ fn extend_transform_matches_cpu_beyond_unit_square() {
     assert!(diff > 20, "extend and clamp should differ off the unit square (diff {diff})");
 }
 
-/// An affine extend is unbounded: scale 40 samples far past the old cap
-/// and still matches CPU eval (the ramp holds its end color out there).
+/// An affine extend at scale 40 is not capped and must match CPU eval.
 #[test]
 fn affine_extend_is_unbounded_and_matches_cpu() {
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
@@ -1254,9 +1166,8 @@ fn affine_extend_is_unbounded_and_matches_cpu() {
     let out = baker.bake_output(&graph, SIZE, &EvalCtx::default(), false).expect("bake");
     let px = readback_all_pixels(&ctx, &out.color, SIZE);
     let ctx_eval = EvalCtx::default();
-    // Skip the leftmost columns where the ramp's [0, 1] span falls between
-    // texels of the 40-wide bake; from u=40*x/W > 1 on it's the held end
-    // color, which must match CPU exactly — and must NOT be the grid.
+    // The first columns hold the ramp's whole [0, 1] span, between texels
+    // of the 40-wide bake. Past it is the held end color, not the grid.
     for y in 0..SIZE.1 {
         for x in 4..SIZE.0 {
             let u = (x as f32 + 0.5) / SIZE.0 as f32;
@@ -1276,8 +1187,8 @@ fn affine_extend_is_unbounded_and_matches_cpu() {
     }
 }
 
-/// Radial extend past core's EXTEND_LIMIT cap renders the missing grid,
-/// exactly as CPU eval does.
+/// Radial extend past EXTEND_LIMIT must show the missing grid, as CPU eval
+/// does.
 #[test]
 fn radial_extend_past_limit_shows_missing_grid_like_cpu() {
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
@@ -1311,8 +1222,7 @@ fn radial_extend_past_limit_shows_missing_grid_like_cpu() {
     let out = baker.bake_output(&graph, SIZE, &EvalCtx::default(), false).expect("bake");
     let px = readback_all_pixels(&ctx, &out.color, SIZE);
     let ctx_eval = EvalCtx::default();
-    // Right half of the frame samples far past the cap on both CPU and
-    // GPU — compare pixels there exactly (same checker formula).
+    // The right half samples past the cap.
     for y in 0..SIZE.1 {
         for x in (SIZE.0 / 2)..SIZE.0 {
             let u = (x as f32 + 0.5) / SIZE.0 as f32;
@@ -1332,16 +1242,11 @@ fn radial_extend_past_limit_shows_missing_grid_like_cpu() {
     }
 }
 
-/// CPU/GPU noise parity — the claim `core::noise` exists to make good.
+/// A histogram, because a few ±1 steps are Oklch→sRGB rounding while a long
+/// tail means the kernels diverged.
 ///
-/// A histogram rather than a single max, because the shape of the
-/// disagreement is the diagnostic: a few ±1 steps are rounding in the
-/// Oklch→sRGB stage, while a long tail means the kernels have diverged.
-///
-/// Samples with L outside `[0, 1]` are skipped, not compared. Signed noise
-/// spends about a sixth of its range there, and the backends differ on
-/// purpose: `to_srgb8` clamps where `pack_srgb8` paints the out-of-range
-/// checker. That is a display choice, and this is about the field under it.
+/// Skips L outside `[0, 1]`, where `to_srgb8` clamps and `pack_srgb8` draws
+/// the checker.
 ///
 /// Returns `(histogram, worst, compared, skipped)`.
 fn noise_parity_histogram(n: Noise) -> (Vec<u32>, u32, u32, u32) {
@@ -1364,10 +1269,7 @@ fn noise_parity_histogram(n: Noise) -> (Vec<u32>, u32, u32, u32) {
             let v = (y as f32 + 0.5) / RES as f32;
             let m = texture_graph_core::evaluate_material(
                 &graph,
-                // w = 0.5, which is where a flat GPU bake slices a 3D
-                // field (`dispatch_kind`'s `w` argument). `Sample::uv` says
-                // 0.0, so a D3 graph compared that way is two different
-                // slices of the same volume.
+                // A flat GPU bake slices at w = 0.5; `Sample::uv` uses 0.0.
                 texture_graph_core::Sample::new(u, v, 0.5),
                 &eval,
             );
@@ -1404,19 +1306,16 @@ fn cpu_and_gpu_noise_agree() {
         ..plain(dims, range, frequency)
     };
     let cases: [(&str, Noise); 12] = [
-        // Simplex, the pre-existing coverage.
         ("simplex D2 unsigned", plain(NoiseDims::D2, NoiseRange::Unsigned, 4.0)),
         ("simplex D2 signed", plain(NoiseDims::D2, NoiseRange::Signed, 9.0)),
         ("simplex D1 unsigned", plain(NoiseDims::D1, NoiseRange::Unsigned, 6.0)),
         ("simplex D3 unsigned", plain(NoiseDims::D3, NoiseRange::Unsigned, 5.0)),
         ("simplex D3 signed", plain(NoiseDims::D3, NoiseRange::Signed, 2.0)),
-        // Value, aperiodic and periodic, every dimensionality.
         ("value D1 unsigned", value(NoiseDims::D1, NoiseRange::Unsigned, 6.0, [0; 3])),
         ("value D2 unsigned", value(NoiseDims::D2, NoiseRange::Unsigned, 4.0, [0; 3])),
         ("value D2 signed", value(NoiseDims::D2, NoiseRange::Signed, 9.0, [0; 3])),
         ("value D3 unsigned", value(NoiseDims::D3, NoiseRange::Unsigned, 5.0, [0; 3])),
         ("value D2 tiling", value(NoiseDims::D2, NoiseRange::Unsigned, 8.0, [8, 8, 0])),
-        // Octaves, on both kernels and a shaping mode each.
         (
             "value ridged x4",
             Noise {
@@ -1522,8 +1421,8 @@ fn a_periodic_value_bake_tiles_exactly_on_the_gpu() {
     assert!(varied, "the field is constant, so tiling proves nothing");
 }
 
-/// The same bake without a period must *not* repeat — otherwise the field
-/// tiles for some reason of its own and the test above proves nothing.
+/// Without a period the field must not repeat, or the test above proves
+/// nothing.
 #[test]
 fn an_aperiodic_bake_does_not_tile() {
     let tile = TILE_RES / TILES_ACROSS;
@@ -1540,12 +1439,7 @@ fn an_aperiodic_bake_does_not_tile() {
     }
 }
 
-// ---- Single-channel output (§5) ----------------------------------------
-
-/// A graph whose Output is a plain gray, plus an unrelated noise layer.
-/// The noise is deliberately *not* wired to the Output: `bake_scalar` is
-/// supposed to bake the layer it is asked for, so a graph can carry
-/// several fields side by side.
+/// A gray Output plus a noise layer deliberately not wired to it.
 fn scalar_fixture(kernel: NoiseKernel) -> (Graph, LayerId) {
     let mut graph = Graph::new();
     let field = graph
@@ -1575,9 +1469,8 @@ fn cpu_scalar(graph: &Graph, layer: LayerId, u: f32, v: f32, w: f32) -> f32 {
     ))
 }
 
-/// Every format reproduces the CPU field to its own precision, and the
-/// layer baked is the one asked for rather than whatever the Output
-/// happens to point at.
+/// Each format must match the CPU field to its precision, for the layer
+/// asked for rather than the Output.
 #[test]
 fn scalar_bake_matches_the_cpu_field_in_every_format() {
     const RES: u32 = 32;
@@ -1586,9 +1479,8 @@ fn scalar_bake_matches_the_cpu_field_in_every_format() {
     let mut baker = Baker::new(ctx.clone());
 
     for (format, tol) in [
-        // 1/255 of quantization, plus the CPU/GPU kernel difference.
+        // Quantization plus the CPU/GPU kernel difference.
         (ScalarFormat::R8Unorm, 1.0 / 255.0 + 2e-3),
-        // Half has ~3 decimal digits over [0, 1].
         (ScalarFormat::R16Float, 1e-3 + 2e-3),
         (ScalarFormat::R32Float, 2e-3),
     ] {
@@ -1617,8 +1509,7 @@ fn scalar_bake_matches_the_cpu_field_in_every_format() {
     }
 }
 
-/// `R8Unorm` clamps as the format requires; the float formats keep a
-/// signed field intact, which is the reason to pay for them.
+/// `R8Unorm` clamps; the float formats must keep a signed field.
 #[test]
 fn scalar_formats_differ_on_out_of_range_values() {
     const RES: u32 = 16;
@@ -1665,8 +1556,7 @@ fn scalar_formats_differ_on_out_of_range_values() {
     assert!(saw_negative, "signed noise produced nothing below zero to clamp");
 }
 
-/// The volume path: `res³` at slice centres, matching the CPU field and
-/// actually varying along w.
+/// Must match the CPU field at slice centers and vary along w.
 #[test]
 fn scalar_volume_matches_the_cpu_field_through_w() {
     const RES: u32 = 16;
@@ -1703,8 +1593,7 @@ fn scalar_volume_matches_the_cpu_field_through_w() {
     assert!(varies_through_w, "the volume is the same slice repeated");
 }
 
-/// `bake_scalar` schedules only what its layer reads. A graph with a big
-/// unrelated Output branch must not pay for it.
+/// `bake_scalar` must not schedule the unrelated Output branch.
 #[test]
 fn scalar_bake_ignores_layers_its_field_does_not_read() {
     let (mut graph, field) = scalar_fixture(NoiseKernel::Simplex);
@@ -1722,14 +1611,12 @@ fn scalar_bake_ignores_layers_its_field_does_not_read() {
         .unwrap();
     let sched = crate::schedule::schedule_layer(&graph, field).expect("schedule");
     assert_eq!(sched.order, vec![field], "only the field should be dispatched");
-    // And the ordinary Output schedule still covers the branch, so the two
-    // are genuinely different plans rather than one that lost layers.
+    // The Output schedule does include the branch.
     assert!(crate::schedule::schedule(&graph, &EvalCtx::default()).unwrap().order.len() > 1);
 }
 
-/// The async readers have to produce the same bytes as the blocking ones —
-/// they are the only path a wasm host has, so a difference would be a bug
-/// nobody native ever hits.
+/// The async readers, wasm's only path, must return the same bytes as the
+/// blocking ones.
 #[test]
 fn async_readback_agrees_with_the_blocking_one() {
     const RES: u32 = 16;
@@ -1757,14 +1644,9 @@ fn async_readback_agrees_with_the_blocking_one() {
     assert_eq!(blocking_rgba.pixels, async_rgba.pixels);
 }
 
-/// Run a readback future to completion on native, the way a host with a
-/// frame loop would: poll the future, then give the device a chance to
-/// resolve the buffer map, and repeat.
-///
-/// `pollster::block_on` alone deadlocks here — it parks the only thread
-/// that could call `Device::poll`. On wasm neither is needed; the browser
-/// resolves the map on its own event loop, which is the whole reason the
-/// async readers exist.
+/// Alternates polling the future and the device, as a frame loop would.
+/// `pollster::block_on` alone deadlocks: it parks the only thread that could
+/// call `Device::poll`.
 fn drive<F: std::future::Future>(ctx: &DeviceCtx, fut: F) -> F::Output {
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake, Waker};
@@ -1784,15 +1666,7 @@ fn drive<F: std::future::Future>(ctx: &DeviceCtx, fut: F) -> F::Output {
     }
 }
 
-// ---- Wave (§4) ----------------------------------------------------------
-
-/// CPU/GPU parity for the waveform node, at the looser bound its doc
-/// comment promises.
-///
-/// `Sine` is transcendental, so this is explicitly *not* the noise
-/// op-order contract: within one sRGB step, not bit-exact. Asserting the
-/// bound honestly is the point — a test that demanded equality here would
-/// either be disabled or force a lie in the doc comment.
+/// Within one sRGB step, not bit-exact: `sin` differs between backends.
 #[test]
 fn cpu_and_gpu_wave_agree_within_one_srgb_step() {
     const RES: u32 = 64;
@@ -1801,8 +1675,6 @@ fn cpu_and_gpu_wave_agree_within_one_srgb_step() {
 
     for shape in [WaveShape::Sine, WaveShape::Triangle, WaveShape::Square, WaveShape::Sawtooth] {
         for range in [NoiseRange::Unsigned, NoiseRange::Signed] {
-            // A ramp along U gives the wave a coordinate to run over —
-            // the shape the banded-planet surface needs.
             let mut graph = Graph::new();
             let ramp = graph.output.color.unwrap();
             graph
@@ -1857,9 +1729,7 @@ fn cpu_and_gpu_wave_agree_within_one_srgb_step() {
                         texture_graph_core::Sample::new(u, v, texture_graph_core::FLAT_W),
                         &eval,
                     );
-                    // Signed output spends half its range below zero,
-                    // where the two backends differ on purpose — `to_srgb8`
-                    // clamps and `pack_srgb8` paints the checker.
+                    // `to_srgb8` clamps here; `pack_srgb8` draws the checker.
                     if !(0.0..=1.0).contains(&m.color.l) {
                         continue;
                     }
@@ -1878,9 +1748,7 @@ fn cpu_and_gpu_wave_agree_within_one_srgb_step() {
     }
 }
 
-/// A `Const` input never reads the bound texture — the shader's
-/// placeholder path. The result must be one flat value, not whatever
-/// happened to be in the slot.
+/// A `Const` input must bake flat, not read the placeholder texture.
 #[test]
 fn a_const_input_wave_bakes_flat() {
     const RES: u32 = 16;
@@ -1903,19 +1771,12 @@ fn a_const_input_wave_bakes_flat() {
     let out = baker.bake_output(&graph, (RES, RES), &EvalCtx::default(), false).expect("bake");
     let px = readback_all_pixels(&ctx, &out.color, (RES, RES));
     assert!(px.iter().all(|p| *p == px[0]), "a constant input gave a varying field");
-    // 0.125 × 2 cycles is sine's peak, so L = 1 — white.
+    // 0.125 × 2 cycles is sine's peak, L = 1.
     assert!(px[0][0] > 250, "expected the peak of the wave, got {:?}", px[0]);
 }
 
-// ---- Warp (§3) ----------------------------------------------------------
-
-/// The banded-planet shape, end to end: a ramp warped by a noise field,
-/// run through a wave. CPU against GPU over the whole frame.
-///
-/// The warp fetch is a texture read at a displaced UV, so this is really
-/// a test that the scheduler grew the source's bake domain far enough —
-/// a domain one texel short shows up here as the missing grid where the
-/// CPU has data.
+/// A ramp warped by noise, through a wave, CPU against GPU. A source domain
+/// grown too little shows the missing grid where the CPU has data.
 #[test]
 fn cpu_and_gpu_warp_agree() {
     const RES: u32 = 64;
@@ -1951,7 +1812,6 @@ fn cpu_and_gpu_warp_agree() {
                     seed_offset: 4,
                     frequency: 5.0,
                     range: NoiseRange::Signed,
-                    // Vector mode wants three channels to read.
                     output: match mode {
                         WarpMode::Scalar => NoiseOutput::Grayscale,
                         WarpMode::Vector => NoiseOutput::Color,
@@ -1968,8 +1828,7 @@ fn cpu_and_gpu_warp_agree() {
                     source: Some(ramp),
                     by: Some(driver),
                     mode,
-                    // Only u and v: the GPU baker cannot displace w, and
-                    // `Warp`'s doc comment says so.
+                    // The GPU baker cannot displace w.
                     amount: [0.15, 0.15, 0.0],
                 }),
             )
@@ -2003,18 +1862,14 @@ fn cpu_and_gpu_warp_agree() {
                 }
             }
         }
-        // Looser than the noise contract: the GPU reads the source at the
-        // nearest texel of the displaced UV while the CPU evaluates it
-        // exactly there, so a warp across a steep gradient lands up to
-        // half a texel apart. Over a ramp this frame that is a few steps,
-        // not a different picture.
+        // The GPU reads the nearest texel of the displaced UV, up to half a
+        // texel from where the CPU evaluates.
         assert!(worst <= 6, "{mode:?}: worst sRGB delta {worst}");
     }
 }
 
-/// The scheduler has to grow the warped source's bake domain by
-/// `|amount|`, or the fetch lands outside baked territory and the whole
-/// frame turns into the missing grid at the edges.
+/// Without growing the source by `|amount|`, the frame edges show the
+/// missing grid.
 #[test]
 fn a_warp_widens_its_sources_bake_domain() {
     let mut graph = Graph::new();
@@ -2045,26 +1900,18 @@ fn a_warp_widens_its_sources_bake_domain() {
     assert!((d.max[0] - 1.3).abs() < 1e-6, "u max {}", d.max[0]);
     assert!((d.min[1] + 0.2).abs() < 1e-6, "v min {}", d.min[1]);
     assert!((d.max[1] - 1.2).abs() < 1e-6, "v max {}", d.max[1]);
-    // The driver is read at the warp's own coordinates, so it stays put.
     assert_eq!(sched.domain_of[&driver], crate::schedule::Domain::UNIT);
     assert_eq!(sched.domain_of[&warp], crate::schedule::Domain::UNIT);
 }
 
-// ---- Named parameters (§6) ----------------------------------------------
-
-/// One graph, several bakes, different pictures — and each of them still
-/// matching the CPU evaluator under the same bindings.
-///
-/// This is the claim that makes a graph worth transmitting: the wire
-/// carries it once and per-instance variation is a small block of values.
+/// Different parameter bindings must give different pictures, each matching
+/// the CPU evaluator.
 #[test]
 fn one_graph_bakes_differently_under_different_bindings() {
     const RES: u32 = 32;
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
     let mut baker = Baker::new(ctx.clone());
 
-    // A ramp whose far stop is a color parameter, mixed toward black by a
-    // scalar parameter: palette and contrast, the consumer's two axes.
     let mut graph = Graph::new();
     graph
         .declare_param(ParamDecl::color("tint", Color::new(0.2, 0.0, 0.0, 1.0)))
@@ -2106,8 +1953,7 @@ fn one_graph_bakes_differently_under_different_bindings() {
     graph
         .set_output(Output {
             color: Some(mixed),
-            // A parameter on an output scalar channel goes through the
-            // scheduler rather than a dispatch, so it is worth covering.
+            // Resolved by the scheduler, not a dispatch.
             roughness: ScalarInput::Param("contrast".into()),
             metallic: ScalarInput::Const(0.0),
             normal: None,
@@ -2134,7 +1980,6 @@ fn one_graph_bakes_differently_under_different_bindings() {
     for (label, eval) in &bindings {
         let out = baker.bake_output(&graph, (RES, RES), eval, false).expect("bake");
         let px = readback_all_pixels(&ctx, &out.color, (RES, RES));
-        // Same bindings, same picture as the CPU evaluator.
         let mut worst = 0u32;
         for y in 0..RES {
             for x in 0..RES {
@@ -2154,7 +1999,6 @@ fn one_graph_bakes_differently_under_different_bindings() {
         }
         assert!(worst <= 1, "{label}: worst sRGB delta {worst}");
 
-        // And the roughness channel, which the scheduler resolved.
         let rough = readback_all_pixels(&ctx, &out.roughness, (RES, RES));
         let want = texture_graph_core::evaluate_material(
             &graph,
@@ -2163,7 +2007,6 @@ fn one_graph_bakes_differently_under_different_bindings() {
         )
         .roughness;
         let got = rough[0][0] as f32 / 255.0;
-        // The channel is sRGB-encoded for display, so compare in that space.
         let want_srgb = if want <= 0.0031308 {
             12.92 * want
         } else {
@@ -2176,8 +2019,6 @@ fn one_graph_bakes_differently_under_different_bindings() {
         frames.push((label, px));
     }
 
-    // Different bindings have to give different pictures, or the test
-    // above would pass on three identical bakes.
     for i in 0..frames.len() {
         for j in (i + 1)..frames.len() {
             assert_ne!(
@@ -2189,9 +2030,7 @@ fn one_graph_bakes_differently_under_different_bindings() {
     }
 }
 
-/// A parameter is resolved before any dispatch is recorded, so a bake of a
-/// parameterised graph costs exactly what the equivalent constant graph
-/// does: same schedule, same slots, same dispatches.
+/// A parameterized graph must schedule the same as its constant equivalent.
 #[test]
 fn a_parameter_costs_the_same_as_the_constant_it_stands_in_for() {
     let mut param_graph = Graph::new();
@@ -2231,8 +2070,7 @@ fn a_parameter_costs_the_same_as_the_constant_it_stands_in_for() {
     let b = crate::schedule::schedule(&const_graph, &eval).expect("schedule");
     assert_eq!(a.order, b.order);
     assert_eq!(a.peak_slots, b.peak_slots);
-    // `remove_param` froze the channel at the declared 0.3, and the
-    // parameterised graph resolves to the same number.
+    // `remove_param` froze the channel at the declared 0.3.
     let (crate::ScalarSlot::Const(x), crate::ScalarSlot::Const(y)) =
         (a.output_slots.roughness, b.output_slots.roughness)
     else {

@@ -1,71 +1,48 @@
-//! Noise kernels — the *specification* both backends implement.
+//! Noise kernels: the specification both backends implement.
 //!
-//! The WGSL twin is `crates/gpu/src/shaders/noise.wgsl`, function for
-//! function. Any change here is a spec change and must land on both sides in
-//! the same commit, or a graph will look one way in a GPU bake and another in
-//! the CPU fallback.
+//! `crates/gpu/src/shaders/noise.wgsl` mirrors this file function for
+//! function. Change both in the same commit, or GPU and CPU bakes differ.
 //!
-//! Two kernels live here:
+//! - [`Kernel::Simplex`]: Stefan Gustavson's textureless simplex, all `f32`
+//!   polynomial arithmetic. Cannot tile. An `f64` kernel or a different
+//!   permutation table would visibly differ from the GPU.
+//! - [`Kernel::Value`]: trilinear value noise on an integer lattice, whose
+//!   cell index can wrap at a per-axis period so bakes tile.
 //!
-//! - [`Kernel::Simplex`] — Gustavson's textureless simplex, described below.
-//!   Aperiodic: there is no lattice to wrap, so it cannot tile.
-//! - [`Kernel::Value`] — trilinear value noise on an integer lattice, whose
-//!   cell index can be taken modulo a per-axis period. That is what makes a
-//!   baked texture seamless, and what reproduces a consumer's own periodic
-//!   value noise.
+//! [`sample`] runs either through the [`Fractal`] octave loop.
 //!
-//! Both feed [`sample`], which also runs the [`Fractal`] octave loop.
+//! # Seeding
 //!
-//! Stefan Gustavson's textureless simplex noise: a permutation-polynomial
-//! gradient hash, entirely `f32` polynomial arithmetic. An `f64` kernel off a
-//! different permutation table would produce visibly different noise from the
-//! GPU, so the same graph would render one way with a working wgpu backend
-//! and another without.
-//!
-//! # Why the seed translates the coordinates
-//!
-//! Gustavson's kernel has no permutation table to reseed: the hash is baked
-//! into the polynomial. The seed is hashed to a fixed offset and added to the
-//! sample position instead.
-//!
-//! The value kernel is seeded differently, and has to be: a fractional
-//! translation would move the lattice off the integers and destroy the
-//! tiling the kernel exists for. Its seed goes into the lattice *hash*
-//! instead, so the cell grid stays put however the field is reseeded.
+//! Simplex has no permutation table to reseed, so the seed is hashed to an
+//! offset added to the sample position. The value kernel puts the seed into
+//! the lattice hash instead: a fractional offset would move the lattice off
+//! the integers and break tiling.
 //!
 //! # Op-order contract
 //!
 //! Only `+ - *`, comparisons, `floor`, `abs`, `min`/`max` and float remainder
-//! appear here — nothing transcendental, nothing whose rounding could differ
-//! between backends. `fract` is written out as `x - floor(x)` because Rust's
-//! `f32::fract` truncates toward zero and WGSL's does not, which would differ
-//! on every negative coordinate.
+//! appear here, so rounding cannot differ between backends. `fract` is
+//! `x - floor(x)` because Rust's `f32::fract` truncates toward zero and
+//! WGSL's does not.
 //!
-//! The value kernel's hash is wholly `u32` arithmetic, so the two backends
-//! agree on lattice corner values bit for bit; only the trilinear blend is
-//! float, and it is six multiply-adds a sample.
+//! The value kernel's hash is all `u32`, so lattice corners match bit for
+//! bit; only the trilinear blend is float.
 //!
-//! Every float literal is written with the *same decimal string* as the
-//! shader, so both sides round one number to `f32` rather than two different
-//! shortenings of it. That is why this module turns off
-//! `clippy::excessive_precision`, which would helpfully truncate them and
-//! quietly reintroduce the divergence.
+//! Float literals use the same decimal strings as the shader, so both round
+//! the same number to `f32`. `clippy::excessive_precision` is off because it
+//! would truncate them.
 //!
-//! # What parity is held
+//! # Parity
 //!
-//! `cpu_and_gpu_noise_agree` in `texture-graph-gpu` holds the two backends to
-//! **within one sRGB step** across D1/D2/D3 and both ranges, most samples
-//! identical.
-//!
-//! Not bit-exactness: that would need a float read-back path, so the
-//! comparison is on the field rather than 8-bit pixels, and every
-//! multiply-add pinned into an explicitly fused form, since shader compilers
-//! contract `a*b + c` unasked. The residual ±1 also covers the Oklch→sRGB
-//! stage, which is its own pair of implementations.
+//! `cpu_and_gpu_noise_agree` in `texture-graph-gpu` holds the backends to
+//! within one sRGB step across D1/D2/D3 and both ranges. Bit-exactness
+//! would need a float read-back and explicitly fused multiply-adds, since
+//! shader compilers contract `a*b + c` on their own. The ±1 also covers the
+//! two Oklch→sRGB implementations.
 
 #![allow(clippy::excessive_precision)]
 
-/// Dimensionality of the noise field, mirroring [`crate::NoiseDims`].
+/// Mirrors [`crate::NoiseDims`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Dims {
     D1,
@@ -73,15 +50,14 @@ pub enum Dims {
     D3,
 }
 
-/// Which kernel generates the field, mirroring [`crate::NoiseKernel`].
+/// Mirrors [`crate::NoiseKernel`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Kernel {
     Simplex,
     Value,
 }
 
-/// How an octave's raw sample is shaped before it is summed, mirroring
-/// [`crate::FractalMode`].
+/// Mirrors [`crate::FractalMode`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum FractalMode {
     Standard,
@@ -89,7 +65,7 @@ pub enum FractalMode {
     Ridged,
 }
 
-/// Octave stack, mirroring [`crate::Fractal`].
+/// Mirrors [`crate::Fractal`].
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Fractal {
     pub octaves: u32,
@@ -99,19 +75,18 @@ pub struct Fractal {
     pub normalize: bool,
 }
 
-/// Upper bound on [`Fractal::octaves`]. The shader unrolls nothing, but a
-/// bound keeps a typo from costing a thousand samples a pixel.
+/// Upper bound on [`Fractal::octaves`], so a mistyped count cannot cost
+/// thousands of samples a pixel.
 pub const MAX_OCTAVES: u32 = 8;
 
-/// Everything about a noise field except where it is sampled and what seed
-/// it runs under.
+/// A noise field, apart from sample position and seed.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Spec {
     pub dims: Dims,
     pub kernel: Kernel,
-    /// Cycles per unit sample-space, at the first octave.
+    /// Cycles per unit of sample space, at the first octave.
     pub frequency: f32,
-    /// Lattice period in cells, per axis; `0` = unbounded. [`Kernel::Value`]
+    /// Lattice period in cells per axis; `0` is unbounded. [`Kernel::Value`]
     /// only.
     pub period: [u32; 3],
     pub fractal: Fractal,
@@ -119,9 +94,6 @@ pub struct Spec {
     pub signed: bool,
 }
 
-// ---- Permutation helpers -----------------------------------------------
-
-/// `(((x * 34) + 1) * x) mod 289` — the permutation polynomial.
 fn permute(x: f32) -> f32 {
     (((x * 34.0) + 1.0) * x) % 289.0
 }
@@ -130,13 +102,12 @@ fn taylor_inv_sqrt(r: f32) -> f32 {
     1.79284291400159 - 0.85373472095314 * r
 }
 
-/// WGSL `fract`: `x - floor(x)`, which for negative `x` is *not* Rust's
-/// `f32::fract`.
+/// WGSL `fract`. Differs from Rust's `f32::fract` for negative `x`.
 fn fract(x: f32) -> f32 {
     x - x.floor()
 }
 
-/// WGSL `step(edge, x)`: 1 when `x >= edge`, else 0.
+/// WGSL `step`.
 fn step(edge: f32, x: f32) -> f32 {
     if x >= edge { 1.0 } else { 0.0 }
 }
@@ -152,8 +123,6 @@ fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
 fn dot4(a: [f32; 4], b: [f32; 4]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
 }
-
-// ---- 2D ----------------------------------------------------------------
 
 /// 2D simplex noise, roughly `[-1, 1]`.
 pub fn snoise2(v: [f32; 2]) -> f32 {
@@ -211,13 +180,10 @@ pub fn snoise2(v: [f32; 2]) -> f32 {
     130.0 * dot3(m, g)
 }
 
-// ---- 3D ----------------------------------------------------------------
-
 /// 3D simplex noise, roughly `[-1, 1]`.
 ///
-/// The index loops walk four lanes of several arrays at once, which is what
-/// the shader's `vec4` lanes are. Zipping them would read better in
-/// isolation and worse against the twin, and the twin is the point.
+/// The index loops mirror the shader's `vec4` lanes, so they stay loops
+/// rather than zips to keep the two easy to compare.
 #[allow(clippy::needless_range_loop)]
 pub fn snoise3(v: [f32; 3]) -> f32 {
     const CX: f32 = 1.0 / 6.0;
@@ -336,16 +302,12 @@ pub fn snoise3(v: [f32; 3]) -> f32 {
     )
 }
 
-// ---- Value noise -------------------------------------------------------
-
-/// Hash of one lattice corner. Integer end to end, so the two backends
-/// produce the *same bits* for a corner rather than two roundings of one
-/// polynomial — which is what lets a periodic field match itself exactly
-/// across a tile boundary.
+/// Integer-only, so both backends produce the same bits for a corner and
+/// a periodic field matches itself exactly across a tile boundary.
 ///
-/// Mixing constants are the consumer's own plume hash (§1 of
-/// `documentation/game-consumer-features.md`), finished with the usual
-/// xor-shift-multiply avalanche.
+/// Mixing constants are the consumer's plume hash (section 1 of
+/// `documentation/game-consumer-features.md`), then an xor-shift-multiply
+/// avalanche.
 fn lattice_hash(cell: [i32; 3], seed: u32) -> u32 {
     let mut h = (cell[0] as u32).wrapping_mul(1_597_334_677)
         ^ (cell[1] as u32).wrapping_mul(3_812_015_801)
@@ -359,10 +321,8 @@ fn lattice_hash(cell: [i32; 3], seed: u32) -> u32 {
     h
 }
 
-/// Wrap a lattice cell index into `[0, period)`. `period == 0` is
-/// "unbounded on this axis" and passes the index through. Written the way
-/// WGSL has to write it (`%` truncates toward zero on both sides), not as
-/// `rem_euclid`, so the twin is a transcription.
+/// Wrap into `[0, period)`; `period == 0` passes through. Not `rem_euclid`,
+/// so it matches the WGSL, where `%` truncates toward zero.
 fn wrap_cell(i: i32, period: u32) -> i32 {
     if period == 0 {
         return i;
@@ -371,8 +331,7 @@ fn wrap_cell(i: i32, period: u32) -> i32 {
     ((i % p) + p) % p
 }
 
-/// Smoothstep weight `t²(3 - 2t)`. Gives C¹ continuity across cell walls;
-/// plain linear weights would show the lattice as a grid of creases.
+/// C¹ across cell walls; linear weights would show the lattice as creases.
 fn smooth_weight(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
@@ -381,9 +340,7 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
-/// Trilinear value noise at `p`, roughly `[-1, 1]`.
-///
-/// The field repeats every `period` cells on each axis where `period != 0`.
+/// Roughly `[-1, 1]`.
 fn value_noise(p: [f32; 3], period: [u32; 3], seed: u32) -> f32 {
     let i = [p[0].floor(), p[1].floor(), p[2].floor()];
     let base = [i[0] as i32, i[1] as i32, i[2] as i32];
@@ -409,10 +366,8 @@ fn value_noise(p: [f32; 3], period: [u32; 3], seed: u32) -> f32 {
     lerp(c0, c1, w[2])
 }
 
-// ---- Seeding -----------------------------------------------------------
-
-/// Wang hash. Not cryptographic — it only has to make different
-/// `(seed, seed_offset)` pairs produce visually distinct noise.
+/// Wang hash. Not cryptographic; it only has to make different seeds look
+/// distinct.
 pub fn wang_hash(seed: u32) -> u32 {
     let mut x = seed;
     x = (x ^ 61) ^ (x >> 16);
@@ -428,8 +383,7 @@ pub fn hash_to_float01(x: u32) -> f32 {
     (x >> 8) as f32 * (1.0 / 16_777_216.0)
 }
 
-/// The translation this seed applies to the sample position, per axis. The
-/// XOR constants are arbitrary and must match the shader's.
+/// The XOR constants are arbitrary and must match the shader's.
 fn seed_offsets(seed: u32) -> [f32; 3] {
     [
         hash_to_float01(wang_hash(seed ^ 0xA1B2_C3D4)) * 256.0,
@@ -438,12 +392,12 @@ fn seed_offsets(seed: u32) -> [f32; 3] {
     ]
 }
 
-/// Stride between octave seeds. Large and odd so octave `i` of one output
-/// channel never lands on octave `j` of the next — channels are only one
-/// apart, and a collision there would correlate L with C visibly.
+/// Large and odd so octave seeds of one channel never collide with the
+/// next channel's, which is only one seed apart. A collision would visibly
+/// correlate L with C.
 const OCTAVE_SEED_STRIDE: u32 = 0x9E37_79B9;
 
-/// One raw octave, in the kernel's own roughly-`[-1, 1]` convention.
+/// Roughly `[-1, 1]`.
 fn octave(
     dims: Dims,
     kernel: Kernel,
@@ -457,8 +411,7 @@ fn octave(
         Kernel::Simplex => {
             let o = seed_offsets(seed);
             match dims {
-                // D1 samples the 2D kernel with y pinned — and, as on the
-                // GPU, only the x axis is scaled by frequency.
+                // As on the GPU, only x is scaled by frequency.
                 Dims::D1 => snoise2([(uvw[0] + o[0]) * f, o[1]]),
                 Dims::D2 => snoise2([(uvw[0] + o[0]) * f, (uvw[1] + o[1]) * f]),
                 Dims::D3 => snoise3([
@@ -468,9 +421,7 @@ fn octave(
                 ]),
             }
         }
-        // Unused axes are pinned to exactly 0, which lands on a lattice
-        // plane rather than somewhere arbitrary inside a cell. The seed
-        // stays out of the coordinates — see the module docs.
+        // Unused axes are 0, on a lattice plane rather than inside a cell.
         Kernel::Value => match dims {
             Dims::D1 => value_noise([uvw[0] * f, 0.0, 0.0], [period[0], 0, 0], seed),
             Dims::D2 => value_noise(
@@ -483,8 +434,8 @@ fn octave(
     }
 }
 
-/// Shape one octave before it is summed. Expressed on the signed sample
-/// `r ∈ [-1, 1]`, so `1 - |2n - 1|` over an unsigned `n` is just `1 - |r|`.
+/// On the signed sample `r`, where the documented `1 - |2n - 1|` over
+/// unsigned `n` is `1 - |r|`.
 fn shape(r: f32, mode: FractalMode) -> f32 {
     match mode {
         FractalMode::Standard => r,
@@ -496,13 +447,11 @@ fn shape(r: f32, mode: FractalMode) -> f32 {
     }
 }
 
-/// This octave's lattice period: the base period scaled alongside the
-/// frequency, so a tiling field stays tiling as octaves are added.
+/// Scales the period with the frequency so every octave tiles. Exact only
+/// for integral lacunarity.
 ///
-/// `floor(x + 0.5)` rather than `round`, because WGSL's `round` breaks ties
-/// to even and Rust's breaks them away from zero. Only an integral
-/// `lacunarity` keeps this exact — at 2.13 the scaled period and the scaled
-/// frequency drift apart and the tile seams.
+/// `floor(x + 0.5)`, not `round`: WGSL's `round` breaks ties to even and
+/// Rust's away from zero.
 fn octave_period(base: [u32; 3], scale: f32) -> [u32; 3] {
     let axis = |p: u32| -> u32 {
         if p == 0 {
@@ -514,20 +463,12 @@ fn octave_period(base: [u32; 3], scale: f32) -> [u32; 3] {
     [axis(base[0]), axis(base[1]), axis(base[2])]
 }
 
-/// One noise sample, in the same `[-1, 1]` (signed) or `[0, 1]` (unsigned)
-/// convention the shader uses.
+/// One sample in `[-1, 1]` if [`Spec::signed`], else `[0, 1]`. `seed` is
+/// the full `ctx.seed + seed_offset + channel`. Mirrors `sample_noise` in
+/// noise.wgsl.
 ///
-/// `seed` is already `ctx.seed + seed_offset + channel`. The twin is
-/// `sample_noise` in noise.wgsl.
-///
-/// The octave loop always produces a signed-convention value, and
-/// [`Spec::signed`] maps it: `Turbulence` and `Ridged` land in `[0, 1]`
-/// naturally, so they are stretched to `[-1, 1]` and — for the unsigned
-/// case — folded straight back. One rule, rather than a range that depends
-/// on the mode.
-///
-/// A one-octave `Standard` fractal reduces to the bare kernel exactly,
-/// which is what a file written before fractals existed loads as.
+/// `Turbulence` and `Ridged` sum into `[0, 1]`, so they are stretched to
+/// `[-1, 1]` first; every mode then maps to unsigned the same way.
 pub fn sample(spec: &Spec, seed: u32, uvw: [f32; 3]) -> f32 {
     let octaves = spec.fractal.octaves.clamp(1, MAX_OCTAVES);
     let mut frequency = spec.frequency;
@@ -568,9 +509,8 @@ pub fn sample(spec: &Spec, seed: u32, uvw: [f32; 3]) -> f32 {
 mod tests {
     use super::*;
 
-    /// The kernel is meant to land in roughly `[-1, 1]` and to actually
-    /// vary. A constant or an out-of-range field would sail past every
-    /// parity check — both backends would agree on nonsense.
+    /// Parity checks cannot catch a constant or out-of-range field, since
+    /// both backends would agree on it.
     #[test]
     fn the_kernels_vary_and_stay_in_range() {
         let mut lo2 = f32::INFINITY;
@@ -594,9 +534,8 @@ mod tests {
         assert!(hi3 - lo3 > 1.0, "3D barely varies: {lo3}..{hi3}");
     }
 
-    /// Negative coordinates are the case Rust's own `fract` would get wrong,
-    /// and they are ordinary here: the seed offset is positive but a
-    /// transform can push a sample anywhere.
+    /// Rust's `fract` would break here; a transform can make any coordinate
+    /// negative.
     #[test]
     fn negative_coordinates_are_continuous_across_zero() {
         for k in 1..20 {
@@ -610,8 +549,6 @@ mod tests {
         }
     }
 
-    /// One octave of `Standard`, the shape a file without fractal fields
-    /// loads as.
     fn plain(dims: Dims, kernel: Kernel, frequency: f32, signed: bool) -> Spec {
         Spec {
             dims,
@@ -629,9 +566,7 @@ mod tests {
         }
     }
 
-    /// Different seeds have to give different fields, or `seed_offset` is
-    /// decorative. Both kernels: the value kernel seeds through its hash
-    /// rather than the coordinates, so this is a separate claim for it.
+    /// Checked for both kernels, since they seed differently.
     #[test]
     fn the_seed_moves_the_field() {
         for kernel in [Kernel::Simplex, Kernel::Value] {
@@ -642,8 +577,6 @@ mod tests {
         }
     }
 
-    /// Unsigned is the signed field mapped onto `[0, 1]`, which is what the
-    /// shader's `raw * 0.5 + 0.5` says.
     #[test]
     fn unsigned_is_the_signed_field_remapped() {
         for k in 0..10 {
@@ -654,8 +587,6 @@ mod tests {
         }
     }
 
-    /// The value kernel has to satisfy the same range-and-varies claim the
-    /// simplex one does, or a tiling bake would tile nothing usefully.
     #[test]
     fn the_value_kernel_varies_and_stays_in_range() {
         let spec = plain(Dims::D3, Kernel::Value, 5.0, true);
@@ -673,12 +604,8 @@ mod tests {
         assert!(hi - lo > 1.0, "barely varies: {lo}..{hi}");
     }
 
-    /// The point of the whole kernel: `f(x) == f(x + period / frequency)`,
-    /// bit for bit, not nearly.
-    ///
-    /// Coordinates are chosen so the shifted sample is exact in f32 — at
-    /// `period == frequency` the shift is one whole unit, and a `k/64` grid
-    /// survives both the add and the frequency multiply.
+    /// `f(x) == f(x + period / frequency)` bit for bit. The `k/64` grid
+    /// and a shift of 1.0 keep every coordinate exact in f32.
     #[test]
     fn the_value_kernel_tiles_exactly() {
         for (dims, period) in [
@@ -695,7 +622,6 @@ mod tests {
                         continue;
                     }
                     let mut shifted = uvw;
-                    // period / frequency = 1.0 unit of sample space.
                     shifted[axis] += 1.0;
                     assert_eq!(
                         here,
@@ -707,20 +633,15 @@ mod tests {
         }
     }
 
-    /// An unbounded axis must *not* repeat, or `period: 0` is silently
-    /// doing something.
     #[test]
     fn an_unbounded_axis_does_not_repeat() {
-        // Dyadic coordinates, so `+ 1.0` is exact in f32 and any difference
-        // is the kernel's rather than the literal's.
+        // Dyadic coordinates, so `+ 1.0` is exact in f32.
         let spec = Spec { period: [8, 0, 0], ..plain(Dims::D2, Kernel::Value, 8.0, true) };
         let here = sample(&spec, 5, [0.3125, 0.3125, 0.0]);
         assert_ne!(here, sample(&spec, 5, [0.3125, 1.3125, 0.0]));
         assert_eq!(here, sample(&spec, 5, [1.3125, 0.3125, 0.0]));
     }
 
-    /// A tiling field stays tiling as octaves are added: the period scales
-    /// with the frequency, so every octave wraps on the same boundary.
     #[test]
     fn a_fractal_of_a_tiling_field_still_tiles() {
         let spec = Spec {
@@ -741,8 +662,8 @@ mod tests {
         }
     }
 
-    /// One `Standard` octave is the bare kernel — the compatibility claim
-    /// that lets `Fractal::default()` be the value an old file loads as.
+    /// Files without fractal fields load as `Fractal::default()`, which
+    /// relies on this.
     #[test]
     fn one_standard_octave_is_the_bare_kernel() {
         for kernel in [Kernel::Simplex, Kernel::Value] {
@@ -755,9 +676,6 @@ mod tests {
         }
     }
 
-    /// Normalized fbm stays inside the range its single octave had. An
-    /// un-normalized one is allowed out, and a graph that wants the extra
-    /// headroom asks for it.
     #[test]
     fn normalized_octaves_stay_in_range() {
         for mode in [FractalMode::Standard, FractalMode::Turbulence, FractalMode::Ridged] {
@@ -779,8 +697,6 @@ mod tests {
         }
     }
 
-    /// Octaves past the first have to actually contribute, or `octaves` is
-    /// an expensive no-op.
     #[test]
     fn more_octaves_change_the_field() {
         let one = plain(Dims::D2, Kernel::Value, 3.0, true);

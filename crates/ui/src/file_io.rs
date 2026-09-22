@@ -1,10 +1,9 @@
-//! File save/load. Both native and web run `rfd::AsyncFileDialog` off the
-//! UI: native on a background thread, web via `spawn_local`. Results land
-//! in a pending slot polled once per frame by [`poll_pending`].
+//! File save/load. Both platforms run `rfd::AsyncFileDialog` off the UI
+//! thread (native on a thread, web via `spawn_local`) and leave the result
+//! for [`poll_pending`].
 //!
-//! Native must not block the UI thread on the dialog future: macOS dispatches
-//! the panel to the main queue, so parking that thread hangs the app with no
-//! dialog ever appearing.
+//! Native must not block the UI thread on the dialog: macOS runs the panel on
+//! the main queue, so the app hangs and no dialog appears.
 
 use texture_graph_core::{FILE_EXTENSION, FileMetadata, Graph, TextureGraphFile};
 
@@ -36,8 +35,6 @@ pub fn handle_wants_open(state: &mut UiState, ctx: &egui::Context) {
     do_open(state, ctx);
 }
 
-// ---- Native ------------------------------------------------------------
-
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use std::sync::Mutex;
@@ -45,7 +42,6 @@ mod native {
 
     /// One dialog at a time — a second request while one is up is dropped.
     pub static DIALOG_OPEN: AtomicBool = AtomicBool::new(false);
-    /// Outcome of the last finished dialog, consumed by `poll_pending`.
     pub static PENDING: Mutex<Option<Outcome>> = Mutex::new(None);
 
     pub enum Outcome {
@@ -127,15 +123,12 @@ fn do_open(_state: &mut UiState, ctx: &egui::Context) {
     });
 }
 
-// ---- Web (wasm) --------------------------------------------------------
-
 #[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
 
 #[cfg(target_arch = "wasm32")]
 thread_local! {
-    /// File bytes handed back from an in-flight open dialog. Polled every
-    /// frame by [`poll_pending`] and turned into an `EditCmd::Replace`.
+    /// Bytes from a finished open dialog, taken by [`poll_pending`].
     static PENDING_LOAD: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
 }
 
@@ -174,7 +167,7 @@ fn do_open(_state: &mut UiState, ctx: &egui::Context) {
     });
 }
 
-/// Picks up the outcome of any finished dialog. Called every frame.
+/// Called every frame.
 pub fn poll_pending(state: &mut UiState) {
     #[cfg(target_arch = "wasm32")]
     {
@@ -203,7 +196,6 @@ pub fn poll_pending(state: &mut UiState) {
     }
 }
 
-/// Parse loaded file text and queue the graph replacement.
 fn apply_loaded(state: &mut UiState, stem: Option<String>, text: &str) {
     match texture_graph_core::load_from_str(text) {
         Ok(file) => {

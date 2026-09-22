@@ -15,7 +15,6 @@ pub fn oklcha_edit(ui: &mut egui::Ui, color: &mut Color) -> bool {
             *color = srgba_to_oklcha(rgba);
             changed = true;
         }
-        // The escape hatch for colors the sRGB picker can't reach.
         let btn = ui.small_button("LCh…");
         egui::Popup::from_toggle_button_response(&btn)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)

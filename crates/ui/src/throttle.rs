@@ -1,16 +1,13 @@
 //! Rate limit for rebakes driven by edits.
 //!
-//! A drag edits the graph every frame, and every edit makes the previews
-//! stale. Baking on each of those frames is what made dragging stutter, so a
-//! stale product rebakes at most once per [`BAKE_INTERVAL`]: the first edit
-//! bakes at once, later ones wait out the interval, and a repaint is booked
-//! for the end of the wait so the last edit of a drag still lands after the
-//! pointer stops moving.
+//! A drag edits the graph every frame, and baking every frame makes dragging
+//! stutter. A stale product rebakes at most once per [`BAKE_INTERVAL`], and a
+//! repaint is booked for the end of the wait so the last edit of a drag still
+//! bakes after the pointer stops.
 //!
-//! Time comes from egui's input clock rather than `Instant`, which panics
-//! on wasm.
+//! Time comes from egui's input clock because `Instant` panics on wasm.
 
-/// Seconds between edit-driven bakes: ten a second.
+/// Seconds between edit-driven bakes.
 pub const BAKE_INTERVAL: f64 = 0.1;
 
 #[derive(Debug, Default)]
@@ -19,10 +16,8 @@ pub struct Throttle {
 }
 
 impl Throttle {
-    /// Whether a bake may run now. If it may, the caller is taken to have
-    /// baked and the interval restarts. If not, a repaint is booked for when
-    /// it may, so the caller can leave its product stale without the result
-    /// waiting on the next input event.
+    /// If true, the caller must bake now and the interval restarts. If false,
+    /// a repaint is booked for when a bake may run.
     pub fn allow(&mut self, ctx: &egui::Context) -> bool {
         let now = ctx.input(|i| i.time);
         let wait = self.last.map_or(0.0, |t| t + BAKE_INTERVAL - now);
@@ -35,8 +30,7 @@ impl Throttle {
         }
     }
 
-    /// Record a bake that ran regardless of the throttle, so edits right
-    /// after it wait their turn too.
+    /// Record a bake that ran without asking [`Self::allow`].
     pub fn mark(&mut self, ctx: &egui::Context) {
         self.last = Some(ctx.input(|i| i.time));
     }

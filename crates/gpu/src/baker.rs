@@ -26,7 +26,6 @@ use crate::schedule::{
     Domain, OutputSlots, ScalarSlot, Schedule, schedule, schedule_layer, schedule_previews,
 };
 
-/// Max stops per ColorRamp supported by the GPU baker.
 const MAX_RAMP_STOPS: usize = 16;
 /// Bindings are declared at pipeline creation, so this is a hard cap.
 const MAX_RAMP_INPUTS: usize = 8;
@@ -41,7 +40,7 @@ pub struct BakeOutput {
 }
 
 /// The four PBR channels over a whole `res × res × depth` volume, `w` at each
-/// slice centre. The 3D preview samples these at object-space position rather
+/// slice center. The 3D preview samples these at object-space position rather
 /// than UV-mapping one flat slice.
 pub struct VolumeOutput {
     pub color: wgpu::Texture,
@@ -81,15 +80,13 @@ impl VolumeJob {
         self.next_z >= self.depth
     }
 
-    /// Compute dispatches one slice records, for sizing a step to a
-    /// budget: a slice of a deep graph costs more than one of a shallow.
+    /// Compute dispatches one slice records, for sizing a step to a budget.
     pub fn dispatches_per_slice(&self) -> u32 {
-        // The missing-texture refill and the four channel packs.
+        // + the missing-texture refill and the four channel packs.
         self.sched.order.len() as u32 + 5
     }
 
-    /// The volume. Only meaningful once [`Self::is_done`]; before that the
-    /// slices not yet reached hold nothing.
+    /// Slices not yet reached are empty until [`Self::is_done`].
     pub fn into_output(self) -> VolumeOutput {
         let mut it = self.volumes.into_iter();
         VolumeOutput {
@@ -103,21 +100,14 @@ impl VolumeJob {
 }
 
 /// Texel format for a single-channel bake.
-///
-/// All three are renderable in core WebGPU, which is why `bake_scalar`
-/// goes through a render pass — `R8Unorm` is not a core *storage* format.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum ScalarFormat {
-    /// One byte a texel, clamped to `[0, 1]` by the format. A quarter the
-    /// memory of `R16Float` and the usual choice for a baked field.
+    /// Clamped to `[0, 1]` by the format.
     R8Unorm,
-    /// Half a float a texel, unclamped, and filterable on WebGPU.
+    /// Unclamped, and filterable on WebGPU.
     R16Float,
-    /// Full precision, unclamped — but **not filterable** on WebGPU
-    /// without the `float32-filterable` feature, so a consumer sampling
-    /// this with a linear sampler gets a validation error. Useful for
-    /// tests and for a host that reads the values back rather than
-    /// sampling them.
+    /// Unclamped. Not filterable on WebGPU without the `float32-filterable`
+    /// feature: sampling it with a linear sampler is a validation error.
     R32Float,
 }
 
@@ -139,21 +129,19 @@ impl ScalarFormat {
     }
 }
 
-/// One scalar field over the six faces of a cube — the sphere counterpart
-/// of [`Baker::bake_scalar_volume`]. See [`texture_graph_core::sphere`].
+/// One scalar field over the six faces of a cube. See
+/// [`texture_graph_core::sphere`].
 ///
-/// A 2D texture of six array layers in `+X, -X, +Y, -Y, +Z, -Z` order, which
-/// is what a `Cube` view of it expects. [`crate::read_scalar_volume`] reads
-/// it back with `size = (face, face, 6)`.
+/// Six array layers in `+X, -X, +Y, -Y, +Z, -Z` order, as a `Cube` view
+/// expects. [`crate::read_scalar_volume`] reads it with
+/// `size = (face, face, 6)`.
 pub struct ScalarCube {
     pub texture: wgpu::Texture,
-    /// Texels along each edge of a face.
+    /// Edge length of a face in texels.
     pub face: u32,
     pub format: ScalarFormat,
 }
 
-/// What one pass through the layers samples: a plane at some `w`, or one
-/// face of a sphere bake.
 #[derive(Copy, Clone, Debug)]
 enum Slice {
     Plane { w: f32 },
@@ -178,13 +166,8 @@ impl Slice {
     }
 }
 
-/// Whether a layer means the same thing on a sphere as in a volume.
-///
-/// The rest re-sample an input at other (u, v) — a Transform, a Warp, a
-/// normal's finite difference, a Map's palette read along u — and on a cube
-/// face (u, v) is not a position in the field, so they would bake something
-/// plausible and wrong. Refusing them is honest until each has a sphere
-/// meaning of its own.
+/// Refuses layers that re-sample an input at other (u, v). On a cube face
+/// (u, v) is not a position in the field, so they would bake a wrong result.
 fn sphere_supports(kind: &LayerKind) -> Result<(), BakeError> {
     match kind {
         LayerKind::Color(_)
@@ -203,8 +186,8 @@ fn sphere_supports(kind: &LayerKind) -> Result<(), BakeError> {
     }
 }
 
-/// One scalar field over a whole `res × res × depth` volume, `w` at each
-/// slice centre — the volume counterpart of [`Baker::bake_scalar`].
+/// One scalar field over a `res × res × depth` volume, `w` at each slice
+/// center.
 pub struct ScalarVolume {
     pub texture: wgpu::Texture,
     /// (width, height, depth) in texels.
@@ -245,7 +228,6 @@ pub struct Baker {
     color_bgl: wgpu::BindGroupLayout,
     noise_pipeline: wgpu::ComputePipeline,
     coordinate_pipeline: wgpu::ComputePipeline,
-    // noise reuses `color_bgl`: same binding shape (uniform + storage_texture).
     transform_pipeline: wgpu::ComputePipeline,
     transform_bgl: wgpu::BindGroupLayout,
     mix_pipeline: wgpu::ComputePipeline,
@@ -253,33 +235,27 @@ pub struct Baker {
     map_pipeline: wgpu::ComputePipeline,
     map_bgl: wgpu::BindGroupLayout,
     min_max_pipeline: wgpu::ComputePipeline,
-    // min_max reuses `map_bgl` — same binding shape (uniform + storage_out + 2 inputs).
     ramp_pipeline: wgpu::ComputePipeline,
     ramp_bgl: wgpu::BindGroupLayout,
-    /// Bound into unused ramp input slots, so they never collide with an
-    /// output storage binding. Held here to keep `dummy_input_view` valid.
+    /// Bound into unused ramp input slots, so they never alias an output
+    /// storage binding.
     #[allow(dead_code)]
     dummy_input: wgpu::Texture,
     dummy_input_view: wgpu::TextureView,
     h2n_pipeline: wgpu::ComputePipeline,
-    // wave reuses `transform_bgl` too — uniform + storage_out + input_2d.
     wave_pipeline: wgpu::ComputePipeline,
-    // warp reuses `map_bgl` — uniform + storage_out + 2 input textures.
     warp_pipeline: wgpu::ComputePipeline,
-    // h2n reuses `transform_bgl` — same binding shape (uniform + storage_out + input_2d).
-    // missing reuses `color_bgl`: same binding shape (uniform + storage_texture).
     missing_pipeline: wgpu::ComputePipeline,
-    /// The magenta/black missing-texture grid, bound wherever a layer input
-    /// is `None`. Refilled per bake, and per slice for volumes.
+    /// Bound wherever a layer input is `None`. Refilled per bake, and per
+    /// slice for volumes.
     missing_tex: Option<wgpu::Texture>,
     missing_view: Option<wgpu::TextureView>,
     pack_pipeline: wgpu::ComputePipeline,
     pack_bgl: wgpu::BindGroupLayout,
     solid_pipeline: wgpu::ComputePipeline,
     solid_bgl: wgpu::BindGroupLayout,
-    /// One render pipeline per scalar format — a pipeline is bound to its
-    /// colour-target format, so they cannot share. Built on first use
-    /// rather than up front, because most sessions never bake a scalar.
+    /// Scalar pipelines are built on first use, one per target format;
+    /// most sessions never bake a scalar.
     scalar_shader: wgpu::ShaderModule,
     scalar_bgl: wgpu::BindGroupLayout,
     scalar_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
@@ -305,8 +281,7 @@ impl Baker {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba32Float,
-            // Sampled only: no STORAGE_BINDING, so wgpu can't confuse this
-            // with an output slot.
+            // No STORAGE_BINDING, so it cannot alias an output slot.
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -355,18 +330,11 @@ impl Baker {
         &self.ctx
     }
 
-    /// Bake per-layer thumbnails at 128². Every layer gets its own
-    /// intermediate slot (no pebble reuse), then a `pack_srgb8` pass packs
-    /// each to an `Rgba8Unorm` texture. Returns one texture per layer for
-    /// the UI to register with egui-wgpu.
-    /// Bake 128² thumbnails for `wanted` — or for every layer when it is
-    /// `None`.
+    /// Bake 128² `Rgba8Unorm` thumbnails for `wanted`, or for every layer
+    /// when it is `None`.
     ///
-    /// Asking for a subset costs a subset: only `wanted` and the layers
-    /// they transitively read are dispatched, and only `wanted` get an
-    /// output texture and a pack pass. The returned map has exactly the
-    /// layers that were asked for, so a caller holding textures for the
-    /// rest keeps showing them.
+    /// Only `wanted` and what they transitively read are dispatched. The
+    /// returned map holds exactly the layers asked for.
     pub fn bake_previews(
         &mut self,
         graph: &Graph,
@@ -379,9 +347,7 @@ impl Baker {
         let size = PREVIEW_SIZE;
         let device = self.ctx.device.clone();
 
-        // Fresh intermediate textures — one per layer, alive for the
-        // duration of this bake. Not cached in `self.pool` because that
-        // pool is sized to the output resolution.
+        // Not `self.pool`, which is sized to the output resolution.
         let mut inter_texs: Vec<wgpu::Texture> =
             Vec::with_capacity(sched.peak_slots as usize);
         let mut inter_views: Vec<wgpu::TextureView> =
@@ -408,9 +374,6 @@ impl Baker {
             inter_views.push(view);
         }
 
-        // One packed Rgba8Unorm output per *wanted* layer, kept and handed
-        // back. The rest of `sched.order` is scheduled only because
-        // something wanted reads it, and is never packed or returned.
         let packed: Vec<LayerId> = match wanted {
             Some(w) => sched.order.iter().copied().filter(|id| w.contains(id)).collect(),
             None => sched.order.clone(),
@@ -429,15 +392,13 @@ impl Baker {
                 label: Some("tg-bake-previews"),
             });
 
-        // Preview-sized missing-texture grid (the pool-sized one on
-        // `self` may be a different resolution).
+        // `self.missing_view` is pool-sized.
         let (_missing_tex, missing_view) = make_missing_texture(&device, size);
         dispatch_missing(
             &self.ctx, &mut encoder, &self.missing_pipeline, &self.color_bgl,
             &missing_view, size, texture_graph_core::FLAT_W,
         );
 
-        // 1. Dispatch every layer into its own intermediate slot.
         for &id in &sched.order {
             let slot = *sched.slot_of.get(&id).unwrap() as usize;
             let layer = graph.get(id).unwrap();
@@ -454,9 +415,7 @@ impl Baker {
             )?;
         }
 
-        // 2. Pack every wanted intermediate to its sRGB output. Thumbnails
-        // show the layer's own [0, 1] view even when its bake domain is
-        // wider.
+        // Thumbnails show [0, 1] even when the bake domain is wider.
         for &id in &packed {
             let slot = *sched.slot_of.get(&id).unwrap() as usize;
             let dst_view = output_views.get(&id).unwrap();
@@ -480,11 +439,7 @@ impl Baker {
         Ok(outputs)
     }
 
-    /// Emit compute dispatches for one layer, writing its output into
-    /// `pool_views[dst_slot]`. Shared between `bake_output`,
-    /// `bake_previews`, and `bake_volume`. `w` is the third texture
-    /// coordinate for this pass — 0.5 for flat bakes, the slice center for
-    /// volume bakes.
+    /// Writes one layer into `pool_views[dst_slot]`.
     fn dispatch_kind(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -498,15 +453,12 @@ impl Baker {
         missing_view: &wgpu::TextureView,
     ) -> Result<(), BakeError> {
         let w = at.w();
-        // A `None` input has no slot — it samples the missing-texture grid.
         let resolve = |opt: Option<texture_graph_core::LayerId>| -> &wgpu::TextureView {
             match opt {
                 Some(id) => &pool_views[slot_of(sched, id) as usize],
                 None => missing_view,
             }
         };
-        // Bake domain of this layer and of each input (the missing grid is
-        // always baked over the unit square).
         let own_dom = domain_of(sched, layer.id);
         let dom_opt = |opt: Option<texture_graph_core::LayerId>| -> [f32; 4] {
             match opt {
@@ -574,9 +526,8 @@ impl Baker {
                 let a_view = resolve(m.a);
                 let (factor_view, dom_factor) = match &m.factor {
                     ScalarInput::Layer(id) => (resolve(Some(*id)), dom_opt(Some(*id))),
-                    // Bind `a` as a placeholder for the factor texture; the
-                    // shader only samples it when factor_is_layer == 1. A
-                    // parameter is a number by now, so it takes this path.
+                    // `a` is a placeholder; the shader does not read it.
+                    // Params are already resolved to numbers.
                     ScalarInput::Const(_) | ScalarInput::Param(_) => (a_view, dom_opt(m.a)),
                 };
                 dispatch_mix(
@@ -659,9 +610,7 @@ impl Baker {
                 );
             }
             LayerKind::Wave(wv) => {
-                // A const input never reads the texture; bind the output's
-                // own domain's placeholder rather than leave the slot
-                // unbound, as Mix does for its factor.
+                // A const input is not read, but the slot must be bound.
                 let (src_view, dom_input) = match &wv.input {
                     ScalarInput::Layer(id) => (resolve(Some(*id)), dom_opt(Some(*id))),
                     ScalarInput::Const(_) | ScalarInput::Param(_) => {
@@ -727,13 +676,10 @@ impl Baker {
         }
     }
 
-    /// Bake the graph's output at `size`. Only variants with pipelines
-    /// implemented so far are supported; others return `Unsupported`.
+    /// Bake the graph's output at `size`.
     ///
-    /// `object_alpha` switches the presentation of partial alpha: `false`
-    /// composites the gray backing checker into the color channel (flat
-    /// previews), `true` keeps the real alpha so the 3D preview can blend
-    /// the object itself.
+    /// `object_alpha = false` composites partial alpha over a gray checker,
+    /// for flat previews; `true` keeps the alpha for the 3D preview to blend.
     pub fn bake_output(
         &mut self,
         graph: &Graph,
@@ -742,9 +688,7 @@ impl Baker {
         object_alpha: bool,
     ) -> Result<BakeOutput, BakeError> {
         let t0 = BakeTimer::start();
-        // Bind the graph's named parameters once, here: from this point on
-        // a `Param` socket is the same number a `Const` one would be, and
-        // no shader has to know the difference.
+        // After this, a `Param` socket is a constant.
         let eval_ctx = &graph.resolve_params(eval_ctx);
         let sched = schedule(graph, eval_ctx)?;
         self.ensure_pool(size, sched.peak_slots.max(1));
@@ -762,7 +706,6 @@ impl Baker {
             missing_view, size, texture_graph_core::FLAT_W,
         );
 
-        // Dispatch each layer.
         for &id in &sched.order {
             let slot = *sched.slot_of.get(&id).unwrap() as usize;
             let layer = graph.get(id).unwrap();
@@ -779,8 +722,6 @@ impl Baker {
             )?;
         }
 
-        // Pack the four output channels. Each pack maps display [0, 1] UV
-        // into its source layer's bake domain.
         let chan_dom = |id: Option<LayerId>| -> [f32; 4] {
             match id {
                 Some(id) => domain_of(&sched, id),
@@ -885,24 +826,17 @@ impl Baker {
     }
 
     /// Bake one layer's scalar (its Oklch L) to a single-channel texture.
+    /// At 256³ in `R8Unorm` that is 16 MB, against 268 MB for
+    /// [`Baker::bake_output`].
     ///
-    /// The point is arithmetic, not taste: a consumer that wants one
-    /// grayscale field out of [`Baker::bake_output`] pays for four
-    /// `Rgba8Unorm` channels and four pack passes to throw three away.
-    /// At 256³ that is the difference between 268 MB and 16 MB.
+    /// Only `layer` and what it transitively reads are dispatched; the
+    /// graph's Output is not consulted.
     ///
-    /// Only `layer` and what it transitively reads are dispatched — the
-    /// graph's Output is not consulted, so a graph can carry several
-    /// fields side by side and a consumer can bake each one on its own.
+    /// Texels are the raw scalar, not a display-encoded gray. `R8Unorm`
+    /// clamps to `[0, 1]`; the float formats keep signed values.
     ///
-    /// The texel is the raw scalar, not a display-encoded gray. `R8Unorm`
-    /// clamps to `[0, 1]` as the format requires; the float formats keep
-    /// the value unclamped, so a signed field survives.
-    ///
-    /// The returned texture carries `TEXTURE_BINDING | COPY_SRC`, so a
-    /// consumer sharing this device can sample it directly and skip
-    /// readback entirely — which is the fast path, and the reason this
-    /// returns a texture rather than an image.
+    /// The texture has `TEXTURE_BINDING | COPY_SRC`, so a consumer on the
+    /// same device can sample it without readback.
     pub fn bake_scalar(
         &mut self,
         graph: &Graph,
@@ -935,15 +869,9 @@ impl Baker {
         Ok(dst)
     }
 
-    /// [`Baker::bake_scalar`] over a volume: `res × res × depth` sampled at
-    /// slice centres, exactly as [`Baker::bake_volume`] does, and with the
-    /// same known limitation — a Transform's w offset/scale cannot
-    /// re-sample its input at a different w, because each slice only has
-    /// its inputs baked at that slice's w.
-    ///
-    /// One encoder and submit per slice, for the reason `bake_volume`
-    /// gives: recording every slice into one encoder blows wgpu-metal's
-    /// outstanding-command-buffer cap on a real graph.
+    /// [`Baker::bake_scalar`] over a `res × res × depth` volume, sampled at
+    /// slice centers as [`Baker::bake_volume`] does, with the same
+    /// limitation on a Transform's w offset/scale.
     pub fn bake_scalar_volume(
         &mut self,
         graph: &Graph,
@@ -960,8 +888,8 @@ impl Baker {
         self.ensure_pool(size, sched.peak_slots.max(1));
 
         let device = self.ctx.device.clone();
-        // One reusable 2D slice target, copied into the volume per slice —
-        // a 2D view of a 3D texture is not a thing WebGPU offers.
+        // WebGPU has no 2D view of a 3D texture, so render to a 2D slice and
+        // copy it in.
         let slice = make_scalar_texture(&device, size, format, "tg-scalar-vol-slice");
         let slice_view = slice.create_view(&wgpu::TextureViewDescriptor::default());
         let texture = make_scalar_volume_texture(&device, res, depth, format, "tg-scalar-vol");
@@ -1003,14 +931,12 @@ impl Baker {
         Ok(ScalarVolume { texture, size: (res, res, depth), format })
     }
 
-    /// [`Baker::bake_scalar`] on a sphere: `layer` sampled over the six
-    /// faces of a cube, each texel at its direction's point on the sphere
-    /// inscribed in the unit cube. The same field a volume bake holds on
-    /// that shell, at a resolution a volume could not afford.
+    /// [`Baker::bake_scalar`] on a sphere: each texel of the six cube faces
+    /// samples its direction's point on the sphere inscribed in the unit
+    /// cube.
     ///
-    /// Only layers that mean the same thing on a sphere may be reachable
-    /// from `layer`; anything else is refused before a dispatch is
-    /// recorded. See `sphere_supports`.
+    /// Returns `Unsupported` if `layer` reads a ColorRamp, Transform, Map,
+    /// HeightToNormal or Warp, which re-sample at other (u, v).
     pub fn bake_scalar_cube(
         &mut self,
         graph: &Graph,
@@ -1068,7 +994,7 @@ impl Baker {
     }
 
     /// Dispatch every layer for one slice, then pack `layer`'s slot into
-    /// `dst_view`. Shared by the flat, volume and sphere scalar bakes.
+    /// `dst_view`.
     #[allow(clippy::too_many_arguments)]
     fn record_scalar_slice(
         &mut self,
@@ -1112,9 +1038,7 @@ impl Baker {
         Ok(())
     }
 
-    /// The render pipeline for `format`, built on first use. Cloning a
-    /// `RenderPipeline` is an `Arc` bump, which is what lets this hand one
-    /// out without borrowing `self` for the rest of the call.
+    /// Returns a clone (an `Arc` bump) so `self` is not borrowed afterwards.
     fn scalar_pipeline(&mut self, format: ScalarFormat) -> wgpu::RenderPipeline {
         let tf = format.texture_format();
         self.scalar_pipelines
@@ -1130,19 +1054,14 @@ impl Baker {
             .clone()
     }
 
-    /// Bake the graph as a solid 3D texture: run the whole per-slice 2D
-    /// pipeline `depth` times with w advancing through the slice centers,
-    /// packing each slice and copying it into layer `z` of four 3D
-    /// textures. Reuses every existing 2D shader — the only per-slice
-    /// difference is the `w` uniform fed to the coordinate-generating
-    /// stages (noise, transform).
+    /// Bake the graph as four 3D textures by running the 2D pipeline once
+    /// per slice, with `w` at the slice center.
     ///
-    /// All at once, which can take a good fraction of a second of CPU at
-    /// 256³; see [`Baker::begin_volume`] to spread it over frames.
+    /// Can take a large part of a second of CPU at 256³; see
+    /// [`Baker::begin_volume`] to spread it over frames.
     ///
-    /// Known limitation (same as the flat GPU path): a Transform's w
-    /// *offset/scale* can't re-sample its input at a different w, because
-    /// each slice only has its inputs baked at the same w.
+    /// A Transform's w offset/scale has no effect, because each slice has
+    /// its inputs baked only at its own w.
     pub fn bake_volume(
         &mut self,
         graph: &Graph,
@@ -1156,11 +1075,10 @@ impl Baker {
     }
 
     /// Start a [`Baker::bake_volume`] that [`Baker::step_volume`] carries
-    /// out a few slices at a time. Nothing is recorded yet.
+    /// out a few slices at a time.
     ///
-    /// The job snapshots the graph and owns its intermediates, so the
-    /// graph can be edited and other bakes run between steps without
-    /// disturbing it.
+    /// The job snapshots the graph and owns its intermediates, so the graph
+    /// can be edited and other bakes run between steps.
     pub fn begin_volume(
         &mut self,
         graph: &Graph,
@@ -1180,8 +1098,6 @@ impl Baker {
             .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()))
             .collect();
         let (missing_tex, missing_view) = make_missing_texture(device, size);
-        // Reusable 2D slice targets (storage-written by pack, then copied
-        // out) and the four 3D destination volumes.
         let slices: Vec<wgpu::Texture> = ["color", "rough", "metal", "normal"]
             .iter()
             .map(|n| make_output_texture(device, size, &format!("tg-vol-slice-{n}")))
@@ -1231,9 +1147,8 @@ impl Baker {
         })
     }
 
-    /// Record and submit up to `max_slices` more of `job`'s slices.
-    /// Whether it is finished; once it is, [`VolumeJob::into_output`] has
-    /// the volume.
+    /// Record and submit up to `max_slices` more of `job`'s slices. Returns
+    /// whether the job is finished.
     pub fn step_volume(&mut self, job: &mut VolumeJob, max_slices: u32) -> Result<bool, BakeError> {
         const CHANNELS: [OutputChannel; 4] = [
             OutputChannel::Color,
@@ -1246,14 +1161,10 @@ impl Baker {
         let size = (job.res, job.res);
         let stop = job.next_z.saturating_add(max_slices).min(job.depth);
         for z in job.next_z..stop {
-            // One encoder + submit PER SLICE. On Metal every compute pass
-            // becomes its own command buffer that stays "outstanding" until
-            // its encoder is submitted; recording all slices into one
-            // encoder puts depth × layers passes in flight at once, which
-            // blows wgpu-metal's 4096 outstanding-command-buffer cap on
-            // real graphs (observed: ~30-layer graph × 64 slices → device
-            // lost). Per-slice submits keep it bounded by one slice's
-            // passes.
+            // One submit per slice. On Metal each compute pass is a command
+            // buffer outstanding until submit, and wgpu-metal caps those at
+            // 4096; one encoder for all slices lost the device on a
+            // ~30-layer graph × 64 slices.
             let mut encoder = self
                 .ctx
                 .device
@@ -1261,7 +1172,7 @@ impl Baker {
                     label: Some("tg-bake-volume"),
                 });
             let w = (z as f32 + 0.5) / job.depth as f32;
-            // Refill per slice — the grid alternates along w too.
+            // The grid alternates along w.
             dispatch_missing(
                 &self.ctx, &mut encoder, &self.missing_pipeline, &self.color_bgl,
                 &job.missing_view, size, w,
@@ -1334,8 +1245,6 @@ impl Baker {
     }
 }
 
-// ---- Dispatch helpers --------------------------------------------------
-
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct ColorParams {
@@ -1354,11 +1263,10 @@ struct NoiseParams {
     seed_base: u32,
     frequency: f32,
     w_coord: f32,
-    /// Bake domain as (min_u, min_v, ext_u, ext_v).
     dom: [f32; 4],
-    /// Lattice period in cells; 0 = unbounded on that axis. `vec3<u32>` in
-    /// the shader, so it has to start 16-byte aligned — which offset 48
-    /// is, and the trailing `_pad` keeps the struct a multiple of 16.
+    /// In cells; 0 = unbounded on that axis. `vec3<u32>` in the shader, so
+    /// it must start 16-byte aligned (offset 48); `_pad` keeps the size a
+    /// multiple of 16.
     period: [u32; 3],
     octaves: u32,
     lacunarity: f32,
@@ -1376,15 +1284,12 @@ struct NoiseParams {
 struct PackParams {
     size: [u32; 2],
     mode: u32,
-    /// 0 = composite the gray alpha checker (flat previews);
-    /// 1 = keep real alpha (3D preview blends the object itself).
+    /// 0 = composite over the gray checker, 1 = keep alpha.
     alpha_object: u32,
     const_value: [f32; 4],
-    /// Volume slice index in texels (0 for flat bakes) — third axis of
-    /// the out-of-range 3D checkerboard.
+    /// Volume slice index in texels; 0 for flat bakes.
     z_px: u32,
     _pad: [u32; 3],
-    /// Source layer's bake domain (min_u, min_v, ext_u, ext_v).
     src_dom: [f32; 4],
 }
 
@@ -1417,9 +1322,7 @@ struct TransformParams {
     radial_into: u32,  // 0=U 1=V 2=W
     w_coord: f32,      // third texture coordinate; 0.5 for flat bakes
     edge_mode: u32,    // 0=Clamp, 1=Extend
-    /// Own bake domain (min_u, min_v, ext_u, ext_v).
     dom: [f32; 4],
-    /// Source layer's bake domain.
     src_dom: [f32; 4],
 }
 
@@ -1432,7 +1335,6 @@ struct MixParams {
     factor_const: f32,
     factor_is_layer: u32,  // 0=Const, 1=Layer
     _pad: [u32; 2],
-    /// Own bake domain, then each input's (min_u, min_v, ext_u, ext_v).
     dom: [f32; 4],
     dom_a: [f32; 4],
     dom_b: [f32; 4],
@@ -1444,7 +1346,6 @@ struct MixParams {
 struct MapParams {
     size: [u32; 2],
     _pad: [u32; 2],
-    /// Own bake domain, the value input's, and the palette's.
     dom: [f32; 4],
     dom_value: [f32; 4],
     dom_palette: [f32; 4],
@@ -1456,7 +1357,6 @@ struct MinMaxParams {
     size: [u32; 2],
     mode: u32,       // 0 = Min, 1 = Max
     criterion: u32,  // 0=R 1=G 2=B 3=Sat 4=Val 5=Luma 6=Alpha 7=Chroma
-    /// Own bake domain, then each input's.
     dom: [f32; 4],
     dom_a: [f32; 4],
     dom_b: [f32; 4],
@@ -1468,9 +1368,7 @@ struct RampParams {
     size: [u32; 2],
     stop_count: u32,
     space: u32,
-    /// Own bake domain.
     dom: [f32; 4],
-    /// Bake domain of each of the 8 possible layer-stop inputs.
     input_doms: [[f32; 4]; 8],
 }
 
@@ -1480,7 +1378,6 @@ struct H2NParams {
     size: [u32; 2],
     strength: f32,
     _pad: u32,
-    /// Own bake domain, then the source's.
     dom: [f32; 4],
     dom_src: [f32; 4],
 }
@@ -1492,9 +1389,8 @@ struct WarpParams {
     mode: u32,
     _pad0: u32,
     amount: [f32; 4],
-    /// Own bake domain, the source's (already grown by `|amount|` by the
-    /// scheduler), and the displacement field's.
     dom: [f32; 4],
+    /// Already grown by `|amount|` by the scheduler.
     dom_src: [f32; 4],
     dom_by: [f32; 4],
 }
@@ -1509,7 +1405,6 @@ struct WaveParams {
     phase: f32,
     input_const: f32,
     input_is_layer: u32,
-    /// Own bake domain, then the input layer's.
     dom: [f32; 4],
     dom_input: [f32; 4],
 }
@@ -1520,7 +1415,7 @@ struct RampStopPacked {
     color: [f32; 4],   // Oklcha; used when kind == 0
     t: f32,
     kind: u32,         // 0 = const, 1 = layer
-    input_index: u32,  // 0..7 into the ramp shader's input array
+    input_index: u32,  // 0..7
     _p0: f32,
 }
 
@@ -1623,8 +1518,7 @@ fn dispatch_warp(
             WarpMode::Vector => 1,
         },
         _pad0: 0,
-        // amount.z rides along for symmetry with the CPU struct; the
-        // shader cannot act on it — see warp.wgsl.
+        // The shader ignores amount.z; see warp.wgsl.
         amount: [w.amount[0], w.amount[1], w.amount[2], 0.0],
         dom,
         dom_src,
@@ -1990,8 +1884,7 @@ fn dispatch_ramp(
 ) -> Result<(), BakeError> {
     use wgpu::util::DeviceExt;
 
-    // Resolve unique layer-refs across stops → 0..N-1 input indices. Multiple
-    // stops pointing at the same layer share one slot.
+    // Stops that read the same layer share one input binding.
     let mut layer_to_input: HashMap<LayerId, u32> = HashMap::new();
     let mut input_pool_slots: Vec<u32> = Vec::new();
     let mut input_doms = [Domain::UNIT.packed(); MAX_RAMP_INPUTS];
@@ -2022,9 +1915,6 @@ fn dispatch_ramp(
 
     let mut packed = Vec::with_capacity(r.stops.len());
     for s in &r.stops {
-        // A parameter is a colour by now, so it packs exactly as a
-        // constant does — which is the whole claim that a param costs
-        // nothing per pixel.
         match eval_ctx.color_const(&s.color) {
             Some(c) => packed.push(RampStopPacked {
                 color: [c.l, c.chroma, c.hue.into_degrees(), c.alpha],
@@ -2056,10 +1946,8 @@ fn dispatch_ramp(
         usage: wgpu::BufferUsages::STORAGE,
     });
 
-    // Bindings 3..11 are the input textures. Any unused slot binds the
-    // Baker's persistent 1×1 dummy (sampled-only) so it never collides with
-    // the storage output binding. The shader only samples slots referenced
-    // by a Stop with kind == 1.
+    // Unused input bindings get the 1×1 dummy, so they never alias the
+    // storage output.
     let mut input_views: [&wgpu::TextureView; MAX_RAMP_INPUTS] =
         [dummy_input_view; MAX_RAMP_INPUTS];
     for (i, &slot) in input_pool_slots.iter().enumerate() {
@@ -2225,8 +2113,7 @@ fn dispatch_noise(
         frequency: n.frequency,
         w_coord: w,
         dom,
-        // `Graph` rejects a period on the simplex kernel, so the shader
-        // never has to decide which of the two the caller meant.
+        // `Graph` rejects a period on the simplex kernel.
         period: n.period,
         octaves: n.fractal.octaves.clamp(1, texture_graph_core::noise::MAX_OCTAVES),
         lacunarity: n.fractal.lacunarity,
@@ -2321,7 +2208,6 @@ fn pack_channel(
             ctx, encoder, pack_pipeline, pack_bgl,
             match out.color {
                 Some(slot) => &pool_views[slot as usize],
-                // Unconnected output color — pack the missing-texture grid.
                 None => missing_view,
             },
             dst_view, size, 0, [0.0; 4],
@@ -2414,7 +2300,6 @@ fn dispatch_pack(
     cpass.dispatch_workgroups(wg_x, wg_y, 1);
 }
 
-/// Fill `dst_view` with the missing-texture grid at slice coordinate `w`.
 fn dispatch_missing(
     ctx: &DeviceCtx,
     encoder: &mut wgpu::CommandEncoder,
@@ -2447,8 +2332,6 @@ fn dispatch_missing(
     cpass.dispatch_workgroups(wg_x, wg_y, 1);
 }
 
-/// Pool-format texture for the missing-input grid: storage-written by
-/// `dispatch_missing`, sampled by whatever layer has the unconnected input.
 fn make_missing_texture(
     device: &wgpu::Device,
     size: (u32, u32),
@@ -2499,12 +2382,8 @@ fn dispatch_solid(
     cpass.dispatch_workgroups(wg_x, wg_y, 1);
 }
 
-/// Wall-clock for the bake timing logs.
-///
-/// `std::time::Instant::now()` compiles for `wasm32-unknown-unknown` and
-/// then panics — there is no clock behind it. A consumer baking in the
-/// browser should not lose a texture to a `log::debug!` it never reads, so
-/// the timer is simply absent there and the log says `None`.
+/// Wall-clock for the bake timing logs. Absent on wasm, where
+/// `std::time::Instant::now()` compiles and then panics.
 #[derive(Copy, Clone)]
 struct BakeTimer {
     #[cfg(not(target_arch = "wasm32"))]
@@ -2544,8 +2423,6 @@ fn workgroup_counts(size: (u32, u32)) -> (u32, u32) {
     ((size.0 + 7) / 8, (size.1 + 7) / 8)
 }
 
-/// 3D `Rgba8Unorm` volume assembled slice-by-slice via
-/// `copy_texture_to_texture` and sampled by the solid 3D preview.
 fn make_volume_texture(device: &wgpu::Device, res: u32, depth: u32, label: &str) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
@@ -2565,7 +2442,6 @@ fn make_volume_texture(device: &wgpu::Device, res: u32, depth: u32, label: &str)
     })
 }
 
-/// An `Rgba32Float` intermediate a layer is baked into and read back from.
 fn make_pool_texture(device: &wgpu::Device, size: (u32, u32)) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("tg-pool"),
@@ -2604,8 +2480,7 @@ fn make_output_texture(device: &wgpu::Device, size: (u32, u32), label: &str) -> 
     })
 }
 
-/// CPU-side sRGB gamma of one 0..=1 linear-light component. Used to encode
-/// constant scalar output channels so they visually match the shader path.
+/// Encodes constant scalar output channels to match the shader path.
 fn srgb_of_linear_component(x: f32) -> f32 {
     let clamped = x.clamp(0.0, 1.0);
     if clamped <= 0.0031308 {
@@ -2616,19 +2491,15 @@ fn srgb_of_linear_component(x: f32) -> f32 {
 }
 
 
-// ---- Single-channel pack ----------------------------------------------
-
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct ScalarPackParams {
     size: [u32; 2],
     _pad: [u32; 2],
-    /// Source layer's bake domain (min_u, min_v, ext_u, ext_v).
     src_dom: [f32; 4],
 }
 
-/// Draw the fullscreen triangle that copies one intermediate's L into
-/// `dst_view`. A render pass, not a dispatch — see `pack_scalar.wgsl`.
+/// A render pass, not a dispatch; see `pack_scalar.wgsl`.
 fn draw_scalar_pack(
     ctx: &DeviceCtx,
     encoder: &mut wgpu::CommandEncoder,
@@ -2659,8 +2530,7 @@ fn draw_scalar_pack(
             depth_slice: None,
             resolve_target: None,
             ops: wgpu::Operations {
-                // The triangle covers every pixel, so the clear is only
-                // there to satisfy the load op.
+                // The triangle covers every pixel; the clear is never seen.
                 load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                 store: wgpu::StoreOp::Store,
             },
@@ -2748,8 +2618,6 @@ fn make_scalar_volume_texture(
     })
 }
 
-/// The shader module and bind-group layout every scalar-pack pipeline
-/// shares; only the colour-target format differs between them.
 fn make_scalar_pack_shader(
     device: &wgpu::Device,
 ) -> (wgpu::ShaderModule, wgpu::BindGroupLayout) {
@@ -2822,8 +2690,6 @@ fn make_scalar_pack_pipeline(
         cache: None,
     })
 }
-
-// ---- Pipeline factories ------------------------------------------------
 
 fn make_color_pipeline(
     device: &wgpu::Device,
@@ -3255,6 +3121,6 @@ fn storage_texture_bgle(
     }
 }
 
-// Silence unused-import warning while other imports are pending future variants.
+// Silences an unused-import warning.
 #[allow(dead_code)]
 fn _sink(_: HashMap<LayerId, ()>) {}

@@ -1,4 +1,4 @@
-// LayerKind::Coordinate: one axis of the sample point, as a gray. Twin of
+// LayerKind::Coordinate: one axis of the sample point, as a gray. Must match
 // the `Coordinate` arm of `core::eval`. Needs `sphere.wgsl` prepended.
 
 struct CoordinateParams {

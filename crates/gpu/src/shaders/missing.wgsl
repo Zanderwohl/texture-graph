@@ -1,8 +1,7 @@
-// Fills a pool texture with the "missing texture" grid used for
-// unconnected (`None`) layer inputs: a magenta/black checkerboard with 16
-// cells per unit in u, v, AND w so it stays a solid 3D checker in volume
-// bakes. Mirrors `missing_texture` in core::eval — keep the cell count
-// and Oklcha constants in sync. Magenta is Oklch of sRGB (1, 0, 1).
+// Magenta/black checker for unconnected (`None`) inputs, 16 cells per unit
+// in u, v and w so volume bakes get a 3D checker. Keep the cell count and
+// colors in sync with `missing_texture` in core::eval. Magenta is Oklch of
+// sRGB (1, 0, 1).
 
 struct MissingParams {
     size: vec2<u32>,

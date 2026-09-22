@@ -5,11 +5,10 @@
 //!
 //! # Staleness
 //!
-//! Textures are replaced in place and never cleared in bulk. An entry
-//! records the graph revision it was baked from; an edit records, per layer
-//! it can have changed, the revision at which that layer's picture stopped
-//! being current. A layer whose entry is behind rebakes on the next request
-//! and keeps showing its previous image until the replacement exists.
+//! An entry records the graph revision it was baked from; an edit records,
+//! per layer it can have changed, the revision at which that layer's picture
+//! stopped being current. A layer whose entry is behind rebakes on the next
+//! request and keeps showing its previous image until the replacement exists.
 //!
 //! Staleness is per layer because an edit usually reaches a handful of them
 //! and a rebake costs two textures, a registration and a freed id each.
@@ -29,14 +28,11 @@ use crate::throttle::Throttle;
 
 pub const PREVIEW_SIZE: u32 = 128;
 
-/// A registered GPU thumbnail. Keeps the texture, so the renderer's view
-/// stays alive, alongside the id to display.
 struct GpuThumb {
+    /// Held so the registered view stays alive.
     #[allow(dead_code)]
     tex: wgpu::Texture,
     id: TextureId,
-    /// The graph revision this was baked from, and the forced-retirement
-    /// counter it was baked under.
     revision: u64,
     forced: u64,
 }
@@ -57,25 +53,20 @@ pub struct PreviewCache {
     /// Bumped to retire every image for a reason the revision can't see, like
     /// a replaced graph or a failed device.
     forced: u64,
-    /// The revision this frame is drawing at.
     revision: u64,
     /// At most one bulk bake a frame: the baker runs every stale layer in a
     /// single submit, so the first request rebuilds all of them.
     rebuilt_this_frame: bool,
-    /// Spaces out rebakes of images that are merely out of date; see
-    /// [`crate::throttle`].
+    /// Spaces out rebakes of images that are merely out of date.
     throttle: Throttle,
 }
 
 impl PreviewCache {
-    /// Start a frame, retiring the images `dirty` names — `None` for all.
-    /// Images stay on screen until their replacements exist.
+    /// Retires the images `dirty` names, `None` for all.
     ///
-    /// Also drops entries for layers that no longer exist. That happens
-    /// here rather than in `rebuild` because deleting a layer nothing reads
-    /// leaves every *remaining* thumbnail current, so no rebuild is
-    /// triggered and a texture registered with egui-wgpu would sit there
-    /// until some later edit happened to need one.
+    /// Dead layers are dropped here rather than in `rebuild`: deleting a
+    /// layer nothing reads triggers no rebuild, so its registered texture
+    /// would otherwise stay until some later edit.
     pub fn begin_frame(
         &mut self,
         graph: &Graph,
@@ -96,9 +87,6 @@ impl PreviewCache {
         self.forget_dead(graph, gpu);
     }
 
-    /// Whether this layer's image is current: baked since the layer was
-    /// last dirtied, and not under a retired forced generation. A layer
-    /// with no entry is never fresh.
     fn is_fresh(&self, id: LayerId) -> bool {
         let since = self.stale_at.get(&id).copied().unwrap_or(0);
         let fresh = |rev: u64, forced: u64| forced == self.forced && rev >= since;
@@ -109,8 +97,7 @@ impl PreviewCache {
             .unwrap_or(false)
     }
 
-    /// Return (and cache) a 128×128 preview of `id`. `None` if the layer
-    /// doesn't exist.
+    /// `None` if the layer doesn't exist.
     pub fn get_or_build(
         &mut self,
         egui_ctx: &egui::Context,
@@ -122,9 +109,8 @@ impl PreviewCache {
         graph.get(id)?;
 
         if !self.is_fresh(id) && !self.rebuilt_this_frame {
-            // An out-of-date image can stay up a little longer; a missing
-            // one can't, or a new node sits blank (or, below, takes the
-            // slow CPU path) until the throttle opens.
+            // A missing image skips the throttle, or a new node sits blank
+            // (or takes the slow CPU path below) until it opens.
             let cold = !self.has_entry(id);
             let go = if cold {
                 self.throttle.mark(egui_ctx);
@@ -144,8 +130,7 @@ impl PreviewCache {
         if let Some(thumb) = self.cpu_entries.get(&id) {
             return Some(thumb.handle.id());
         }
-        // Cold, and the bulk bake either failed or there's no GPU at all.
-        // A single-layer CPU bake so the node still shows something.
+        // The bulk bake failed or there is no GPU.
         let handle = bake_cpu(egui_ctx, graph, id, eval_ctx);
         let tid = handle.id();
         self.cpu_entries.insert(
@@ -159,7 +144,6 @@ impl PreviewCache {
         self.gpu_entries.contains_key(&id) || self.cpu_entries.contains_key(&id)
     }
 
-    /// The layers whose thumbnail is out of date and still exists.
     fn stale_layers(&self, graph: &Graph) -> HashSet<LayerId> {
         graph
             .layers
@@ -169,9 +153,6 @@ impl PreviewCache {
             .collect()
     }
 
-    /// Bake fresh thumbnails for every stale layer, register them, and swap
-    /// those entries. A layer that wasn't stale is not baked, not
-    /// registered, and keeps the texture it already had.
     fn rebuild(&mut self, graph: &Graph, eval_ctx: &EvalCtx, gpu: Option<&mut GpuBits>) {
         let wanted = self.stale_layers(graph);
         if wanted.is_empty() {
@@ -179,17 +160,14 @@ impl PreviewCache {
         }
 
         let Some(gpu) = gpu else {
-            // No GPU — drop the stale CPU entries and let the per-layer
-            // fallback in `get_or_build` rebuild them lazily.
+            // `get_or_build` rebakes these lazily on the CPU.
             self.cpu_entries.retain(|id, _| !wanted.contains(id));
             return;
         };
         let Ok(new_texs) = gpu.baker.bake_previews(graph, eval_ctx, Some(&wanted)) else {
-            // Keep the cache, so the user sees the last good state rather
-            // than a blank grid. Entries stay stale and the next frame tries
-            // again: a persistent failure costs an attempt per frame, but the
-            // common one is transient and a thumbnail that never returns is
-            // worse.
+            // Keep the last good images and retry next frame. Failures are
+            // usually transient, so a retry per frame beats a thumbnail that
+            // never returns.
             return;
         };
 
@@ -208,8 +186,6 @@ impl PreviewCache {
             if let Some(old) = old {
                 replaced.push(old.id);
             }
-            // A layer that just got a GPU thumbnail has no use for the CPU
-            // one it may have been showing.
             self.cpu_entries.remove(&lid);
         }
         for id in replaced {
@@ -217,9 +193,6 @@ impl PreviewCache {
         }
     }
 
-    /// Drop entries for layers that no longer exist, freeing what they had
-    /// registered, so a long editing session doesn't accumulate textures
-    /// for deleted nodes.
     fn forget_dead(&mut self, graph: &Graph, gpu: Option<&GpuBits>) {
         let dead: Vec<LayerId> = self
             .gpu_entries

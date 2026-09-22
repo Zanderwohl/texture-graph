@@ -1,7 +1,7 @@
 //! Logic for the ColorRamp gradient bar: crossing reorders, sorted
 //! insertion, duplicate placement, gradient sampling.
 //!
-//! Free of egui so the reorder behaviour is unit-testable; the widget lives
+//! Free of egui so the reorder behavior is unit-testable; the widget lives
 //! in `nodes.rs`.
 
 use texture_graph_core::color::blend;
@@ -39,9 +39,8 @@ pub fn insert_index(stops: &[ColorStop], t: f32) -> usize {
 /// radius at a typical bar width, so the copy is its own target at once.
 pub const DUPLICATE_NUDGE: f32 = 0.05;
 
-/// Slack for [`has_room`]. A candidate is one nudge from its source by
-/// construction, so that comparison sits exactly on the boundary — and
-/// `0.55f32 - 0.5f32` is 0.04999995, which reads as a collision.
+/// Slack for [`has_room`]. A candidate is exactly one nudge from its
+/// source, and `0.55f32 - 0.5f32` is 0.04999995, which reads as a collision.
 const DUPLICATE_EPS: f32 = 1e-4;
 
 /// Whether a stop fits at `c`: on the ramp, and a clear nudge from every
@@ -53,12 +52,9 @@ fn has_room(stops: &[ColorStop], c: f32) -> bool {
             .all(|s| (s.t - c).abs() >= DUPLICATE_NUDGE - DUPLICATE_EPS)
 }
 
-/// Where a duplicate of `stops[i]` goes: a nudge right, else left, else the
-/// middle of the nearest gap with room.
-///
-/// The fallback hunts by proximity rather than size, since the copy belongs
-/// next to its source. A ramp with no room anywhere returns the source's own
-/// `t` and accepts the overlap, rather than silently not appearing.
+/// A nudge right, else left, else the middle of the nearest gap with room
+/// (nearest rather than widest, so the copy stays by its source). With no
+/// room anywhere, returns the source's `t` and accepts the overlap.
 pub fn duplicate_t(stops: &[ColorStop], i: usize) -> f32 {
     let t = stops[i].t;
     [t + DUPLICATE_NUDGE, t - DUPLICATE_NUDGE]
@@ -68,11 +64,7 @@ pub fn duplicate_t(stops: &[ColorStop], i: usize) -> f32 {
         .unwrap_or(t)
 }
 
-/// Middle of the empty run nearest `t` with room for a stop, counting the
-/// stretches out to 0.0 and 1.0.
-///
-/// Gap middles are just more candidates for [`has_room`], so there is only
-/// ever one idea of how much space is enough. Ties go to the lower gap.
+/// Counts the stretches out to 0.0 and 1.0. Ties go to the lower gap.
 fn nearest_gap_mid(stops: &[ColorStop], t: f32) -> Option<f32> {
     // Every path that writes stops keeps them sorted, but a loaded graph is
     // whatever the file said.
@@ -86,9 +78,7 @@ fn nearest_gap_mid(stops: &[ColorStop], t: f32) -> Option<f32> {
         .min_by(|a, b| (a - t).abs().total_cmp(&(b - t).abs()))
 }
 
-/// Display color of one stop: a `Const` passes through, a parameter shows
-/// whatever it is bound to, and a wired stop evaluates its source once at
-/// the stop's own position along the ramp.
+/// A wired stop evaluates its source once, at the stop's own `t`.
 pub fn stop_display_color(graph: &Graph, stop: &ColorStop, ctx: &EvalCtx) -> Color {
     match &stop.color {
         ColorInput::Const(c) => *c,
@@ -96,16 +86,14 @@ pub fn stop_display_color(graph: &Graph, stop: &ColorStop, ctx: &EvalCtx) -> Col
         ColorInput::Param(name) => graph
             .param_value(name, ctx)
             .and_then(|v| v.as_color())
-            // Undeclared: the graph mutators reject that, so this is a
-            // hand-built file. Show the missing-texture magenta rather
-            // than a plausible gray.
+            // Undeclared, so a hand-built file. Show the missing-texture
+            // magenta rather than a plausible gray.
             .unwrap_or_else(|| texture_graph_core::color::oklcha(0.7017, 0.3223, 328.36, 1.0)),
     }
 }
 
-/// Ramp color at `u` over pre-resolved `(t, color)` pairs — mirrors
-/// `eval_ramp`'s segment selection (holds the outermost stop's color past
-/// either end) so the bar shows exactly what evaluation produces.
+/// Mirrors `eval_ramp`'s segment selection, including holding the end
+/// colors past either end, so the bar matches evaluation.
 pub fn sample_display(display: &[(f32, Color)], space: BlendSpace, u: f32) -> Color {
     match display {
         [] => return texture_graph_core::color::oklcha(0.5, 0.0, 0.0, 1.0),
@@ -172,7 +160,6 @@ mod tests {
     #[test]
     fn drag_right_across_neighbor_swaps() {
         let mut stops = vec![stop(0.0, 0.1), stop(0.5, 0.2), stop(1.0, 0.3)];
-        // Drag stop 0 to 0.7: crosses stop at 0.5.
         let (i, swaps) = drag_stop_to(&mut stops, 0, 0.7);
         assert_eq!(i, 1);
         assert_eq!(swaps, vec![(0, 1)]);
@@ -186,7 +173,6 @@ mod tests {
     #[test]
     fn drag_left_across_multiple_in_one_frame() {
         let mut stops = vec![stop(0.1, 0.1), stop(0.4, 0.2), stop(0.6, 0.3), stop(0.9, 0.4)];
-        // Drag the last stop all the way to 0.0 — crosses everything.
         let (i, swaps) = drag_stop_to(&mut stops, 3, 0.0);
         assert_eq!(i, 0);
         assert_eq!(swaps, vec![(3, 2), (2, 1), (1, 0)]);
@@ -232,10 +218,9 @@ mod tests {
 
     #[test]
     fn duplicate_falls_back_to_the_nearest_roomy_gap_when_boxed_in() {
-        // Both slots beside 0.5 are taken and the 0.05-wide gaps either
-        // side of it are too tight to hold a stop clear of both edges, so
-        // the copy goes to the middle of [0.55, 0.9] — nearer than the
-        // wider [0.0, 0.45] a widest-gap rule would have picked.
+        // Both slots beside 0.5 are taken and the adjacent gaps are too
+        // tight, so the copy goes to the middle of [0.55, 0.9], nearer than
+        // the wider [0.0, 0.45].
         let stops = vec![stop(0.45, 0.1), stop(0.5, 0.2), stop(0.55, 0.3), stop(0.9, 0.4)];
         assert!((duplicate_t(&stops, 1) - 0.725).abs() < 1e-6);
     }

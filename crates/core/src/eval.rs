@@ -11,9 +11,8 @@ use crate::kind::{
     Wave, WaveShape,
 };
 
-/// A sample point in the graph's canonical unit cube. Consumers of the
-/// core map their own coordinates (mesh UVs, world position, planar grid)
-/// into this space.
+/// A point in the graph's unit cube. Callers map their own coordinates into
+/// it.
 #[derive(Copy, Clone, Debug)]
 pub struct Sample {
     pub u: f32,
@@ -21,51 +20,38 @@ pub struct Sample {
     pub w: f32,
 }
 
-/// The `w` a *flat* bake samples a 3D field at — the middle of the unit
-/// cube, not its floor.
-///
-/// Both backends must agree, or a 3D graph is two different slices of the
-/// same volume depending on where it was rendered.
+/// The `w` a flat bake samples a 3D field at. CPU and GPU must agree, or
+/// they render different slices of the same volume.
 pub const FLAT_W: f32 = 0.5;
 
 impl Sample {
     pub const fn new(u: f32, v: f32, w: f32) -> Self {
         Self { u, v, w }
     }
-    /// A sample at `w = 0`. For a *flat bake* of a graph that may contain
-    /// 3D fields, use [`Sample::flat`] instead — see [`FLAT_W`].
+    /// A sample at `w = 0`. A flat bake should use [`Sample::flat`].
     pub const fn uv(u: f32, v: f32) -> Self {
         Self { u, v, w: 0.0 }
     }
-    /// The sample a flat bake takes at `(u, v)`, on the [`FLAT_W`] slice.
+    /// A sample on the [`FLAT_W`] slice.
     pub const fn flat(u: f32, v: f32) -> Self {
         Self { u, v, w: FLAT_W }
     }
 }
 
-/// Ambient parameters that stay constant across a whole bake — the global
-/// noise seed, the finite-difference step `HeightToNormal` uses, and the
-/// bindings for the graph's named parameters.
-///
-/// No longer `Copy`: `params` owns its names. Clone it, or pass it by
-/// reference as every entry point here does.
+/// Settings constant across a whole bake.
 #[derive(Clone, Debug)]
 pub struct EvalCtx {
     pub seed: u32,
+    /// Finite-difference step for `HeightToNormal`, in UV units.
     pub normal_epsilon: f32,
-    /// Bindings for [`Graph::params`], by name. A parameter left out here
-    /// takes its declared default — see [`Graph::resolve_params`], which
-    /// every entry point runs before evaluating.
+    /// Bindings for [`Graph::params`]. A parameter left out takes its
+    /// declared default.
     pub params: BTreeMap<String, ParamValue>,
 }
 
 impl EvalCtx {
-    /// The constant this scalar socket reads, or `None` when it reads a
-    /// layer and so has to be baked rather than supplied as a uniform.
-    ///
-    /// `self` must already be resolved — see [`Graph::resolve_params`].
-    /// That is what makes a parameter cost nothing on the GPU: by the time
-    /// a dispatch is recorded it is the same number a `Const` would be.
+    /// The constant this socket reads, or `None` when it reads a layer.
+    /// `self` must already be resolved with [`Graph::resolve_params`].
     pub fn scalar_const(&self, si: &ScalarInput) -> Option<f32> {
         match si {
             ScalarInput::Const(v) => Some(*v),
@@ -76,8 +62,7 @@ impl EvalCtx {
         }
     }
 
-    /// The constant this color socket reads, or `None` when it reads a
-    /// layer. See [`EvalCtx::scalar_const`].
+    /// See [`EvalCtx::scalar_const`].
     pub fn color_const(&self, ci: &ColorInput) -> Option<Color> {
         match ci {
             ColorInput::Const(c) => Some(*c),
@@ -91,8 +76,6 @@ impl EvalCtx {
         }
     }
 
-    /// This context with one parameter bound. Chainable, for the common
-    /// case of baking N instances of one graph.
     pub fn with_param(mut self, name: impl Into<String>, value: ParamValue) -> Self {
         self.params.insert(name.into(), value);
         self
@@ -109,7 +92,7 @@ impl Default for EvalCtx {
     }
 }
 
-/// Material sample from the graph's Output at `s`.
+/// Every channel of the graph's Output at one sample.
 #[derive(Copy, Clone, Debug)]
 pub struct Material {
     pub color: Color,
@@ -118,17 +101,14 @@ pub struct Material {
     pub normal: Color,
 }
 
-/// What an undeclared parameter reads as. Unreachable for a graph the
-/// mutators built — they reject a kind that names one — so this is the
-/// answer for a hand-assembled `Graph`, not a design decision anybody is
-/// meant to rely on.
+/// What an undeclared parameter reads as. Only a hand-assembled `Graph`
+/// can reach this; the mutators reject undeclared names.
 const UNBOUND_SCALAR: f32 = 0.0;
 
 fn unbound_color() -> Color {
     Color::new(0.0, 0.0, 0.0, 1.0)
 }
 
-/// Evaluate the graph's `Output` at `s` and return every material channel.
 pub fn evaluate_material(g: &Graph, s: Sample, ctx: &EvalCtx) -> Material {
     let ctx = &g.resolve_params(ctx);
     let by_id: HashMap<LayerId, &Layer> = g.layers.iter().map(|l| (l.id, l)).collect();
@@ -143,14 +123,12 @@ pub fn evaluate_material(g: &Graph, s: Sample, ctx: &EvalCtx) -> Material {
     Material { color, roughness, metallic, normal }
 }
 
-/// Evaluate any single layer's color at `s` — useful for per-layer previews.
+/// Evaluate one layer's color, as for a per-layer preview.
 pub fn evaluate(g: &Graph, id: LayerId, s: Sample, ctx: &EvalCtx) -> Color {
     let ctx = &g.resolve_params(ctx);
     let by_id: HashMap<LayerId, &Layer> = g.layers.iter().map(|l| (l.id, l)).collect();
     eval_layer(id, s, &by_id, ctx)
 }
-
-// ---- Core dispatch ------------------------------------------------------
 
 fn eval_layer(id: LayerId, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &EvalCtx) -> Color {
     let Some(layer) = by_id.get(&id) else {
@@ -178,11 +156,9 @@ fn eval_layer(id: LayerId, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &Ev
     }
 }
 
-/// The "missing texture" grid shown for unconnected (`None`) layer
-/// inputs: a magenta/black checkerboard, 16 cells per unit in u, v, AND w
-/// so it stays a solid 3D checker in volume bakes. Mirrored by
-/// `missing.wgsl` on the GPU — keep the cell count and colors in sync.
-/// Magenta constants are Oklch of sRGB (1, 0, 1).
+/// The magenta/black checker shown for an unconnected input. Checkered in
+/// `w` too, so it stays a 3D checker in volume bakes. Keep the cell count
+/// and colors in sync with `missing.wgsl`. Magenta is Oklch of sRGB (1, 0, 1).
 pub fn missing_texture(s: Sample) -> Color {
     const CELLS: f32 = 16.0;
     let cell = |x: f32| (x * CELLS).floor() as i64;
@@ -194,7 +170,6 @@ pub fn missing_texture(s: Sample) -> Color {
     }
 }
 
-/// Evaluate an optional layer input; `None` samples the missing grid.
 fn eval_opt(
     id: Option<LayerId>,
     s: Sample,
@@ -211,9 +186,7 @@ fn eval_color_input(ci: &ColorInput, s: Sample, by_id: &HashMap<LayerId, &Layer>
     match ci {
         ColorInput::Const(c) => *c,
         ColorInput::Layer(id) => eval_layer(*id, s, by_id, ctx),
-        // `ctx` has already been resolved against the graph's declarations
-        // by `evaluate`/`evaluate_material`, so a declared name is always
-        // present. A miss means a hand-built graph the mutators never saw.
+        // `ctx` is resolved, so a miss means a hand-built graph.
         ColorInput::Param(name) => ctx
             .params
             .get(name.as_str())
@@ -234,11 +207,8 @@ fn eval_scalar(si: &ScalarInput, s: Sample, by_id: &HashMap<LayerId, &Layer>, ct
     }
 }
 
-// ---- Node implementations ----------------------------------------------
-
-/// Translate the serialized node into the kernel's own vocabulary. The two
-/// sets of enums stay separate so `crate::noise` — the spec the shader is
-/// transcribed from — does not depend on the file format.
+/// The enums stay separate so `crate::noise`, which the shader is
+/// transcribed from, does not depend on the file format.
 fn noise_spec(n: &Noise) -> crate::noise::Spec {
     crate::noise::Spec {
         dims: match n.dims {
@@ -268,7 +238,6 @@ fn noise_spec(n: &Noise) -> crate::noise::Spec {
 }
 
 fn eval_noise(n: &Noise, s: Sample, ctx: &EvalCtx) -> Color {
-    // Straight through to the shared kernel; `crate::noise` has the why.
     let spec = noise_spec(n);
     let sample = |off: u32| -> f32 {
         crate::noise::sample(
@@ -284,9 +253,7 @@ fn eval_noise(n: &Noise, s: Sample, ctx: &EvalCtx) -> Color {
             Color::new(v, 0.0, 0.0, 1.0)
         }
         NoiseOutput::Color => {
-            // Three independent noises → L, C, hue directly in Oklch.
-            // Chroma is scaled to a comfortable in-gamut band; hue is a
-            // full turn for unsigned, half-turn magnitude for signed.
+            // Chroma scale keeps most colors in gamut.
             const CHROMA_SCALE: f32 = 0.15;
             let nl = sample(0);
             let nc = sample(1);
@@ -301,11 +268,8 @@ fn eval_noise(n: &Noise, s: Sample, ctx: &EvalCtx) -> Color {
 }
 
 fn eval_ramp(r: &ColorRamp, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &EvalCtx) -> Color {
-    // Domain: `s.u`. Off either end the ramp holds the outermost stop's
-    // color (t clamped to [0, 1]) — a first stop at 0.3 paints [0, 0.3]
-    // with its own color, and likewise past the last stop.
+    // Samples along `s.u`. Past either end stop, the ramp holds that stop's color.
     debug_assert!(r.stops.len() >= 2, "ramp validation should reject <2 stops");
-    // Find the segment containing s.u.
     let mut lo_idx = 0usize;
     let mut hi_idx = r.stops.len() - 1;
     for i in 0..r.stops.len() - 1 {
@@ -340,12 +304,9 @@ fn eval_ramp(r: &ColorRamp, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &E
     blend(ca, cb, t, r.space)
 }
 
-/// Transform, then apply the edge policy to the resulting U/V:
-/// `Clamp` pins them to the [0, 1] square (matching a baked texture's
-/// edge clamp); `Extend` samples the source at the true coordinates.
-/// Affine mappings extend without limit (the GPU bakes sources over the
-/// exact requested region); radial mappings render the missing grid
-/// beyond the [`EXTEND_LIMIT`] box, matching the GPU's conservative cap.
+/// `Extend` is unbounded for affine mappings, since the GPU bakes sources
+/// over the exact requested region. Radial mappings show the missing grid
+/// beyond the [`EXTEND_LIMIT`] box, matching the GPU's cap.
 fn eval_transform(
     t: &Transform,
     s: Sample,
@@ -372,11 +333,9 @@ fn eval_transform(
 }
 
 fn apply_transform(t: &Transform, s: Sample) -> Sample {
-    // 1. Recenter.
     let mut u = s.u - t.offset[0];
     let mut v = s.v - t.offset[1];
     let w = s.w - t.offset[2];
-    // 2. Rotate in UV plane.
     if t.rotate_uv != 0.0 {
         let (sin, cos) = t.rotate_uv.sin_cos();
         let ru = u * cos - v * sin;
@@ -384,7 +343,6 @@ fn apply_transform(t: &Transform, s: Sample) -> Sample {
         u = ru;
         v = rv;
     }
-    // 3. Per-axis scale.
     let u = u * t.scale[0];
     let v = v * t.scale[1];
     let w = w * t.scale[2];
@@ -418,8 +376,7 @@ fn eval_mix(m: &Mix, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &EvalCtx)
     let a = eval_opt(m.a, s, by_id, ctx);
     let b = eval_opt(m.b, s, by_id, ctx);
     match m.mode {
-        // Add/Sub compose in Oklab where chroma is a Cartesian (a, b) vector.
-        // Grayscale-noise + Add is the fractal-noise use case; L just sums.
+        // Oklab, where chroma is a Cartesian (a, b) vector that sums.
         BlendMode::Add | BlendMode::Subtract => {
             let sign = if matches!(m.mode, BlendMode::Add) { 1.0 } else { -1.0 };
             let al: Oklab = a.color.into_color();
@@ -428,7 +385,7 @@ fn eval_mix(m: &Mix, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &EvalCtx)
             let back: Oklch = combined.into_color();
             back.with_alpha(a.alpha)
         }
-        // Multiply as optical darkening: componentwise in linear sRGB.
+        // Linear sRGB, for optical darkening.
         BlendMode::Multiply => {
             let la: LinSrgb = a.color.into_color();
             let lb: LinSrgb = b.color.into_color();
@@ -446,7 +403,6 @@ fn eval_mix(m: &Mix, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &EvalCtx)
 fn eval_map(m: &Map, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &EvalCtx) -> Color {
     let value = eval_opt(m.value, s, by_id, ctx);
     let t = scalar_of(value);
-    // Look up palette at (t, 0, 0).
     eval_opt(m.palette, Sample::new(t, 0.0, 0.0), by_id, ctx)
 }
 
@@ -462,9 +418,6 @@ fn eval_min_max(m: &MinMax, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &E
     if a_wins { a } else { b }
 }
 
-/// Read the chosen criterion off `c`. Whole pixel — including alpha and
-/// hue — flows through the winner, so this only picks the number for the
-/// compare.
 fn criterion_of(c: Color, crit: Criterion) -> f32 {
     use palette::{Hsv, IntoColor, Srgb};
     match crit {
@@ -472,7 +425,6 @@ fn criterion_of(c: Color, crit: Criterion) -> f32 {
         Criterion::Chroma => return c.chroma,
         _ => {}
     }
-    // Everything else needs a trip through gamma-encoded sRGB.
     let srgb: Srgb = c.color.into_color();
     match crit {
         Criterion::Red => srgb.red,
@@ -487,33 +439,25 @@ fn criterion_of(c: Color, crit: Criterion) -> f32 {
             let hsv: Hsv = srgb.into_color();
             hsv.value
         }
-        // Handled above.
         Criterion::Alpha | Criterion::Chroma => unreachable!(),
     }
 }
 
-/// The displacement `by`'s value contributes, per axis, before `amount`
-/// scales it. Shared with the GPU twin in `warp.wgsl`.
+/// Per-axis displacement before `amount` scales it. Must match `warp.wgsl`.
 pub fn warp_displacement(by: Color, mode: WarpMode) -> [f32; 3] {
     match mode {
         WarpMode::Scalar => {
             let l = scalar_of(by);
             [l, l, l]
         }
-        // Hue over a full turn rather than in degrees, so it is on roughly
-        // the same footing as L.
+        // Hue in turns, not degrees, so it is on a similar scale to L.
         WarpMode::Vector => [by.l, by.chroma, by.hue.into_degrees() / 360.0],
     }
 }
 
-/// How far past the unit square a warp of `amount` may reach before the
-/// sample leaves what the baker covers.
-///
-/// The driving field is assumed to lie in `[-1, 1]`, so the reachable
-/// rectangle is the unit square grown by `|amount|` — which is exactly
-/// what `schedule.rs` asks the source to be baked over — and then capped
-/// at the [`EXTEND_LIMIT`] box like any other extended request. Outside
-/// it, both backends show the missing grid.
+/// The region a warp may sample: the unit square grown by `|amount|`
+/// (assuming a driver in `[-1, 1]`), capped at the [`EXTEND_LIMIT`] box.
+/// Must match the region `schedule.rs` bakes the source over.
 fn warp_bounds(amount: [f32; 3]) -> ([f32; 2], [f32; 2]) {
     let lo = |a: f32| (0.0 - a.abs()).max(0.5 - EXTEND_LIMIT);
     let hi = |a: f32| (1.0 + a.abs()).min(0.5 + EXTEND_LIMIT);
@@ -534,18 +478,16 @@ fn eval_warp(w: &Warp, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &EvalCt
     eval_opt(w.source, moved, by_id, ctx)
 }
 
-/// One cycle of `shape` at phase `t`, in `[-1, 1]`.
+/// One cycle of `shape` at phase `t` (in cycles), in `[-1, 1]`.
 ///
-/// `t` is reduced to `[0, 1)` first — `fract` written as `x - floor(x)`,
-/// because Rust's `f32::fract` truncates toward zero and WGSL's does not,
-/// which would differ on every negative input. The same reason
-/// `crate::noise` writes it out.
+/// Uses `x - floor(x)`, not `f32::fract`, which truncates toward zero and
+/// so differs from WGSL's `fract` on negative input.
 pub fn wave_cycle(t: f32, shape: WaveShape) -> f32 {
     let frac = |x: f32| x - x.floor();
     let t = frac(t);
     match shape {
         WaveShape::Sine => (std::f32::consts::TAU * t).sin(),
-        // Phase-aligned with sine: 0 at t = 0, +1 at t = 0.25.
+        // In phase with sine: 0 at t = 0, +1 at t = 0.25.
         WaveShape::Triangle => 1.0 - 4.0 * (frac(t + 0.25) - 0.5).abs(),
         WaveShape::Square => {
             if t < 0.5 {
@@ -575,10 +517,8 @@ fn eval_h2n(h: &HeightToNormal, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx
     let l_nx = sample_l(Sample::new(s.u - eps, s.v, s.w));
     let l_py = sample_l(Sample::new(s.u, s.v + eps, s.w));
     let l_ny = sample_l(Sample::new(s.u, s.v - eps, s.w));
-    // Central-difference gradient of the height field.
     let dhdx = (l_px - l_nx) / (2.0 * eps);
     let dhdy = (l_py - l_ny) / (2.0 * eps);
-    // Normal to a heightfield z = h(x,y) is (-dh/dx, -dh/dy, 1), scaled by strength.
     let mut n = [-dhdx * h.strength, -dhdy * h.strength, 1.0];
     let mag = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(f32::EPSILON);
     n[0] /= mag;
@@ -594,9 +534,8 @@ mod param_tests {
     use crate::kind::{BlendMode, ColorRamp, ColorStop, Mix};
     use crate::param::{ParamDecl, ParamValue};
 
-    /// A graph whose whole look is one scalar parameter — the shape §6
-    /// exists for.
-    fn parameterised() -> (Graph, LayerId) {
+    /// A Mix whose factor is the scalar parameter `contrast`.
+    fn parameterized() -> (Graph, LayerId) {
         let mut g = Graph::new();
         g.declare_param(ParamDecl::scalar("contrast", 0.0, 1.0, 0.25)).unwrap();
         let dark = g.output.color.unwrap();
@@ -619,13 +558,11 @@ mod param_tests {
         (g, mix)
     }
 
-    /// The whole point: one graph, N bakes, different pictures.
     #[test]
     fn one_graph_reads_differently_under_different_bindings() {
-        let (g, mix) = parameterised();
+        let (g, mix) = parameterized();
         let at = |ctx: &EvalCtx| scalar_of(evaluate(&g, mix, Sample::uv(0.5, 0.5), ctx));
 
-        // Unbound: the declared default.
         let default = at(&EvalCtx::default());
         assert!((default - 0.25).abs() < 1e-5, "default gave {default}");
 
@@ -636,8 +573,6 @@ mod param_tests {
         }
     }
 
-    /// A color parameter drives a ramp stop, which is the palette half of
-    /// "six planet classes differ by palette and contrast".
     #[test]
     fn a_color_parameter_drives_a_ramp_stop() {
         let mut g = Graph::new();
@@ -664,11 +599,9 @@ mod param_tests {
         assert!((got.chroma - 0.1).abs() < 1e-5, "C was {}", got.chroma);
     }
 
-    /// Entry points resolve for themselves, so a caller never has to know
-    /// that resolution is a step.
     #[test]
     fn the_caller_does_not_have_to_resolve_first() {
-        let (g, mix) = parameterised();
+        let (g, mix) = parameterized();
         let raw = EvalCtx::default().with_param("contrast", ParamValue::Scalar(0.9));
         let pre_resolved = g.resolve_params(&raw);
         assert_eq!(
@@ -684,8 +617,7 @@ mod warp_tests {
     use crate::color::oklcha;
     use crate::kind::{Warp, WarpMode};
 
-    /// A graph of: a ramp along U (the thing being warped), a flat driver
-    /// with a chosen L, and a Warp of the one by the other.
+    /// A U ramp warped by a flat driver of lightness `driver_l`.
     fn warped(driver_l: f32, amount: [f32; 3], mode: WarpMode) -> (Graph, LayerId) {
         let mut g = Graph::new();
         let ramp = g.output.color.unwrap();
@@ -723,9 +655,7 @@ mod warp_tests {
         (g, w)
     }
 
-    /// The displacement is the driver's value times `amount`, not a
-    /// recentred version of it: a flat 1.0 driver with amount 0.25 reads
-    /// the source a quarter of a unit further along.
+    /// The driver is not recenterd: a 1.0 driver with amount 0.25 shifts by 0.25.
     #[test]
     fn the_displacement_is_the_drivers_value_times_amount() {
         let (g, w) = warped(1.0, [0.25, 0.0, 0.0], WarpMode::Scalar);
@@ -742,7 +672,6 @@ mod warp_tests {
         }
     }
 
-    /// A zero driver is a zero displacement, so the warp is its source.
     #[test]
     fn a_zero_driver_is_a_no_op() {
         let (g, w) = warped(0.0, [0.5, 0.5, 0.0], WarpMode::Scalar);
@@ -757,26 +686,20 @@ mod warp_tests {
         }
     }
 
-    /// The bound the node promises: a driver inside `[-1, 1]` always
-    /// lands on data, and one outside it shows the missing grid — which
-    /// is what the GPU does when the fetch leaves the source's baked
-    /// domain.
+    /// A driver in `[-1, 1]` lands on data; beyond it the missing grid
+    /// shows, as on the GPU when a fetch leaves the baked domain.
     #[test]
     fn a_driver_past_one_falls_off_the_baked_domain() {
         let ctx = EvalCtx::default();
-        // L = 1 with amount 0.1 reaches u + 0.1, inside [0 - 0.1, 1 + 0.1].
         let (inside, w_in) = warped(1.0, [0.1, 0.0, 0.0], WarpMode::Scalar);
         let at_edge = evaluate(&inside, w_in, Sample::uv(1.0, 0.5), &ctx);
         assert_ne!(at_edge, missing_texture(Sample::uv(1.1, 0.5)));
 
-        // L = 4 reaches u + 0.4, well past it.
         let (outside, w_out) = warped(4.0, [0.1, 0.0, 0.0], WarpMode::Scalar);
         let far = evaluate(&outside, w_out, Sample::uv(1.0, 0.5), &ctx);
         assert_eq!(far, missing_texture(Sample::new(1.4, 0.5, 0.0)));
     }
 
-    /// Vector mode reads three channels independently; scalar mode reads
-    /// one and applies it to all three axes.
     #[test]
     fn vector_mode_reads_three_channels() {
         let c = oklcha(0.8, 0.1, 180.0, 1.0);
@@ -784,13 +707,9 @@ mod warp_tests {
         let v = warp_displacement(c, WarpMode::Vector);
         assert!((v[0] - 0.8).abs() < 1e-6);
         assert!((v[1] - 0.1).abs() < 1e-6);
-        // Hue over a full turn, not in degrees.
         assert!((v[2] - 0.5).abs() < 1e-6, "hue should be half a turn, got {}", v[2]);
     }
 
-    /// The warp reads `by` at its own coordinates and `source` at the
-    /// displaced ones — a varying driver must actually distort the source
-    /// rather than shift it uniformly.
     #[test]
     fn a_varying_driver_distorts_rather_than_shifts() {
         let mut g = Graph::new();
@@ -835,8 +754,7 @@ mod warp_tests {
             )
             .unwrap();
         let ctx = EvalCtx::default();
-        // The ramp alone is constant down a column; the warp must not be,
-        // because the driver varies in v too.
+        // The ramp is constant down a column; the warp must not be.
         let column: Vec<f32> = (0..16)
             .map(|k| scalar_of(evaluate(&g, w, Sample::uv(0.5, k as f32 / 16.0), &ctx)))
             .collect();
@@ -853,8 +771,6 @@ mod wave_tests {
     use super::*;
     use crate::kind::{Wave, WaveShape};
 
-    /// Every shape is described over the phase within a cycle, so it has
-    /// to actually be periodic in it.
     #[test]
     fn every_shape_repeats_once_a_cycle() {
         for shape in [
@@ -878,8 +794,7 @@ mod wave_tests {
         }
     }
 
-    /// Sine, triangle and square share a phase: zero-crossings and sign in
-    /// the same places. A sawtooth deliberately does not — it ramps.
+    /// Sine, triangle and square agree on sign; sawtooth is exempt.
     #[test]
     fn shapes_stay_inside_range_and_share_sines_phase() {
         for k in 0..64 {
@@ -893,7 +808,6 @@ mod wave_tests {
                 let v = wave_cycle(t, shape);
                 assert!((-1.0..=1.0).contains(&v), "{shape:?} at {t} gave {v}");
             }
-            // Away from the crossings at 0 and 0.5, the three agree on sign.
             if (t - 0.0).abs() > 1e-3 && (t - 0.5).abs() > 1e-3 {
                 let sine = wave_cycle(t, WaveShape::Sine);
                 for shape in [WaveShape::Triangle, WaveShape::Square] {
@@ -906,15 +820,12 @@ mod wave_tests {
                 }
             }
         }
-        // The landmarks, exactly.
         assert!((wave_cycle(0.25, WaveShape::Triangle) - 1.0).abs() < 1e-6);
         assert!((wave_cycle(0.75, WaveShape::Triangle) + 1.0).abs() < 1e-6);
         assert_eq!(wave_cycle(0.0, WaveShape::Sawtooth), -1.0);
         assert!((wave_cycle(0.999, WaveShape::Sawtooth) - 1.0).abs() < 0.01);
     }
 
-    /// `frequency` counts cycles, `phase` shifts by cycles, and `range`
-    /// maps the result the same way grayscale noise does.
     #[test]
     fn frequency_and_phase_are_counted_in_cycles() {
         let mut g = Graph::new();
@@ -928,24 +839,19 @@ mod wave_tests {
         };
         let at = |g: &Graph, id| scalar_of(evaluate(g, id, Sample::uv(0.0, 0.0), &EvalCtx::default()));
 
-        // Const input 0.125 at frequency 2 is phase 0.25 — sine's peak.
+        // 0.125 at frequency 2 is phase 0.25, sine's peak.
         g.set_kind(id, LayerKind::Wave(wave(2.0, 0.0, NoiseRange::Signed))).unwrap();
         assert!((at(&g, id) - 1.0).abs() < 1e-5);
-        // A full turn of phase changes nothing.
         g.set_kind(id, LayerKind::Wave(wave(2.0, 1.0, NoiseRange::Signed))).unwrap();
         assert!((at(&g, id) - 1.0).abs() < 1e-5);
-        // Half a turn inverts it.
         g.set_kind(id, LayerKind::Wave(wave(2.0, 0.5, NoiseRange::Signed))).unwrap();
         assert!((at(&g, id) + 1.0).abs() < 1e-5);
-        // Unsigned is the signed field on [0, 1].
         g.set_kind(id, LayerKind::Wave(wave(2.0, 0.0, NoiseRange::Unsigned))).unwrap();
         assert!((at(&g, id) - 1.0).abs() < 1e-5);
         g.set_kind(id, LayerKind::Wave(wave(2.0, 0.5, NoiseRange::Unsigned))).unwrap();
         assert!(at(&g, id).abs() < 1e-5);
     }
 
-    /// The wave reads its input as a scalar, so wiring a layer in makes
-    /// the output vary with that layer rather than sit flat.
     #[test]
     fn a_layer_input_makes_the_wave_vary() {
         let mut g = Graph::new();
@@ -1045,7 +951,6 @@ mod tests {
                 }),
             )
             .unwrap();
-        // Rewriting `a` to reference `b` would create a cycle.
         let err = g.set_kind(
             a,
             LayerKind::Mix(Mix {
@@ -1095,7 +1000,7 @@ mod tests {
         let (g, t) = ramp_under_transform(EdgeMode::Clamp, 4.0);
         let by_id: HashMap<LayerId, &Layer> = g.layers.iter().map(|l| (l.id, l)).collect();
         let ctx = EvalCtx::default();
-        // u=0.5 transforms to 2.0 -> clamps to 1.0 -> ramp's white end.
+        // u=0.5 scales to 2.0 and clamps to 1.0.
         let c = eval_layer(t, Sample::uv(0.5, 0.5), &by_id, &ctx);
         assert!((c.l - 1.0).abs() < 1e-4, "expected clamped end color, got L={}", c.l);
     }
@@ -1105,8 +1010,6 @@ mod tests {
         let (g, t) = ramp_under_transform(EdgeMode::Extend, 4.0);
         let by_id: HashMap<LayerId, &Layer> = g.layers.iter().map(|l| (l.id, l)).collect();
         let ctx = EvalCtx::default();
-        // u=0.5 -> 2.0: the ramp holds its end color past t=1, and extend
-        // actually reaches it (not the missing grid).
         let c = eval_layer(t, Sample::uv(0.5, 0.5), &by_id, &ctx);
         assert!((c.l - 1.0).abs() < 1e-4);
         assert!(c.chroma.abs() < 1e-4, "should be the ramp color, not the magenta grid");
@@ -1117,8 +1020,7 @@ mod tests {
         let (g, t) = ramp_under_transform(EdgeMode::Extend, 40.0);
         let by_id: HashMap<LayerId, &Layer> = g.layers.iter().map(|l| (l.id, l)).collect();
         let ctx = EvalCtx::default();
-        // u=0.9 -> 36.0, far past EXTEND_LIMIT — an affine extend still
-        // samples the source (which holds its end color), never the grid.
+        // u=0.9 scales to 36.0, far past EXTEND_LIMIT.
         let c = eval_layer(t, Sample::uv(0.9, 0.5), &by_id, &ctx);
         assert!((c.l - 1.0).abs() < 1e-4, "expected held end color, got L={}", c.l);
         assert!(c.chroma.abs() < 1e-4, "should be the ramp color, not the magenta grid");
@@ -1138,8 +1040,6 @@ mod tests {
         g.set_kind(t, LayerKind::Transform(radial)).unwrap();
         let by_id: HashMap<LayerId, &Layer> = g.layers.iter().map(|l| (l.id, l)).collect();
         let ctx = EvalCtx::default();
-        // u=0.9 -> radius ~36, past EXTEND_LIMIT: radial extends cap, so
-        // the missing checker shows.
         let ts = apply_transform(&radial, Sample::uv(0.9, 0.5));
         assert!(ts.u > 0.5 + EXTEND_LIMIT);
         let expected = missing_texture(ts);

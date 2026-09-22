@@ -41,9 +41,8 @@ pub fn draw_and_interact_nodes(
     let mut hit = false;
     let style = row_style(ui.style(), state.canvas_zoom);
     for layout in layouts {
-        // Skipping off-screen nodes whole spends the frame's bake budget on
-        // thumbnails somebody can see. The margin covers the sockets, which
-        // sit on the edge and reach past the rect.
+        // Off-screen nodes are skipped so the bake budget goes to visible
+        // thumbnails. The margin covers sockets, which reach past the rect.
         let margin = socket_hit_radius(state.canvas_zoom);
         if !layout.rect.expand(margin).intersects(canvas_rect) && !held(state, layout.node) {
             continue;
@@ -70,11 +69,9 @@ pub fn draw_and_interact_nodes(
     hit
 }
 
-/// Whether this node must be drawn wherever it is, on screen or not.
-///
-/// A node being dragged, or whose ramp stop is, resolves that drag against
-/// the pointer and would be dropped where it left the view. A node being
-/// renamed would take the keyboard focus the rename commits by with it.
+/// Must be drawn even off screen: a dragged node or ramp stop resolves its
+/// drag against the pointer, and a renamed node holds the keyboard focus
+/// the rename commits by.
 fn held(state: &UiState, node: NodeRef) -> bool {
     state.drag.is_some_and(|d| d.node == node)
         || matches!(node, NodeRef::Layer(id)
@@ -82,9 +79,7 @@ fn held(state: &UiState, node: NodeRef) -> bool {
                 || state.renaming.as_ref().is_some_and(|r| r.node == id))
 }
 
-// ---- Body ---------------------------------------------------------------
-
-/// Offsets a duplicate down and right, so the copy reads as a second node.
+/// World units, down and right, so the copy reads as a second node.
 const DUPLICATE_OFFSET: f32 = 40.0;
 
 fn body_interact(
@@ -127,8 +122,7 @@ fn body_interact(
         NodeRef::Layer(id) => {
             let world = super::screen_to_world(layout.rect.min, canvas_rect.min, state);
             resp.context_menu(|ui| {
-                // Arms the header field rather than typing here; a menu is
-                // where people look for "rename".
+                // Arms the header field; the menu entry is for discoverability.
                 if ui.button("Rename").clicked() {
                     state.renaming = Some(Renaming {
                         node: id,
@@ -230,9 +224,7 @@ fn draw_chrome(
     );
 }
 
-// ---- Title --------------------------------------------------------------
-
-/// The name's line in the header: click to rename, field appears in place.
+/// The name's line in the header.
 fn title_rect(node: egui::Rect, z: f32) -> egui::Rect {
     egui::Rect::from_min_size(
         node.min + egui::vec2(8.0, 2.0) * z,
@@ -240,18 +232,11 @@ fn title_rect(node: egui::Rect, z: f32) -> egui::Rect {
     )
 }
 
-/// Enter or clicking away commits, Escape discards.
-///
-/// The text lives in `UiState`, not the graph: names must be unique, and
-/// half-typed text needs somewhere to sit while it is briefly a duplicate.
-/// Committing queues a `Rename` like any edit, so a refusal lands in the
-/// status row and the title stays put.
-///
-/// Returns whether the field claimed the pointer.
+/// Enter or clicking away commits, Escape discards. Returns whether the
+/// field claimed the pointer.
 fn title(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, layout: &NodeLayout) -> bool {
     let NodeRef::Layer(id) = layout.node else { return false };
     let z = state.canvas_zoom;
-    // Too far out for the header to be legible, let alone typed into.
     if z < ZOOM_WIDGETS_MIN {
         return false;
     }
@@ -299,7 +284,7 @@ fn title(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, layout: &NodeLay
     }
 
     // Escape surrenders focus too, so it has to be read before the blur or a
-    // cancelled rename commits.
+    // canceled rename commits.
     if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
         state.renaming = None;
     } else if resp.lost_focus() {
@@ -313,9 +298,8 @@ fn title(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, layout: &NodeLay
     true
 }
 
-/// The edit a committed title amounts to, or `None` for a no-op. Reading a
-/// title and clicking away must not mark the file unsaved; an emptied field
-/// is the same case, and the model would refuse it anyway.
+/// `None` for a no-op, so reading a title and clicking away does not mark
+/// the file unsaved.
 fn rename_command(graph: &Graph, id: LayerId, text: &str) -> Option<EditCmd> {
     let trimmed = text.trim();
     let current = &graph.get(id)?.name;
@@ -354,16 +338,10 @@ fn draw_thumbnail(
     }
 }
 
-// ---- Inline widget rows -------------------------------------------------
-
-/// Child Ui spanning one row, styled to the canvas zoom so fonts and
-/// interact sizes track the node.
-///
-/// The id is explicit, not a salt. A salted child takes its id — and the
-/// auto-ids of every widget inside it — from the parent's running counter,
-/// so a row's widgets would depend on how many child Uis happened to come
-/// before them: the rename field appearing, or a node scrolling out of view,
-/// would swap ids under them and land an in-flight drag on the wrong one.
+/// The id is explicit, not a salt. A salted child takes its id, and its
+/// widgets' auto-ids, from the parent's running counter, so the rename field
+/// appearing or a node leaving the view would shift ids and move an
+/// in-flight drag to the wrong widget.
 fn row_ui(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -481,8 +459,6 @@ fn layer_rows(
     }
 }
 
-// ---- Ramp stops ---------------------------------------------------------
-
 /// What a stop's right-click menu asked for.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum StopAction {
@@ -494,9 +470,8 @@ enum StopAction {
     Unbind,
 }
 
-/// The items themselves, for whichever menu is showing them. Delete greys
-/// out at the two-stop floor rather than vanishing, so the menu keeps its
-/// shape.
+/// Delete grays out at the two-stop floor rather than vanishing, so the
+/// menu keeps its shape.
 fn stop_menu_items(
     ui: &mut egui::Ui,
     can_delete: bool,
@@ -516,7 +491,7 @@ fn stop_menu_items(
         ui.close();
     }
     // A stop is the one ColorInput in the editor, so this menu is where
-    // a palette gets parameterised.
+    // a palette gets parameterized.
     if bound {
         if ui.button("Unbind parameter").clicked() {
             action = Some(StopAction::Unbind);
@@ -558,8 +533,8 @@ fn stop_menu(
     action
 }
 
-/// Carry out `action`. `saved_consts` keys are positional, so an insert or
-/// remove has to drag them along; see [`UiState::remap_ramp_consts`].
+/// `saved_consts` keys are positional, so an insert or remove must remap
+/// them; see [`UiState::remap_ramp_consts`].
 fn apply_stop_action(
     r: &mut ColorRamp,
     i: usize,
@@ -599,7 +574,7 @@ fn apply_stop_action(
             true
         }
         StopAction::Delete => {
-            // The floor the data depends on; the menu greys out there too.
+            // A ramp needs two stops; the menu grays out Delete there too.
             if i >= r.stops.len() || r.stops.len() <= 2 {
                 return false;
             }
@@ -614,11 +589,8 @@ fn apply_stop_action(
     }
 }
 
-// ---- Ramp bar -----------------------------------------------------------
-
-/// Grab radius around an indicator: its half-width plus slop, floored so it
-/// stays grabbable zoomed out. Generous, because a near miss drags nothing
-/// at all and the row's height is reserved for this one gesture.
+/// Half-width plus slop, floored so it stays grabbable zoomed out. Generous,
+/// because a near miss drags nothing.
 fn ramp_grab_radius(z: f32) -> f32 {
     (4.0 * z).max(4.0) + 5.0
 }
@@ -768,10 +740,9 @@ fn ramp_bar(
     let mut changed = false;
 
     // Arm on the press, not `drag_started`: egui withholds that until the
-    // pointer has travelled `max_click_dist`, and `interact_pointer_pos`
-    // reports where it is now, so the hit test would run a grab radius from
-    // where the user aimed. `is_pointer_button_down_on` is set on the press
-    // frame and confirms the press is the bar's.
+    // pointer has traveled `max_click_dist`, so the hit test would run from
+    // where the pointer is now rather than where the user aimed.
+    // `is_pointer_button_down_on` confirms the press is the bar's.
     if ui.ctx().input(|i| i.pointer.primary_pressed()) && resp.is_pointer_button_down_on() {
         if let Some(p) = resp.interact_pointer_pos() {
             if let Some(i) = indicator_at(&ramp.stops, p.x) {
@@ -794,8 +765,6 @@ fn ramp_bar(
         // pointer leaves the window, stalling the indicator mid-drag.
         if let Some(p) = ui.ctx().input(|i| i.pointer.interact_pos()) {
             if drag.stop < ramp.stops.len() {
-                // Carry the grab offset, so the indicator travels with the
-                // cursor instead of snapping its centre under it.
                 let t = (pointer_t(p.x) + drag.grab_dt).clamp(0.0, 1.0);
                 // A press that hasn't moved is not an edit; pushing SetKind
                 // anyway re-bakes every downstream thumbnail per frame.
@@ -841,11 +810,10 @@ fn ramp_bar(
         }
     }
 
-    // The indicators share the bar's response rather than each holding an
-    // interact rect. A per-indicator id would be the stop's index while its
-    // rect follows the stop's `t`, and removing a stop from the middle parts
-    // those: the indicator to its right keeps its pixels under a new id,
-    // which egui flags and which would point an open menu at the wrong stop.
+    // The indicators share the bar's response. A per-indicator id would be
+    // the stop's index while its rect follows `t`, so removing a middle stop
+    // would give the next indicator a new id at the same pixels, which egui
+    // flags and which points an open menu at the wrong stop.
     let menu_id = egui::Popup::default_response_id(&resp);
     let secondary = resp.secondary_clicked();
     let hit = secondary
@@ -853,9 +821,8 @@ fn ramp_bar(
         .flatten()
         .and_then(|p| indicator_at(&ramp.stops, p.x));
     if secondary {
-        // Open gradient closes the menu rather than opening one about
-        // whichever stop is nearest. It has to be said explicitly: only
-        // `show` applies the command below, and there is nothing to show.
+        // Open gradient closes the menu. This must be explicit: only `show`
+        // applies the command below, and nothing is shown.
         state.ramp_menu = hit.map(|stop| RampMenu { node: id, stop });
         if hit.is_none() {
             egui::Popup::close_id(ui.ctx(), menu_id);
@@ -863,8 +830,8 @@ fn ramp_bar(
     } else if state.ramp_menu.is_some_and(|m| m.node == id)
         && !egui::Popup::is_id_open(ui.ctx(), menu_id)
     {
-        // It can also close without the bar hearing the click — inside the
-        // popup, or Escape — so the stop must not outlive it.
+        // It can also close without the bar hearing the click (inside the
+        // popup, or Escape), so the stop must not outlive it.
         state.ramp_menu = None;
     }
     // `Response::context_menu`, minus opening on every secondary click.
@@ -897,8 +864,8 @@ fn ramp_bar(
             changed |= apply_stop_action(
                 ramp, menu.stop, a, state, NodeRef::Layer(id), graph, eval_ctx,
             );
-            // Both actions move the indices, and the menu closed on the
-            // click, so don't leave it naming whatever slid into that slot.
+            // The menu closed on the click, and the action may have moved
+            // indices.
             state.ramp_menu = None;
         }
     }
@@ -910,8 +877,8 @@ fn ramp_bar(
         .then(|| ui.ctx().input(|i| i.pointer.hover_pos()))
         .flatten()
         .and_then(|p| indicator_at(&ramp.stops, p.x));
-    // The grab radius reaches past the outline, so the cursor is what tells
-    // you you're inside it before committing to the press.
+    // The grab radius reaches past the outline, so the cursor shows when a
+    // press would grab.
     if dragging.is_some() || hovering.is_some() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
     }
@@ -1289,10 +1256,8 @@ fn blend_space_combo(
     )
 }
 
-/// Kernel picker. Moving off the value kernel clears the period rather
-/// than leaving one that `Graph::set_kind` would reject — the edit the user
-/// made is the kernel, and an error toast about a field they cannot see on
-/// simplex would be no help.
+/// Moving to simplex clears the period, which `Graph::set_kind` would
+/// otherwise reject over a field the simplex UI does not show.
 fn noise_kernel_combo(
     ui: &mut egui::Ui,
     salt: (&'static str, u64, &'static str),
@@ -1313,8 +1278,7 @@ fn noise_kernel_combo(
 }
 
 /// Per-axis lattice period, `0` meaning "does not repeat on this axis".
-/// Hovering says what the current pair actually repeats at, because
-/// `period / frequency` is the number that matters and neither field is it.
+/// The hover text gives `period / frequency`, the actual repeat length.
 fn noise_period_row(ui: &mut egui::Ui, n: &mut texture_graph_core::Noise) -> bool {
     let mut changed = false;
     ui.label("period")
@@ -1394,10 +1358,7 @@ fn output_rows(
     }
 }
 
-// ---- Sockets ------------------------------------------------------------
-
-/// Interact with and paint every socket on this node. Registered after the
-/// body and widgets so sockets win the pointer.
+/// Registered after the body and widgets so sockets win the pointer.
 fn sockets(
     ui: &mut egui::Ui,
     painter: &egui::Painter,
@@ -1471,8 +1432,8 @@ fn sockets(
 
 /// How much a hovered socket, or one a live wire could land on, grows by.
 const SOCKET_HOVER: f32 = 1.35;
-/// Smallest a socket ever draws, so it survives zooming out. Larger for one
-/// a wire could land on, which has an answer to give.
+/// Smallest a socket draws, so it survives zooming out. Larger for one a
+/// wire could land on, so its color stays readable.
 const SOCKET_DRAW_MIN: f32 = 2.0;
 const SOCKET_CANDIDATE_MIN: f32 = 3.0;
 
@@ -1486,8 +1447,8 @@ fn eligibility(eligible: bool, z: f32) -> (f32, egui::Color32) {
     (big, if eligible { egui::Color32::BLACK } else { egui::Color32::RED })
 }
 
-/// Radius and outline for an input socket. One that would refuse the wire in
-/// the air rings red, while the drag can still be cancelled.
+/// One that would refuse the wire in the air turns red while the drag can
+/// still be canceled.
 fn socket_style(
     graph: &Graph,
     state: &UiState,
@@ -1496,10 +1457,10 @@ fn socket_style(
     z: f32,
 ) -> (f32, egui::Color32) {
     match state.wire_drag {
-        // That wire hunts for an output, so no input is a candidate.
         Some(WireDrag::FromOutput { src, .. }) if hovered => {
             eligibility(super::wires::refusal(graph, node, src).is_none(), z)
         }
+        // A `FromInput` wire looks for an output, so no input is a candidate.
         _ => plain(hovered, z),
     }
 }

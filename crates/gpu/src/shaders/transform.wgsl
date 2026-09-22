@@ -1,15 +1,9 @@
-// LayerKind::Transform. Read `source` at re-mapped (u, v) coords.
+// LayerKind::Transform. Must match `apply_transform` and `eval_transform`
+// in `core::eval`.
 //
-// The pre-transform is the same as `apply_transform` in `core::eval`:
-// recenter → rotate in UV → per-axis scale → coord_mode (Passthrough,
-// Permute, or Radial).
-//
-// Edge modes (mirroring `eval_transform` in `core::eval`):
-// - Clamp: transformed U/V pin to the [0, 1] square.
-// - Extend: the scheduler bakes the source over the UV rectangle this
-//   transform actually samples (capped at core's EXTEND_LIMIT box), so
-//   out-of-[0,1] samples land on real data; anything outside the source's
-//   baked domain shows the missing-texture grid.
+// Extend: the scheduler bakes the source over the rectangle this transform
+// samples, capped at core's EXTEND_LIMIT box. Samples outside what was
+// baked show the missing-texture grid.
 
 struct TransformParams {
     size: vec2<u32>,
@@ -23,7 +17,7 @@ struct TransformParams {
     w_coord: f32,        // third texture coordinate; 0.5 for flat bakes
     edge_mode: u32,      // 0=Clamp, 1=Extend
     dom: vec4<f32>,      // own bake domain (min_u, min_v, ext_u, ext_v)
-    src_dom: vec4<f32>,  // source's bake domain
+    src_dom: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> params: TransformParams;
@@ -40,8 +34,7 @@ fn dom_texel(dom: vec4<f32>, uv: vec2<f32>, size: vec2<u32>) -> vec2<i32> {
     );
 }
 
-// The missing-texture grid at a sample point — mirrors `missing_texture`
-// in core::eval and missing.wgsl (16 cells/unit, magenta/black, 3D).
+// Keep in sync with `missing_texture` in core::eval and missing.wgsl.
 const MISSING_CELLS: f32 = 16.0;
 
 fn missing_color(p: vec3<f32>) -> vec4<f32> {
@@ -118,13 +111,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t = apply_transform(u, v, w);
     var src_px: vec4<f32>;
     if (params.edge_mode == 0u) {
-        // Clamp: pin to the unit square, then sample the source there.
         let cuv = vec2<f32>(clamp(t.x, 0.0, 1.0), clamp(t.y, 0.0, 1.0));
         src_px = textureLoad(src, dom_texel(params.src_dom, cuv, params.size), 0);
     } else if (t.x < params.src_dom.x || t.x > params.src_dom.x + params.src_dom.z ||
                t.y < params.src_dom.y || t.y > params.src_dom.y + params.src_dom.w) {
-        // Extend, but past what the source's bake covers (the request was
-        // capped): the missing grid, at the transformed sample point.
+        // Extend past the capped bake.
         src_px = missing_color(t);
     } else {
         src_px = textureLoad(src, dom_texel(params.src_dom, t.xy, params.size), 0);

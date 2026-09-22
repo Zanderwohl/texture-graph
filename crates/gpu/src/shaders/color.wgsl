@@ -1,4 +1,4 @@
-// LayerKind::Color — writes a uniform Oklcha value to every texel.
+// LayerKind::Color: one Oklcha value in every texel.
 
 struct Params {
     color: vec4<f32>,   // (L, C, hue-deg, alpha), unclamped

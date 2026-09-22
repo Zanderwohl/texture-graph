@@ -14,8 +14,6 @@ struct MapParams {
 @group(0) @binding(2) var tex_value: texture_2d<f32>;
 @group(0) @binding(3) var tex_palette: texture_2d<f32>;
 
-// Map this dispatch's texel to its UV within the layer's bake domain
-// (dom = (min_u, min_v, ext_u, ext_v)).
 fn dom_uv(dom: vec4<f32>, gid: vec2<u32>, size: vec2<u32>) -> vec2<f32> {
     return vec2<f32>(
         dom.x + (f32(gid.x) + 0.5) / f32(size.x) * dom.z,
@@ -40,8 +38,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let uv = dom_uv(params.dom, gid.xy, params.size);
     let val = textureLoad(tex_value, dom_texel(params.dom_value, uv, params.size), 0);
     let t = clamp(val.x, 0.0, 1.0);
-    // Nearest-neighbor sample into palette at (t, 0), mapped through the
-    // palette's bake domain. Palette is 1D-in-U.
+    // The palette varies only in u.
     let px = clamp(
         (t - params.dom_palette.x) / params.dom_palette.z * f32(params.size.x),
         0.0, f32(params.size.x) - 1.0,

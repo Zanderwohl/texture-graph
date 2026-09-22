@@ -23,8 +23,8 @@ pub fn wire_shape(a: egui::Pos2, b: egui::Pos2, zoom: f32, stroke: egui::Stroke)
     })
 }
 
-/// Every stored connection at exact socket geometry. A detach-dragged edge
-/// is hidden but unedited, so cancelling makes it reappear.
+/// A detach-dragged edge is hidden but unedited, so canceling makes it
+/// reappear.
 pub fn draw_edges(
     painter: &egui::Painter,
     layouts: &[NodeLayout],
@@ -48,7 +48,7 @@ pub fn draw_edges(
     }
 }
 
-/// Nearest of `sockets` within the grab radius. Both sides hunt alike.
+/// Nearest of `sockets` within the grab radius.
 fn nearest<T>(
     sockets: impl Iterator<Item = (egui::Pos2, T)>,
     ptr: egui::Pos2,
@@ -65,7 +65,6 @@ fn nearest<T>(
     best.map(|(_, item)| item)
 }
 
-/// The input socket currently under the pointer, if any.
 fn hovered_input(
     layouts: &[NodeLayout],
     ptr: egui::Pos2,
@@ -77,8 +76,7 @@ fn hovered_input(
     nearest(sockets, ptr, zoom)
 }
 
-/// The output socket under the pointer: what a wire pulled backwards out of
-/// an input hunts for. The Output pseudo-node has none.
+/// The Output pseudo-node has no output socket.
 pub fn hovered_output(
     layouts: &[NodeLayout],
     ptr: egui::Pos2,
@@ -118,13 +116,11 @@ fn anchor(
     }
 }
 
-/// Why a drop would be refused, decided while the wire is in the air so the
-/// socket can ring red before the user commits, and reused as the message if
-/// they commit anyway — one function, so colour and sentence agree.
+/// Used both to color the socket red during the drag and as the error
+/// message on drop, so the two agree.
 ///
-/// Only cycles: every layer produces a `Color` and every socket takes one,
-/// so there is no type mismatch to catch. The graph stays the authority; a
-/// drop goes through `set_kind`, which refuses anything this misses.
+/// Only cycles: every layer produces a `Color` and every socket takes one.
+/// `set_kind` still refuses anything this misses.
 pub fn refusal(graph: &Graph, node: NodeRef, src: LayerId) -> Option<String> {
     // Nothing reads the material output, so it can't be in a loop.
     let NodeRef::Layer(dst) = node else { return None };
@@ -140,8 +136,7 @@ pub fn refusal(graph: &Graph, node: NodeRef, src: LayerId) -> Option<String> {
     Some(if src == dst {
         format!("{} can't read itself", name(dst))
     } else {
-        // Naming both ends is the point: on a dozen nodes, "that would make
-        // a loop" leaves the user hunting for the other half.
+        // Name both ends so the user can find the loop.
         format!("{} already reads {} — that would make a loop", name(src), name(dst))
     })
 }
@@ -166,7 +161,7 @@ pub fn advance_wire_drag(
         .ctx()
         .input(|i| (i.pointer.primary_down(), i.pointer.hover_pos()));
     let Some(ptr) = ptr else {
-        // Pointer left the window: cancel.
+        // Pointer left the window.
         state.wire_drag = None;
         return false;
     };
@@ -176,8 +171,6 @@ pub fn advance_wire_drag(
         return false;
     };
 
-    // The two directions differ only in what they are hunting for; from
-    // here down a candidate connection is a candidate connection.
     let candidate = match wire {
         WireDrag::FromOutput { src, .. } => hovered_input(layouts, ptr, state.canvas_zoom)
             .map(|(node, sock)| Candidate { node, key: sock.key, src, at: sock.center }),
@@ -197,7 +190,6 @@ pub fn advance_wire_drag(
         return true;
     }
 
-    // Released — resolve the drop.
     let detached = wire.detached_from();
     state.wire_drag = None;
     match candidate {
@@ -205,8 +197,7 @@ pub fn advance_wire_drag(
             if detached == Some((c.node, c.key)) {
                 // Dropped back where it came from: nothing happened.
             } else if let Some(why) = refused {
-                // Refused before it can disturb anything — in particular
-                // the wire it was detached from stays where it is.
+                // The wire it was detached from stays where it is.
                 state.last_error = Some(why);
             } else {
                 let mut edits: Vec<(NodeRef, InputKey, Option<LayerId>)> = Vec::new();
@@ -228,10 +219,8 @@ pub fn advance_wire_drag(
     false
 }
 
-/// Apply a batch of socket edits, one `EditCmd` per touched node, stashing
-/// and restoring displaced `Const` values along the way. Grouping matters:
-/// a detach-and-reconnect on the same node must land as ONE `SetKind` so
-/// the intermediate state never exists.
+/// One `EditCmd` per touched node, so a detach-and-reconnect on the same
+/// node lands as a single `SetKind` and the intermediate state never exists.
 pub fn apply_socket_edits(
     graph: &Graph,
     state: &mut UiState,
@@ -325,10 +314,8 @@ mod tests {
     use crate::catalog::{self, Kind};
     use texture_graph_core::LayerKind;
 
-    /// A chain albedo → warp → crackle. `crackle` reads `warp` reads
-    /// `albedo`. The names are distinctive on purpose: "a" and "c" occur
-    /// inside the refusal's own wording, so asserting on them would pass
-    /// whether or not the message named anything.
+    /// `crackle` reads `warp` reads `albedo`. Names like "a" would occur in
+    /// the refusal's own wording, so asserting on them would prove nothing.
     fn chain() -> (Graph, LayerId, LayerId, LayerId) {
         let mut g = Graph::new();
         let albedo = g.add_layer("albedo", catalog::default_kind(Kind::Color)).unwrap();
@@ -345,10 +332,7 @@ mod tests {
         LayerKind::Transform(t)
     }
 
-    /// The red-socket rule. This is what the user sees *before* committing,
-    /// so it has to agree with what the graph would do — a socket that
-    /// stays black and then refuses the drop is worse than one that never
-    /// looked inviting.
+    /// The red socket must agree with what the graph will refuse.
     #[test]
     fn a_socket_that_would_refuse_the_drop_says_so_in_advance() {
         let (mut g, albedo, _warp, crackle) = chain();
@@ -367,9 +351,7 @@ mod tests {
         assert!(g.set_kind(albedo, reading(crackle)).is_err());
     }
 
-    /// The other half of the same agreement: a socket that rings black has
-    /// to actually accept the drop, or the wire bounces with an error the
-    /// user was given no warning about.
+    /// A socket not shown red must accept the drop.
     #[test]
     fn a_socket_that_admits_the_drop_really_takes_it() {
         let (mut g, albedo, _warp, crackle) = chain();
@@ -388,7 +370,7 @@ mod tests {
     }
 
     /// Nothing reads the material output, so no wire into it can close a
-    /// loop — including one from a layer that reads everything else.
+    /// loop.
     #[test]
     fn the_material_output_never_refuses_a_wire() {
         let (g, _albedo, _warp, crackle) = chain();
@@ -407,9 +389,8 @@ mod tests {
         }
     }
 
-    /// A wire dragged backwards out of an input is hunting for an output,
-    /// and the Output pseudo-node does not have one — dropping on it would
-    /// be asking the material's result to feed a node.
+    /// A wire dragged out of an input looks for an output, and the Output
+    /// pseudo-node has none.
     #[test]
     fn a_backwards_wire_finds_outputs_and_never_the_material_output() {
         let layouts = vec![

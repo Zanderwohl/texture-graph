@@ -3,11 +3,9 @@
 //! A file must start with `TextureGraphFile(`, which doubles as the format's
 //! magic; anything else is rejected before RON sees it. Extension `.tgraph`.
 //!
-//! [`load_from_str`] and [`save_to_string`] are unconditional; the path
-//! helpers sit behind the default-on `std-fs` feature. `std::fs` compiles
-//! for `wasm32-unknown-unknown` and then fails at runtime, so a wasm
-//! consumer takes `default-features = false` and gets a compile error
-//! instead of a mystery at load time.
+//! The path helpers need the default-on `std-fs` feature. A wasm consumer
+//! should disable it: `std::fs` compiles for `wasm32-unknown-unknown` but
+//! fails at runtime.
 
 #[cfg(feature = "std-fs")]
 use std::fs;
@@ -24,17 +22,12 @@ use crate::graph::Graph;
 /// path.
 pub const FILE_EXTENSION: &str = "tgraph";
 
-/// Current on-disk format version. Bump on any breaking layout change.
-///
-/// RON tags enum variants by name, so a `LayerKind` variant added here
-/// keeps old files loading in new builds — it is the other direction that
-/// needs the version, and that is what a reader older than a writer checks.
-/// Bumped once per batch of new kinds, not once per node: 2 for §1–§7 of
-/// `documentation/game-consumer-features.md`, 3 for §8's `Coordinate`.
+/// Bump when a file could fail to load in an older build, such as on a new
+/// `LayerKind` variant. RON tags variants by name, so old files still load in
+/// newer builds; the version lets an older build refuse a newer file.
 pub const CURRENT_FORMAT_VERSION: u32 = 3;
 
-/// Structural magic — the RON parser sees this literal as the top-level
-/// struct name.
+/// The RON parser reads this as the top-level struct name.
 const MAGIC_PREFIX: &str = "TextureGraphFile(";
 
 /// Root on-disk record.
@@ -45,24 +38,20 @@ pub struct TextureGraphFile {
     pub graph: Graph,
 }
 
-/// Human-authored header that travels with the graph. All fields are
-/// optional in intent: empty strings and empty vectors are fine.
+/// Every field may be empty.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FileMetadata {
-    /// Human-readable name for the graph. May differ from the filename.
     pub name: String,
-    /// Free-form description.
     pub description: Option<String>,
     pub authors: Vec<String>,
     /// ISO-8601 UTC. Caller-supplied, so this crate stays clock-free.
     pub modified: String,
-    /// Version string of the application that wrote this file. Free-form.
+    /// Free-form version string of the writing application.
     pub written_by: String,
 }
 
 impl TextureGraphFile {
-    /// Package `graph` at the current format version with the given
-    /// metadata.
+    /// Uses [`CURRENT_FORMAT_VERSION`].
     pub fn new(metadata: FileMetadata, graph: Graph) -> Self {
         Self {
             format_version: CURRENT_FORMAT_VERSION,
@@ -94,8 +83,7 @@ pub enum LoadError {
     Deserialize(#[from] ron::error::SpannedError),
 }
 
-/// Pretty RON. Struct names are on, so the top-level token is the magic
-/// marker; field order is stable and diffs readably.
+/// Pretty RON with struct names on, so the top-level token is the magic.
 pub fn save_to_string(file: &TextureGraphFile) -> Result<String, ron::Error> {
     let cfg = PrettyConfig::new()
         .depth_limit(usize::MAX)
@@ -106,8 +94,7 @@ pub fn save_to_string(file: &TextureGraphFile) -> Result<String, ron::Error> {
     ron::ser::to_string_pretty(file, cfg)
 }
 
-/// Parse a texture-graph file from RON text. Validates the magic marker
-/// and the format version before deserializing.
+/// Rejects a missing magic prefix or a format version newer than this build.
 pub fn load_from_str(s: &str) -> Result<TextureGraphFile, LoadError> {
     let trimmed = s.trim_start();
     if !trimmed.starts_with(MAGIC_PREFIX) {
@@ -123,8 +110,7 @@ pub fn load_from_str(s: &str) -> Result<TextureGraphFile, LoadError> {
     Ok(file)
 }
 
-/// Write `file` to disk as pretty RON. If `path` has no extension, appends
-/// [`FILE_EXTENSION`].
+/// Appends [`FILE_EXTENSION`] if `path` has none.
 #[cfg(feature = "std-fs")]
 pub fn save_to_path(file: &TextureGraphFile, path: impl AsRef<Path>) -> Result<(), SaveError> {
     let mut p = path.as_ref().to_path_buf();
@@ -136,7 +122,6 @@ pub fn save_to_path(file: &TextureGraphFile, path: impl AsRef<Path>) -> Result<(
     Ok(())
 }
 
-/// Read a texture-graph file from disk.
 #[cfg(feature = "std-fs")]
 pub fn load_from_path(path: impl AsRef<Path>) -> Result<TextureGraphFile, LoadError> {
     let s = fs::read_to_string(path)?;
@@ -170,8 +155,7 @@ mod tests {
         assert_eq!(back.graph.layers.len(), file.graph.layers.len());
     }
 
-    /// A graph written before the value kernel, the period and the
-    /// fractal stack existed still loads, and loads as the node it meant:
+    /// A v1 noise layer, without kernel, period or fractal fields, loads as
     /// one octave of aperiodic simplex.
     #[test]
     fn a_v1_noise_layer_loads_as_aperiodic_single_octave_simplex() {
@@ -202,11 +186,6 @@ mod tests {
         assert_eq!(n.fractal.octaves, 1);
     }
 
-    /// The other direction is what the version is for: a file from a
-    /// newer build is refused rather than half-read.
-    /// A graph written before parameters existed loads with none, and a
-    /// graph with them round-trips its declarations and its bindings by
-    /// name.
     #[test]
     fn parameters_round_trip_and_are_optional_on_disk() {
         let mut g = Graph::new();
@@ -215,7 +194,7 @@ mod tests {
         g.declare_param(crate::param::ParamDecl::scalar("contrast", -1.0, 3.0, 0.75))
             .unwrap();
         let mut tint = crate::param::ParamDecl::color("tint", oklcha(0.4, 0.2, 90.0, 1.0));
-        tint.description = Some("body colour".into());
+        tint.description = Some("body color".into());
         g.declare_param(tint).unwrap();
 
         let s = save_to_string(&TextureGraphFile::new(sample_metadata(), g)).unwrap();
@@ -229,7 +208,7 @@ mod tests {
             back.params["contrast"].kind,
             crate::param::ParamKind::Scalar { min: -1.0, max: 3.0 }
         );
-        assert_eq!(back.params["tint"].description.as_deref(), Some("body colour"));
+        assert_eq!(back.params["tint"].description.as_deref(), Some("body color"));
     }
 
     #[test]
@@ -258,12 +237,10 @@ mod tests {
         let a = g.add_layer("a", LayerKind::Color(oklcha(0.1, 0.0, 0.0, 1.0))).unwrap();
         let b = g.add_layer("b", LayerKind::Color(oklcha(0.9, 0.0, 0.0, 1.0))).unwrap();
         let before = save_to_string(&TextureGraphFile::new(sample_metadata(), g.clone())).unwrap();
-        // Reversing the list_order changes UI display but must not touch
-        // the serialized `layers` payload.
+        // Reordering `list_order` must not change the serialized `layers`.
         g.set_list_position(a, 1).unwrap();
         g.set_list_position(b, 0).unwrap();
         let after = save_to_string(&TextureGraphFile::new(sample_metadata(), g)).unwrap();
-        // The layers block is identical; only `list_order` differs.
         let extract_layers = |s: &str| {
             let start = s.find("layers:").unwrap();
             let end = s[start..].find("list_order:").unwrap();

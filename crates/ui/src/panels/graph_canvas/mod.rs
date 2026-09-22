@@ -1,13 +1,13 @@
 //! Center panel: Blender-style node editor with pan/zoom.
 //!
-//! - **Scroll wheel** zooms about the pointer.
-//! - **Drag on empty space** pans; **drag on a node body** moves the node.
-//! - **Drag from a socket** starts a wire, either direction; dropping on
-//!   empty space disconnects. Pulling a *connected* input off detaches it.
-//! - **Click a node's title** to rename it: Enter or clicking away commits,
+//! - Scroll wheel zooms about the pointer.
+//! - Drag on empty space pans; drag on a node body moves the node.
+//! - Drag from a socket starts a wire, either direction; dropping on empty
+//!   space disconnects. Pulling a connected input off detaches it.
+//! - Click a node's title to rename it: Enter or clicking away commits,
 //!   Escape discards.
-//! - **Right-click on empty space** adds a node at the pointer;
-//!   right-click on a node offers rename, preview, duplicate and delete.
+//! - Right-click on empty space adds a node at the pointer; right-click on
+//!   a node offers rename, preview, duplicate and delete.
 //!
 //! Positions live on `Canvas` for `state.active_canvas`; edges are derived
 //! from socket values each frame, and an unplaced layer is grid-placed for
@@ -64,7 +64,6 @@ pub fn show(
 ) {
     ensure_active_canvas(graph, state);
 
-    // The whole panel is a pan surface.
     let (canvas_rect, canvas_resp) =
         ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
     let painter = ui.painter_at(canvas_rect);
@@ -104,7 +103,6 @@ pub fn show(
     let wire_active =
         wires::advance_wire_drag(ui, graph, state, &layouts, &out_sockets, &painter);
 
-    // Pan only when nothing else claimed the drag.
     if !drag_still_active
         && !wire_active
         && !node_hit
@@ -115,8 +113,6 @@ pub fn show(
     }
 }
 
-// ---- Coordinate transforms ---------------------------------------------
-
 fn world_to_screen(world: egui::Pos2, origin: egui::Pos2, state: &UiState) -> egui::Pos2 {
     origin + state.canvas_pan + world.to_vec2() * state.canvas_zoom
 }
@@ -124,8 +120,6 @@ fn world_to_screen(world: egui::Pos2, origin: egui::Pos2, state: &UiState) -> eg
 fn screen_to_world(screen: egui::Pos2, origin: egui::Pos2, state: &UiState) -> egui::Pos2 {
     ((screen - origin - state.canvas_pan) / state.canvas_zoom).to_pos2()
 }
-
-// ---- Zoom ---------------------------------------------------------------
 
 fn handle_zoom(
     ui: &egui::Ui,
@@ -151,8 +145,6 @@ fn handle_zoom(
     let new_screen = world_to_screen(world_at_ptr, canvas_rect.min, state);
     state.canvas_pan += ptr - new_screen;
 }
-
-// ---- Layout ------------------------------------------------------------
 
 fn ensure_active_canvas(graph: &Graph, state: &mut UiState) {
     if graph.canvases.contains_key(&state.active_canvas) {
@@ -210,9 +202,6 @@ fn resolve_positions(
     (out, output_pos)
 }
 
-// ---- Drag lock ---------------------------------------------------------
-
-/// Resolve a live node drag against the pointer and emit its position.
 /// Returns whether the drag is still active.
 fn advance_active_drag(ui: &egui::Ui, state: &mut UiState, canvas_rect: egui::Rect) -> bool {
     let Some(drag) = state.drag else {
@@ -225,7 +214,7 @@ fn advance_active_drag(ui: &egui::Ui, state: &mut UiState, canvas_rect: egui::Re
         state.drag = None;
         return false;
     }
-    // Release on leaving the viewport, or a node wanders off under a
+    // Release on leaving the viewport, or the node can end up under a
     // sibling panel.
     let Some(ptr) = ptr else {
         state.drag = None;
@@ -267,10 +256,8 @@ fn release_stale_ramp_drag(ui: &egui::Ui, graph: &Graph, state: &mut UiState) {
     }
 }
 
-// ---- Context menu -------------------------------------------------------
-
-/// Right-click on empty canvas adds a node at the pointer. A node's own
-/// interact claims right-clicks on it, so this only fires on background.
+/// A node's own interact claims right-clicks on it, so this only fires on
+/// the background.
 fn canvas_context_menu(
     graph: &Graph,
     state: &mut UiState,
@@ -347,7 +334,7 @@ mod canvas_tests {
         }
 
         /// Run one frame, returning how many shapes egui painted in its error
-        /// colour. Those are `warn_on_id_clash` and `warn_if_rect_changes_id`,
+        /// color. Those are `warn_on_id_clash` and `warn_if_rect_changes_id`,
         /// so any of them means a widget id moved. The canvas paints nothing
         /// red itself but an ineligible socket mid-wire-drag.
         fn frame(&mut self, events: Vec<egui::Event>) -> usize {
@@ -554,7 +541,7 @@ mod canvas_tests {
         }
     }
 
-    /// An indicator grabbed off centre travels with the pointer instead of
+    /// An indicator grabbed off center travels with the pointer instead of
     /// snapping under it, starting on the press rather than once egui has
     /// decided the press was a drag.
     #[test]
@@ -674,12 +661,9 @@ mod canvas_tests {
         assert_eq!(h.stops(ramp).len(), 4, "the row menu did not duplicate");
     }
 
-    /// Losing a stop from the middle leaves the indicators to its right on
-    /// the same pixels while every index past the hole moves down. Anything
-    /// keyed by index but placed by `t` then changes id without moving, which
-    /// egui flags and which points an open menu at the wrong stop.
-    ///
-    /// Driven by `set_kind`, so it stays a test about removal itself.
+    /// Removing a middle stop moves later indices down while their
+    /// indicators stay put, so anything keyed by index but placed by `t`
+    /// changes id without moving. Driven by `set_kind` to test removal alone.
     #[test]
     fn removing_a_stop_does_not_shuffle_widget_ids() {
         let mut h = Harness::new();
@@ -700,12 +684,9 @@ mod canvas_tests {
         assert_eq!(h.settle(3), 0, "dropping a stop shuffled ids");
     }
 
-    /// The other way an index moves without its pixels: crossing swaps two
-    /// stops in the vec while the one crossed never moves.
-    ///
-    /// egui doesn't flag this even with per-indicator ids — both ids survive
-    /// the swap, so it reads the rect match as coincidence. The red count is
-    /// a backstop; the crossing assertions are what earn their keep.
+    /// Crossing swaps two stops in the vec while the crossed one stays put.
+    /// egui does not flag this (both ids survive), so the crossing
+    /// assertions are the real check.
     #[test]
     fn dragging_a_stop_across_another_does_not_shuffle_widget_ids() {
         let mut h = Harness::new();
@@ -723,9 +704,8 @@ mod canvas_tests {
         assert_eq!(h.settle(3), 0, "the frames after the crossing shuffled ids");
     }
 
-    /// One menu serves every indicator, so opening it depends on the
-    /// right-click landing on one — and closing it has to be as explicit,
-    /// since the close command rides along with a showing that won't happen.
+    /// One menu serves every indicator, so a right-click that lands on none
+    /// has to close it explicitly.
     #[test]
     fn right_clicking_open_gradient_closes_an_open_stop_menu() {
         let mut h = Harness::new();
@@ -759,11 +739,9 @@ mod canvas_tests {
         }
     }
 
-    /// Inline widgets live in child `Ui`s, and one keyed by salt takes its
-    /// auto-id seed from the parent's running counter. The rename field adds
-    /// a child before all the rows, which would shift every slider and
-    /// drag-value after it one slot along. Explicit ids prevent that, and
-    /// this is what holds them.
+    /// A child `Ui` keyed by salt takes its auto-id seed from the parent's
+    /// counter, so the rename field would shift the id of every later
+    /// widget. Explicit ids prevent that.
     #[test]
     fn starting_and_ending_a_rename_does_not_shuffle_widget_ids() {
         let mut h = Harness::new();
@@ -779,12 +757,9 @@ mod canvas_tests {
         assert_eq!(h.settle(3), 0, "removing the rename field shuffled ids");
     }
 
-    /// The same hazard reaching the rows: a node's row count follows its
-    /// parameters, so switching a Mix off Blend drops two child `Ui`s from
-    /// the middle of the canvas and everything after shifts a slot while
-    /// staying put — exactly what `warn_if_rect_changes_id` catches.
-    ///
-    /// The Output is downstream here and keeps two sliders to shift onto.
+    /// Switching a Mix off Blend drops two child `Ui`s mid-canvas, so later
+    /// widgets would change id without moving. The Output is downstream and
+    /// keeps two sliders to shift onto.
     #[test]
     fn changing_a_nodes_row_count_does_not_shuffle_later_widget_ids() {
         let mut h = Harness::new();
@@ -814,11 +789,8 @@ mod canvas_tests {
         (before, layout::rows_for(&LayerKind::Mix(m)).len())
     }
 
-    /// Panning is the other way child `Ui` counts change, because
-    /// off-screen nodes are skipped whole. This does not exercise the id
-    /// hazard the way the row-count test does — every rect moves with the
-    /// pan, so egui has no same-rect pair to compare — but it does prove
-    /// the cull path itself paints nothing and does not panic.
+    /// Off-screen nodes are skipped whole. Every rect moves with the pan, so
+    /// this cannot catch the id hazard; it checks the cull path is quiet.
     #[test]
     fn panning_nodes_out_of_view_is_quiet() {
         let mut h = Harness::new();
@@ -829,8 +801,7 @@ mod canvas_tests {
         }
     }
 
-    /// The rename itself, end to end through the real widget: click the
-    /// title, type, press Enter, and the layer is renamed.
+    /// Click the title, type, press Enter.
     #[test]
     fn clicking_a_title_renames_the_layer() {
         let mut h = Harness::new();
@@ -853,10 +824,8 @@ mod canvas_tests {
         assert!(h.state.renaming.is_none(), "the field outlived the commit");
     }
 
-    /// Escape throws the edit away. Committing on blur is the other path,
-    /// and the two must not be confused: Escape also surrenders focus, so
-    /// an implementation that checked for a blur first would read a cancel
-    /// as a commit.
+    /// Escape also surrenders focus, so checking for a blur first would read
+    /// a cancel as a commit.
     #[test]
     fn escape_abandons_a_rename() {
         let mut h = Harness::new();

@@ -1,18 +1,16 @@
-// LayerKind::Mix. Add / Sub / Multiply / Blend of two color layers.
+// LayerKind::Mix.
 //
-// Add and Subtract operate in Oklab (chroma is a Cartesian (a, b) vector,
-// so a straight component-wise sum composes fractal noise correctly).
-// Multiply operates in linear sRGB (optical darkening). Blend uses the
-// caller-selected space (Oklch, LinearSrgb, or HSV of gamma-encoded sRGB).
-//
-// factor is either a constant or the L channel of a third input layer.
+// Add and Subtract work in Oklab, where (a, b) is Cartesian, so summed
+// fractal noise octaves compose correctly. Multiply works in linear sRGB.
+// Blend uses the selected space; its HSV is of gamma-encoded sRGB, as in
+// `palette`.
 
 struct MixParams {
     size: vec2<u32>,
     mode: u32,             // 0=Add, 1=Subtract, 2=Multiply, 3=Blend
     space: u32,            // 0=Oklch, 1=LinearSrgb, 2=Hsv (Blend only)
     factor_const: f32,
-    factor_is_layer: u32,  // 0=Const, 1=Layer
+    factor_is_layer: u32,  // 0=Const, 1=L of tex_factor
     _pad: vec2<u32>,
     dom: vec4<f32>,        // own bake domain (min_u, min_v, ext_u, ext_v)
     dom_a: vec4<f32>,
@@ -26,8 +24,6 @@ struct MixParams {
 @group(0) @binding(3) var tex_b: texture_2d<f32>;
 @group(0) @binding(4) var tex_factor: texture_2d<f32>;
 
-// Map this dispatch's texel to its UV within the layer's bake domain
-// (dom = (min_u, min_v, ext_u, ext_v)).
 fn dom_uv(dom: vec4<f32>, gid: vec2<u32>, size: vec2<u32>) -> vec2<f32> {
     return vec2<f32>(
         dom.x + (f32(gid.x) + 0.5) / f32(size.x) * dom.z,
@@ -104,8 +100,8 @@ fn linear_srgb_to_oklch(rgb: vec3<f32>) -> vec3<f32> {
 
 // Shortest-arc hue lerp in degrees.
 fn lerp_hue_deg(a: f32, b: f32, t: f32) -> f32 {
-    var d = (b - a) - floor((b - a) / 360.0) * 360.0; // ((b-a) mod 360), but keep sign class
-    // Match Rust's `%`: rem, not modulo. Emulate with fract-of-signed:
+    var d = (b - a) - floor((b - a) / 360.0) * 360.0;
+    // Rust's `%` is a remainder, not a modulo.
     d = (b - a) - trunc((b - a) / 360.0) * 360.0;
     if (d > 180.0)  { d = d - 360.0; }
     if (d < -180.0) { d = d + 360.0; }
@@ -113,10 +109,6 @@ fn lerp_hue_deg(a: f32, b: f32, t: f32) -> f32 {
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 { return a + (b - a) * t; }
-
-// --- HSV -------------------------------------------------------------
-// Palette's Srgb -> Hsv uses the standard hexagonal formulation on
-// gamma-encoded sRGB values. Match its behavior.
 
 fn linear_to_srgb_component(x: f32) -> f32 {
     let cx = clamp(x, 0.0, 1.0);
@@ -167,7 +159,6 @@ fn blend_colors(a: vec4<f32>, b: vec4<f32>, t: f32, space: u32) -> vec4<f32> {
     let alpha = lerp(a.w, b.w, t);
     switch space {
         case 1u: {
-            // Linear sRGB
             let la = oklch_to_linear_srgb(a);
             let lb = oklch_to_linear_srgb(b);
             let mixed = vec3<f32>(lerp(la.x, lb.x, t), lerp(la.y, lb.y, t), lerp(la.z, lb.z, t));
@@ -175,7 +166,6 @@ fn blend_colors(a: vec4<f32>, b: vec4<f32>, t: f32, space: u32) -> vec4<f32> {
             return vec4<f32>(back, alpha);
         }
         case 2u: {
-            // HSV of gamma-encoded sRGB
             let la = oklch_to_linear_srgb(a);
             let lb = oklch_to_linear_srgb(b);
             let sa = vec3<f32>(linear_to_srgb_component(la.x), linear_to_srgb_component(la.y), linear_to_srgb_component(la.z));
@@ -189,7 +179,6 @@ fn blend_colors(a: vec4<f32>, b: vec4<f32>, t: f32, space: u32) -> vec4<f32> {
             return vec4<f32>(back, alpha);
         }
         default: {
-            // Oklch
             return vec4<f32>(
                 lerp(a.x, b.x, t),
                 lerp(a.y, b.y, t),
@@ -211,21 +200,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     switch params.mode {
         case 0u: {
-            // Add — in Oklab.
             let al = oklch_to_oklab_vec(a);
             let bl = oklch_to_oklab_vec(b);
             let sum = vec4<f32>(al.x + bl.x, al.y + bl.y, al.z + bl.z, a.w);
             out = oklab_to_oklch_vec(sum);
         }
         case 1u: {
-            // Subtract — in Oklab.
             let al = oklch_to_oklab_vec(a);
             let bl = oklch_to_oklab_vec(b);
             let diff = vec4<f32>(al.x - bl.x, al.y - bl.y, al.z - bl.z, a.w);
             out = oklab_to_oklch_vec(diff);
         }
         case 2u: {
-            // Multiply — componentwise in linear sRGB.
             let la = oklch_to_linear_srgb(a);
             let lb = oklch_to_linear_srgb(b);
             let prod = vec3<f32>(la.x * lb.x, la.y * lb.y, la.z * lb.z);
@@ -236,7 +222,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             var t = params.factor_const;
             if (params.factor_is_layer == 1u) {
                 let f = textureLoad(tex_factor, dom_texel(params.dom_factor, uv, params.size), 0);
-                t = f.x;  // scalar_of takes L
+                t = f.x;
             }
             out = blend_colors(a, b, t, params.space);
         }

@@ -1,16 +1,9 @@
-//! Display strings for the node enums, and the one hint that explains a
-//! pair of fields rather than a single control.
-//!
-//! Shared because the same field is edited in two places — the inspector
-//! column and the node body on the canvas — and a control that reads
-//! "ridged" in one and "Ridged" in the other is a bug report waiting to
-//! happen.
+//! Display strings for the node enums, shared so the inspector and the
+//! canvas node bodies label the same field the same way.
 
 use texture_graph_core::{
     Axis, FractalMode, NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, WarpMode, WaveShape,
 };
-
-// ---- Noise ------------------------------------------------------------
 
 pub const DIMS: &[NoiseDims] = &[NoiseDims::D1, NoiseDims::D2, NoiseDims::D3];
 pub const OUTPUTS: &[NoiseOutput] = &[NoiseOutput::Grayscale, NoiseOutput::Color];
@@ -56,11 +49,9 @@ pub fn fractal_mode(m: FractalMode) -> &'static str {
     }
 }
 
-/// What the current `frequency`/`period` pair actually does, in words.
-///
 /// The repeat length is `period / frequency` sample-space units, and only
-/// `period == frequency` is seamless across the unit cube. Saying so beats
-/// rounding the number the user typed into one that happens to tile.
+/// `period == frequency` is seamless on the unit cube. The hint says so
+/// instead of rounding the user's numbers to ones that tile.
 pub fn period_hint(frequency: f32, period: [u32; 3]) -> String {
     if period == [0; 3] {
         return "no period — the field never repeats".to_string();
@@ -84,8 +75,6 @@ pub fn period_hint(frequency: f32, period: [u32; 3]) -> String {
     }
     format!("repeats: {}", parts.join(", "))
 }
-
-// ---- Wave -------------------------------------------------------------
 
 pub const AXES: &[Axis] = &[Axis::U, Axis::V, Axis::W];
 
@@ -112,8 +101,6 @@ pub fn shape(s: WaveShape) -> &'static str {
         WaveShape::Sawtooth => "sawtooth",
     }
 }
-
-// ---- Warp -------------------------------------------------------------
 
 pub const WARP_MODES: &[WarpMode] = &[WarpMode::Scalar, WarpMode::Vector];
 

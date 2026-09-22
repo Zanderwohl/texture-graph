@@ -1,11 +1,8 @@
 //! Readback tests for the 3D scene renderer's orientation and lighting.
 //!
-//! Each shape renders with a texture that is red for u < 0.5 and green
-//! above, and the pixels are inspected:
-//!
-//! - A mesh rendering inside-out shows the far surface through itself, so the
-//!   split comes out mirrored on a cube, or the wrong hemisphere on a sphere.
-//! - Broken lighting collapses lit-face brightness to ambient.
+//! Shapes are textured red for u < 0.5 and green above. An inside-out mesh
+//! mirrors the split on a cube or shows the wrong hemisphere on a sphere;
+//! broken lighting drops lit faces to ambient.
 
 use texture_graph_core::{
     Color, EvalCtx, Graph, LayerKind, Noise, NoiseDims, NoiseOutput, NoiseRange,
@@ -17,7 +14,6 @@ use crate::{Baker, DeviceCtx};
 
 const SIZE: u32 = 128;
 
-/// Build an Rgba8Unorm sampled texture from a per-pixel closure.
 fn make_tex(ctx: &DeviceCtx, label: &str, f: impl Fn(u32, u32) -> [u8; 4]) -> wgpu::Texture {
     const W: u32 = 64;
     let tex = ctx.device.create_texture(&wgpu::TextureDescriptor {
@@ -54,7 +50,6 @@ fn make_tex(ctx: &DeviceCtx, label: &str, f: impl Fn(u32, u32) -> [u8; 4]) -> wg
     tex
 }
 
-/// Red left / green right color; mid roughness; zero metallic; flat normal.
 fn split_material(ctx: &DeviceCtx) -> BakeOutput {
     BakeOutput {
         color: make_tex(ctx, "test-color", |x, _| {
@@ -67,7 +62,6 @@ fn split_material(ctx: &DeviceCtx) -> BakeOutput {
     }
 }
 
-/// Build an Rgba8Unorm 3D volume from a per-texel closure.
 fn make_volume(
     ctx: &DeviceCtx,
     label: &str,
@@ -110,7 +104,6 @@ fn make_volume(
     tex
 }
 
-/// Solid material: red where texture-space x < 0.5, green otherwise.
 fn solid_split_material(ctx: &DeviceCtx) -> VolumeOutput {
     const R: u32 = 32;
     VolumeOutput {
@@ -124,8 +117,7 @@ fn solid_split_material(ctx: &DeviceCtx) -> VolumeOutput {
     }
 }
 
-/// Render `shape` at the given turntable angle (camera fixed on +Z) with
-/// an explicit material and return the full RGBA8 frame, row-major.
+/// Camera fixed on +Z; `yaw` turns the model.
 fn render_frame_with(
     ctx: &DeviceCtx,
     shape: SceneShape,
@@ -192,7 +184,6 @@ fn render_frame_with(
     pixels
 }
 
-/// UV-material convenience wrapper around `render_frame_with`.
 fn render_frame(ctx: &DeviceCtx, shape: SceneShape, yaw: f32) -> Vec<[u8; 4]> {
     let material = split_material(ctx);
     render_frame_with(ctx, shape, yaw, SceneMaterial::Uv(&material))
@@ -225,9 +216,8 @@ fn cube_front_face_is_lit_and_not_mirrored() {
         "right of cube face should be green-dominant, got {right:?} (mirrored ⇒ inside-out winding)"
     );
 
-    // Key+fill light the +Z face heavily (≈2.8× white on a diffuse face).
-    // After Reinhard + gamma the dominant channel lands well above 120.
-    // Ambient-only (the "dark cube" bug) would be < 60.
+    // Key + fill give about 2.8× white on this face, well above 120 after
+    // Reinhard and gamma. Ambient alone is below 60.
     let brightness = left[0].max(right[1]);
     assert!(
         brightness > 120,
@@ -237,11 +227,8 @@ fn cube_front_face_is_lit_and_not_mirrored() {
 
 #[test]
 fn facing_surface_stays_lit_through_full_turntable_spin() {
-    // The three-point rig is fixed relative to the CAMERA and `yaw` spins
-    // the model. Whatever face rotates toward the viewer must always catch
-    // the key + fill. (The old code orbited the camera through the rig's
-    // shadow side instead — the model went near-black for half of every
-    // revolution, reported as "the cube is very dark".)
+    // The lights are fixed to the camera, so whichever face turns toward
+    // the viewer must stay lit.
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless wgpu init");
     let c = SIZE / 2;
     for step in 0..8 {
@@ -268,29 +255,22 @@ fn sphere_shows_near_hemisphere_with_smooth_shading() {
     let c = SIZE / 2;
     let center = px(&frame, c, c);
     eprintln!("sphere: center={center:?}");
-    // Log a horizontal scanline to expose any conical shading artifacts.
     let scan: Vec<[u8; 4]> = (0..8).map(|i| px(&frame, SIZE / 8 * i + SIZE / 16, c)).collect();
     eprintln!("sphere scanline: {scan:?}");
 
-    // theta = 0 (the u seam) is at +X; the camera at yaw 0 looks from +Z,
-    // so the visible NEAR hemisphere is theta ∈ (0, π) ⇒ u ∈ (0, 0.5),
-    // which is entirely red. Seeing green means we're looking through the
-    // sphere at the far hemisphere (inside-out winding).
+    // theta = 0 is at +X, so from +Z the near hemisphere is u ∈ (0, 0.5),
+    // all red. Green means inside-out winding.
     assert!(
         center[0] > center[1] + 40,
         "sphere center should be red (near hemisphere), got {center:?} (green ⇒ inside-out winding)"
     );
 
-    // Center of a lit sphere: key + fill both graze it, expect a clearly
-    // lit pixel, not ambient black.
     assert!(
         center[0] > 100,
         "sphere center should be lit, got {center:?}"
     );
 
-    // Smoothness probe: brightness across the equator should vary
-    // gradually. A conical-artifact regression shows as a sharp local
-    // discontinuity between adjacent samples inside the silhouette.
+    // Conical shading artifacts show as a jump between adjacent samples.
     let vals: Vec<i32> = (40..88).map(|x| px(&frame, x, c)[0] as i32).collect();
     let max_jump = vals.windows(2).map(|w| (w[1] - w[0]).abs()).max().unwrap();
     eprintln!("sphere equator max adjacent-pixel jump: {max_jump}");
@@ -302,10 +282,7 @@ fn sphere_shows_near_hemisphere_with_smooth_shading() {
 
 #[test]
 fn solid_material_samples_by_object_position() {
-    // Volume is red for texture-space x < 0.5, green above. With the
-    // camera on +Z, object-space -X (⇒ tex x < 0.5) is screen-left, so
-    // both shapes must show red on the left and green on the right —
-    // driven purely by 3D position, no UVs involved.
+    // Object-space -X (tex x < 0.5, red) is screen-left from +Z.
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless wgpu init");
     let volume = solid_split_material(&ctx);
     let c = SIZE / 2;
@@ -396,12 +373,11 @@ fn volume_bake_varies_along_w_only_for_3d_graphs() {
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless wgpu init");
     let mut baker = Baker::new(ctx.clone());
     const RES: u32 = 64; // 64 * 4 B = 256 B rows, copy-aligned
-    // Odd depth so the middle slice's center lands EXACTLY on w = 0.5
-    // ((31 + 0.5) / 63), comparable to the flat bake below.
+    // Odd, so the middle slice is at w = (31 + 0.5) / 63 = 0.5, as the flat
+    // bake below.
     const DEPTH: u32 = 63;
     const MID: u32 = DEPTH / 2;
 
-    // 3D noise: w advances per slice, so distant slices must differ.
     let g3 = noise_graph(NoiseDims::D3);
     assert!(g3.output_is_3d(), "D3-noise graph should report as 3D");
     let vol = baker.bake_volume(&g3, RES, DEPTH, &EvalCtx::default()).expect("bake 3d volume");
@@ -409,7 +385,6 @@ fn volume_bake_varies_along_w_only_for_3d_graphs() {
     let mid = read_volume_slice(&ctx, &vol.color, RES, MID);
     assert_ne!(near, mid, "3D noise slices at different w should differ");
 
-    // 2D noise ignores w: every slice must be identical.
     let g2 = noise_graph(NoiseDims::D2);
     assert!(!g2.output_is_3d(), "D2-noise graph should NOT report as 3D");
     let vol2 = baker.bake_volume(&g2, RES, DEPTH, &EvalCtx::default()).expect("bake 2d volume");
@@ -417,8 +392,6 @@ fn volume_bake_varies_along_w_only_for_3d_graphs() {
     let far2 = read_volume_slice(&ctx, &vol2.color, RES, MID);
     assert_eq!(near2, far2, "2D noise slices should be identical at every w");
 
-    // And the flat bake must still evaluate at w = 0.5 — the volume's
-    // center slice equals the flat bake of the same graph.
     let flat = baker.bake_output(&g3, (RES, RES), &EvalCtx::default(), false).expect("flat bake");
     let flat_px = read_texture_2d(&ctx, &flat.color, RES);
     assert_eq!(flat_px, mid, "volume center slice should match the flat (w=0.5) bake");
@@ -426,10 +399,7 @@ fn volume_bake_varies_along_w_only_for_3d_graphs() {
 
 #[test]
 fn background_is_flat_transparency_checker() {
-    // Outside the mesh silhouette the scene shows the screen-space gray
-    // checker (8-px cells, 0.75/0.55 sRGB → bytes 191/140), not a solid
-    // clear color. Sample two horizontally-adjacent cells in the top-left
-    // corner, comfortably outside the sphere.
+    // 8-px cells, 0.75/0.55 sRGB → bytes 191/140.
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless wgpu init");
     let frame = render_frame(&ctx, SceneShape::Sphere, 0.0);
     let a = px(&frame, 3, 3);
@@ -453,9 +423,7 @@ fn background_is_flat_transparency_checker() {
 
 #[test]
 fn object_alpha_switch_keeps_real_alpha_in_volume_bakes() {
-    // A half-transparent solid color. The flat bake (object_alpha=false)
-    // must composite the gray checker and emit alpha=255; the volume bake
-    // must keep the real ~50% alpha so the 3D object itself blends.
+    // The flat bake composites over the checker; the volume bake keeps alpha.
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless wgpu init");
     let mut baker = Baker::new(ctx.clone());
     const RES: u32 = 64;
@@ -479,8 +447,7 @@ fn object_alpha_switch_keeps_real_alpha_in_volume_bakes() {
         (a - 128).abs() <= 2,
         "volume bake keeps real alpha (~128), got {a}"
     );
-    // And no gray checker mixed into the color: neighboring 8-px cells of
-    // a solid color must be identical.
+    // No checker mixed in: neighboring 8-px cells must match.
     assert_eq!(
         &vol_px[0..4],
         &vol_px[(8 * 4) as usize..(8 * 4 + 4) as usize],
@@ -490,12 +457,9 @@ fn object_alpha_switch_keeps_real_alpha_in_volume_bakes() {
 
 #[test]
 fn out_of_range_checker_alternates_along_w() {
-    // Signed 2D noise leaves ~half the pixels outside [0,1] → magenta/
-    // black checker in the packed output. The 2D pattern is identical for
-    // every slice (D2 noise ignores w), so any difference between slices
-    // comes purely from the checker's third axis: with 10-texel cells,
-    // slice 0 and slice 10 must differ (flipped parity) while slice 0 and
-    // slice 20 must match (parity restored).
+    // D2 noise is the same on every slice, so slices differ only by the
+    // out-of-range checker's w axis: with 10-texel cells, slices 0 and 10
+    // must differ and 0 and 20 must match.
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless wgpu init");
     let mut baker = Baker::new(ctx.clone());
     const RES: u32 = 64;

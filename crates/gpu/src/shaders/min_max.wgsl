@@ -1,7 +1,5 @@
-// LayerKind::MinMax. Per-pixel winner-take-all between two color layers.
-// Whichever pixel's `criterion` is smaller (Min) or larger (Max) is emitted
-// whole — all four channels flow through the winner, not just the compared
-// attribute. Ties go to `a`.
+// LayerKind::MinMax. Emits whichever input pixel has the smaller (Min) or
+// larger (Max) `criterion`, all four channels. Ties go to `a`.
 
 struct MinMaxParams {
     size: vec2<u32>,
@@ -16,8 +14,6 @@ struct MinMaxParams {
 @group(0) @binding(1) var out_tex: texture_storage_2d<rgba32float, write>;
 @group(0) @binding(2) var tex_a: texture_2d<f32>;
 
-// Map this dispatch's texel to its UV within the layer's bake domain
-// (dom = (min_u, min_v, ext_u, ext_v)).
 fn dom_uv(dom: vec4<f32>, gid: vec2<u32>, size: vec2<u32>) -> vec2<f32> {
     return vec2<f32>(
         dom.x + (f32(gid.x) + 0.5) / f32(size.x) * dom.z,
@@ -75,13 +71,12 @@ fn linear_to_srgb(lin: vec3<f32>) -> vec3<f32> {
 }
 
 fn criterion_of(px: vec4<f32>) -> f32 {
-    // Alpha and Chroma read straight off Oklcha — no conversion needed.
     switch params.criterion {
         case 6u: { return px.w; }
         case 7u: { return px.y; }
         default: {}
     }
-    // Everything else compares in gamma sRGB (what a monitor shows).
+    // The rest compare in gamma sRGB, as displayed.
     let lin = oklch_to_linear_srgb(px);
     let srgb = linear_to_srgb(lin);
     switch params.criterion {
@@ -89,14 +84,14 @@ fn criterion_of(px: vec4<f32>) -> f32 {
         case 1u: { return srgb.y; }
         case 2u: { return srgb.z; }
         case 3u: {
-            // HSV saturation on gamma sRGB.
+            // HSV saturation.
             let mx = max(max(srgb.x, srgb.y), srgb.z);
             if (mx <= 0.0) { return 0.0; }
             let mn = min(min(srgb.x, srgb.y), srgb.z);
             return (mx - mn) / mx;
         }
         case 4u: {
-            // HSV value on gamma sRGB.
+            // HSV value.
             return max(max(srgb.x, srgb.y), srgb.z);
         }
         default: {

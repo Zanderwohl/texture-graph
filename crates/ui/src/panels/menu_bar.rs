@@ -2,9 +2,7 @@ use texture_graph_core::Graph;
 
 use crate::state::{EditCmd, UiState};
 
-/// Top menu bar: "Save"/"Open" natively, "Download"/"Upload" on wasm.
-/// Emits `EditCmd`s and sets the wants-save/open flags; `file_io` runs the
-/// dialogs.
+/// Sets the wants-save/open flags; `file_io` runs the dialogs.
 pub fn show(ui: &mut egui::Ui, _graph: &Graph, state: &mut UiState) {
     egui::MenuBar::new().ui(ui, |ui| {
         ui.menu_button("File", |ui| {

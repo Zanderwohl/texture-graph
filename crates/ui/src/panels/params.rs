@@ -1,15 +1,13 @@
 //! The graph's named parameters: what it declares, and what this session
 //! has them bound to.
 //!
-//! Two different things share the panel on purpose. A declaration travels
-//! with the graph — it is what a consumer sees when it loads the file. A
-//! binding does not: it is this editor standing in for one instance of the
-//! six the consumer will bake, so the author can see what a parameter
-//! *does* without a round trip through the game.
+//! A declaration travels with the graph file. A binding does not: it stands
+//! in for one instance the consumer will bake, so the author can see what a
+//! parameter does without running the game.
 //!
 //! Declarations go through [`EditCmd`] like every other graph edit;
-//! bindings write straight to the ambient [`EvalCtx`], because nothing in
-//! the file changes when you drag one.
+//! bindings write straight to the [`EvalCtx`], because the file does not
+//! change.
 
 use texture_graph_core::color::oklcha;
 use texture_graph_core::{EvalCtx, Graph, ParamDecl, ParamKind, ParamValue};
@@ -17,8 +15,6 @@ use texture_graph_core::{EvalCtx, Graph, ParamDecl, ParamKind, ParamValue};
 use crate::state::{EditCmd, UiState};
 use crate::widgets::color_edit;
 
-/// Draw the panel. `eval_ctx` is written in place — a binding is session
-/// state, not a graph edit.
 pub fn show(ui: &mut egui::Ui, graph: &Graph, state: &mut UiState, eval_ctx: &mut EvalCtx) {
     ui.heading("Parameters");
     ui.label(
@@ -71,7 +67,6 @@ fn param_row(
     egui::CollapsingHeader::new(format!("{} ({})", decl.name, decl.kind.label()))
         .id_salt(("param", &decl.name))
         .show(ui, |ui| {
-            // ---- The binding: session state, no graph edit ----
             ui.horizontal(|ui| {
                 ui.label("value");
                 let bound = graph.param_value(&decl.name, eval_ctx);
@@ -104,7 +99,6 @@ fn param_row(
                 }
             });
 
-            // ---- The declaration: a graph edit ----
             let mut edited = decl.clone();
             let mut changed = false;
             ui.horizontal(|ui| {
@@ -172,8 +166,7 @@ fn param_row(
         });
 }
 
-/// `stem`, `stem 1`, `stem 2`… — the same shape the layer catalog uses for
-/// a duplicate node name.
+/// `stem`, `stem 1`, `stem 2`, … as for layer names.
 fn unique_name(graph: &Graph, stem: &str) -> String {
     if !graph.params.contains_key(stem) {
         return stem.to_string();

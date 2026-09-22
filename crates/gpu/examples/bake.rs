@@ -4,11 +4,10 @@
 //! cargo run -p texture-graph-gpu --example bake -- out.ppm [graph.tg] [size]
 //! ```
 //!
-//! The whole headless path, and what holds it open: `cargo test` compiles
-//! examples, so this stops building if the crate ever grows a dependency on
-//! the editor. `texture-graph-gpu` pulls in no egui, eframe or winit.
+//! `cargo test` compiles examples, so this stops building if the crate
+//! gains a dependency on egui, eframe or winit.
 //!
-//! PPM needs no dependency to write. `magick out.ppm out.png` to shrink it.
+//! PPM is written without a dependency. `magick out.ppm out.png` converts it.
 
 use std::path::PathBuf;
 
@@ -35,8 +34,6 @@ fn main() {
         None => demo_graph(),
     };
 
-    // No window, surface or event loop: just an adapter and a queue.
-    // `pollster` only blocks on the init; a caller with a runtime awaits it.
     let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("no usable GPU adapter");
     let mut baker = Baker::new(ctx.clone());
     let baked = baker
@@ -53,8 +50,7 @@ fn main() {
     println!("baked {what} at {size}x{size} -> {}", out_path.display());
 }
 
-/// Noise through a two-stop ramp, so a run with no arguments still shows
-/// whether the pipeline works.
+/// Noise through a two-stop ramp, for a run with no graph argument.
 fn demo_graph() -> Graph {
     let mut g = Graph::new();
     let noise = g
@@ -82,7 +78,6 @@ fn demo_graph() -> Graph {
             }),
         )
         .unwrap();
-    // `Map` turns the scalar noise into colour: value in, palette across.
     let mapped = g
         .add_layer(
             "mapped",

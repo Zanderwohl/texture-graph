@@ -7,12 +7,7 @@ use texture_graph_core::{ColorInput, EvalCtx, Graph, LayerId, ParamUse, color::o
 
 use crate::widgets::{color_edit, layer_ref, param_ref};
 
-/// Draw a `ColorInput` inline and mutate it in place.
-///
-/// * `label` — prefixes the layer combo in Layer mode; empty for none.
-/// * `except` — hidden from the picker, so a layer can't reference itself.
-/// * `ctx` — the parameter bindings in force, so unbinding can freeze the
-///   input at what it currently shows rather than at an arbitrary gray.
+/// `except` is left out of the layer list so a layer can't reference itself.
 pub fn color_input_widget(
     ui: &mut egui::Ui,
     graph: &Graph,
@@ -23,8 +18,8 @@ pub fn color_input_widget(
     ctx: &EvalCtx,
 ) -> bool {
     let mut changed = false;
-    // A mode switch replaces the whole enum, which would invalidate the
-    // borrow the arm below is holding. Decide inside, assign after.
+    // A mode switch replaces the enum the match arm is borrowing, so it is
+    // assigned after the match.
     let mut swap_to: Option<ColorInput> = None;
 
     match input {
@@ -43,8 +38,7 @@ pub fn color_input_widget(
                     .unwrap_or(LayerId(0));
                 swap_to = Some(ColorInput::Layer(fallback));
             }
-            // Only offered when the graph actually declares a color
-            // parameter; a button that can only fail is worse than none.
+            // Hidden when no color parameter exists, since it could only fail.
             if let Some(first) = param_ref::first(graph, ParamUse::Color) {
                 if ui.small_button("use param").clicked() {
                     swap_to = Some(ColorInput::Param(first));
@@ -68,8 +62,8 @@ pub fn color_input_widget(
                 changed = true;
             }
             if ui.small_button("use const").clicked() {
-                // Freeze at what the parameter currently shows, so
-                // unbinding does not also change the picture.
+                // Freeze at the current value so unbinding does not change
+                // the picture.
                 let frozen = graph
                     .param_value(name, ctx)
                     .and_then(|v| v.as_color())

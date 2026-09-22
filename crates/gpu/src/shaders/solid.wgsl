@@ -1,6 +1,5 @@
-// Fills an Rgba8Unorm dst with a uniform vec4. Used by the pack stage for
-// const-scalar output channels and for the absent-normal case; no src
-// texture required.
+// Fills an Rgba8Unorm dst with one value. The pack stage uses it for
+// constant scalar channels and an absent normal.
 
 struct SolidParams {
     color: vec4<f32>,

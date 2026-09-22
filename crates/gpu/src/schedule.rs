@@ -1,19 +1,15 @@
 //! Pebble-game scheduler for the compute pipeline.
 //!
-//! Given a `Graph`, produces:
-//! - a topological order over every layer reachable from `Output`;
-//! - an assignment `LayerId -> slot` where each "slot" is one of the pooled
-//!   `Rgba32Float` textures the baker allocates;
-//! - the peak number of slots that were live simultaneously — the exact
-//!   texture-pool size to allocate.
+//! Produces a topological order over the layers reachable from `Output`, an
+//! assignment of each layer to a slot (one of the baker's pooled
+//! `Rgba32Float` textures), and the peak number of slots live at once.
 //!
-//! Linear-scan register allocation: refcount each layer's remaining
-//! consumers, walk the topo order popping a slot per layer, and return a
-//! slot once its last consumer has run. Output roots carry a +1 sentinel so
-//! their slot survives to be sampled by `pack_srgb8`.
+//! Slots are assigned by linear scan: refcount each layer's consumers and
+//! free a slot after its last consumer runs. Output roots get one extra
+//! count so their slot survives to be packed.
 //!
-//! Greedy is optimal for any fixed topo order, since interval coloring is.
-//! Reordering the topo pass to minimize peak is NP-hard.
+//! Greedy is optimal for a fixed topo order, as interval coloring is.
+//! Choosing the order to minimize the peak is NP-hard.
 
 use std::collections::{HashMap, HashSet};
 
@@ -22,26 +18,21 @@ use texture_graph_core::{
     ScalarInput, Transform, Warp,
 };
 
-/// Fully-resolved dispatch plan for one bake.
 #[derive(Debug, Clone)]
 pub struct Schedule {
-    /// Layers to dispatch, in the order the baker executes them.
     pub order: Vec<LayerId>,
-    /// Which pool slot each layer's output ends up in.
     pub slot_of: HashMap<LayerId, u32>,
-    /// Number of `Rgba32Float` textures to allocate in the pool.
     pub peak_slots: u32,
-    /// Where the four PBR channels come from after all dispatches.
     pub output_slots: OutputSlots,
-    /// UV rectangle each layer is baked over. `Domain::UNIT` for everything
-    /// unless an `EdgeMode::Extend` transform pulls a source wider.
+    /// `Domain::UNIT` unless an `EdgeMode::Extend` transform or a `Warp`
+    /// widens a source.
     pub domain_of: HashMap<LayerId, Domain>,
 }
 
 /// UV rectangle a layer's bake covers. Always contains the unit square, so
-/// thumbnails and direct output stay renderable; extend-transform consumers
-/// grow it, exactly for affine requests and capped at [`EXTEND_LIMIT`] for
-/// radial ones.
+/// thumbnails and direct output stay renderable. Extend consumers grow it,
+/// exactly for affine requests and capped at [`EXTEND_LIMIT`] for radial
+/// ones.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct Domain {
     pub min: [f32; 2],
@@ -58,8 +49,7 @@ impl Domain {
         self.max[1] = self.max[1].max(o.max[1]);
     }
 
-    /// `(min_u, min_v, ext_u, ext_v)` — the uniform layout the shaders use
-    /// to map UV to texels.
+    /// `(min_u, min_v, ext_u, ext_v)`, the layout the shaders expect.
     pub fn packed(&self) -> [f32; 4] {
         [
             self.min[0],
@@ -70,11 +60,9 @@ impl Domain {
     }
 }
 
-/// Per-layer bake domains. Every reachable layer starts at the unit square,
-/// then a reverse-topo walk unions in what each consumer samples. Only
-/// `EdgeMode::Extend` reaches beyond the unit square; everything else samples
-/// at its own coordinates, so a widened consumer widens its inputs too. A
-/// `Map`'s palette is luminance-indexed and always within range.
+/// Every layer starts at the unit square; a reverse-topo walk unions in what
+/// each consumer samples. Layers other than Extend transforms and warps
+/// sample at their own coordinates, so a widened consumer widens its inputs.
 fn compute_domains(graph: &Graph, order: &[LayerId]) -> HashMap<LayerId, Domain> {
     let mut dom: HashMap<LayerId, Domain> =
         order.iter().map(|&id| (id, Domain::UNIT)).collect();
@@ -83,7 +71,6 @@ fn compute_domains(graph: &Graph, order: &[LayerId]) -> HashMap<LayerId, Domain>
         let Some(layer) = graph.get(id) else { continue };
         match &layer.kind {
             LayerKind::Transform(t) => {
-                // Clamp samples within [0, 1], which the baseline covers.
                 if t.edge_mode == EdgeMode::Extend {
                     if let (Some(src), Some(req)) = (t.source, transform_request(t, d)) {
                         if let Some(e) = dom.get_mut(&src) {
@@ -99,15 +86,10 @@ fn compute_domains(graph: &Graph, order: &[LayerId]) -> HashMap<LayerId, Domain>
                 // Luminance-indexed, so the unit domain suffices.
             }
             LayerKind::Warp(w) => {
-                // The displacement field is read at the warp's own
-                // coordinates, so it needs no more than the warp's domain.
                 if let Some(e) = w.by.and_then(|b| dom.get_mut(&b)) {
                     e.union(d);
                 }
-                // The source is read at the displaced ones. `Warp` promises
-                // its driver lies in [-1, 1], so |amount| bounds the reach;
-                // cap it like a radial extend, since `amount` is a float a
-                // user can type any number into.
+                // Capped like a radial extend, since `amount` is unbounded.
                 if let Some(e) = w.source.and_then(|src| dom.get_mut(&src)) {
                     e.union(warp_request(w, d));
                 }
@@ -124,15 +106,11 @@ fn compute_domains(graph: &Graph, order: &[LayerId]) -> HashMap<LayerId, Domain>
     dom
 }
 
-/// The UV rectangle an extend-transform samples its source over, given the
-/// transform's own bake domain `d`: the AABB of the transformed corners.
-/// Affine (passthrough/permute) requests are exact and unbounded — the
-/// bake still spends the same pixel count, just spread over the wider
-/// rectangle, matching 1:1 what the consumer samples. Radial requests are
-/// conservative, so they intersect with the [`EXTEND_LIMIT`] box; `None`
-/// when that leaves nothing (those samples all show the missing grid, so
-/// the source needn't grow). Non-finite requests (degenerate scales) also
-/// return `None`.
+/// The rectangle an extend transform with bake domain `d` samples its
+/// source over. Affine requests are exact and unbounded; the bake keeps its
+/// pixel count, spread wider. Radial requests are conservative, so they are
+/// intersected with the [`EXTEND_LIMIT`] box. `None` when that is empty or
+/// the request is not finite.
 fn transform_request(t: &Transform, d: Domain) -> Option<Domain> {
     let corners = [
         (d.min[0], d.min[1]),
@@ -158,8 +136,7 @@ fn transform_request(t: &Transform, d: Domain) -> Option<Domain> {
         v_min = v_min.min(v);
         v_max = v_max.max(v);
     }
-    // w spans [0, 1] across a volume bake (0.5 flat) — conservative range
-    // for the permute/radial cases that read it.
+    // w spans [0, 1] across a volume bake (0.5 flat).
     let sw_max = {
         let a = (0.0 - t.offset[2]) * t.scale[2];
         let b = (1.0 - t.offset[2]) * t.scale[2];
@@ -209,13 +186,8 @@ fn transform_request(t: &Transform, d: Domain) -> Option<Domain> {
     Some(Domain { min: [u0, v0], max: [u1, v1] })
 }
 
-/// The UV rectangle a warp samples its source over: its own domain grown
-/// by `|amount|`, capped at the [`EXTEND_LIMIT`] box.
-///
-/// The twin of this bound on the CPU side is `warp_bounds` in
-/// `core::eval`, which states it over the unit square. They agree wherever
-/// the warp's own domain is the unit square, which is everywhere but under
-/// an extend transform.
+/// `d` grown by `|amount|`, capped at the [`EXTEND_LIMIT`] box. Agrees with
+/// `warp_bounds` in `core::eval` when `d` is the unit square.
 fn warp_request(w: &Warp, d: Domain) -> Domain {
     let lo = 0.5 - EXTEND_LIMIT;
     let hi = 0.5 + EXTEND_LIMIT;
@@ -227,25 +199,23 @@ fn warp_request(w: &Warp, d: Domain) -> Domain {
     Domain { min: [u0, v0], max: [u1, v1] }
 }
 
-/// Post-schedule descriptor for the `pack_srgb8` stage.
 #[derive(Debug, Copy, Clone)]
 pub struct OutputSlots {
-    /// `None` = unconnected — pack from the missing-texture grid.
+    /// `None` packs the missing-texture grid.
     pub color: Option<u32>,
     pub roughness: ScalarSlot,
     pub metallic: ScalarSlot,
     pub normal: Option<u32>,
 }
 
-/// A scalar output channel either takes a constant or reads a layer's L.
 #[derive(Debug, Copy, Clone)]
 pub enum ScalarSlot {
     Const(f32),
+    /// Reads the slot's L.
     Slot(u32),
 }
 
-/// Errors surfaced during scheduling. A well-formed `Graph` (as
-/// enforced by the graph mutators) should never trip these.
+/// A graph built through the `Graph` mutators never produces these.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScheduleError {
     UnknownLayer(LayerId),
@@ -263,14 +233,12 @@ impl std::fmt::Display for ScheduleError {
 
 impl std::error::Error for ScheduleError {}
 
-/// Build a `Schedule` for `graph`. Only layers reachable from `Output` are
-/// included; unreachable layers cost neither dispatches nor slots.
+/// Only layers reachable from `Output` are included.
 pub fn schedule(graph: &Graph, ctx: &EvalCtx) -> Result<Schedule, ScheduleError> {
     let ctx = &graph.resolve_params(ctx);
     let output_roots = output_referenced(graph);
     let plan = plan_from(graph, &output_roots)?;
 
-    // Resolve the four output channels against the final slot_of.
     let output_slots = OutputSlots {
         color: match graph.output.color {
             Some(id) => Some(*plan.slot_of.get(&id).ok_or(ScheduleError::UnknownLayer(id))?),
@@ -288,18 +256,11 @@ pub fn schedule(graph: &Graph, ctx: &EvalCtx) -> Result<Schedule, ScheduleError>
     Ok(plan.into_schedule(output_slots))
 }
 
-/// Build a `Schedule` that produces one layer and nothing else — `root`
-/// plus everything it transitively reads, with the same slot reuse
-/// `schedule` gets.
+/// A `Schedule` for `root` and everything it transitively reads, with the
+/// same slot reuse as [`schedule`].
 ///
-/// This is the plan a single-channel bake wants: the graph's Output may
-/// route through nodes the caller does not care about, and a consumer
-/// asking for one scalar field should not pay for the other three PBR
-/// channels' dispatches.
-///
-/// `output_slots.color` points at `root`, so a caller that wants to reuse
-/// the ordinary pack path can. The scalar channels report their constants
-/// and `normal` is `None`; nothing here consults them.
+/// `output_slots.color` points at `root`; the other channels are
+/// placeholders.
 pub fn schedule_layer(graph: &Graph, root: LayerId) -> Result<Schedule, ScheduleError> {
     if graph.get(root).is_none() {
         return Err(ScheduleError::UnknownLayer(root));
@@ -314,8 +275,7 @@ pub fn schedule_layer(graph: &Graph, root: LayerId) -> Result<Schedule, Schedule
     Ok(plan.into_schedule(output_slots))
 }
 
-/// Everything a `Schedule` holds except which slots the output channels
-/// read, which is the one part that depends on why the bake was asked for.
+/// A `Schedule` without its output slots.
 struct Plan {
     order: Vec<LayerId>,
     slot_of: HashMap<LayerId, u32>,
@@ -335,10 +295,7 @@ impl Plan {
     }
 }
 
-/// Topological order over `roots` and their upstream closure, with slots
-/// allocated by the pebble game described in the module docs.
 fn plan_from(graph: &Graph, roots: &[LayerId]) -> Result<Plan, ScheduleError> {
-    // Reverse-transitive closure — every layer reachable from any root.
     let mut required: HashSet<LayerId> = HashSet::new();
     let mut stack = roots.to_vec();
     while let Some(id) = stack.pop() {
@@ -351,8 +308,8 @@ fn plan_from(graph: &Graph, roots: &[LayerId]) -> Result<Plan, ScheduleError> {
         }
     }
 
-    // Topological post-order DFS. `visiting` catches cycles (defense-in-depth
-    // — the graph mutators already reject cycles at edit time).
+    // `visiting` catches cycles, which the graph mutators should already
+    // have rejected.
     let mut order = Vec::with_capacity(required.len());
     let mut done: HashSet<LayerId> = HashSet::new();
     let mut visiting: HashSet<LayerId> = HashSet::new();
@@ -360,9 +317,9 @@ fn plan_from(graph: &Graph, roots: &[LayerId]) -> Result<Plan, ScheduleError> {
         topo_dfs(graph, root, &required, &mut visiting, &mut done, &mut order)?;
     }
 
-    // Refcount consumers. Every occurrence of an id in another layer's
-    // `inputs()` counts once; each root reference also counts once, which
-    // is the sentinel that keeps a root's slot alive to be packed.
+    // Each occurrence in an `inputs()` counts, so a Mix reading one layer
+    // twice counts twice. The root count keeps a root's slot alive to be
+    // packed.
     let mut remaining: HashMap<LayerId, u32> = HashMap::new();
     for &id in &order {
         remaining.entry(id).or_insert(0);
@@ -377,9 +334,6 @@ fn plan_from(graph: &Graph, roots: &[LayerId]) -> Result<Plan, ScheduleError> {
         *remaining.entry(root).or_insert(0) += 1;
     }
 
-    // Walk topo order, allocating slots. Free pool is a Vec used as a
-    // stack — reusing the most-recently-freed slot keeps cache locality
-    // decent.
     let mut slot_of: HashMap<LayerId, u32> = HashMap::new();
     let mut free_pool: Vec<u32> = Vec::new();
     let mut peak_slots: u32 = 0;
@@ -394,10 +348,6 @@ fn plan_from(graph: &Graph, roots: &[LayerId]) -> Result<Plan, ScheduleError> {
         };
         slot_of.insert(id, slot);
 
-        // Decrement every input's remaining_uses; if it hits zero, its slot
-        // returns to the free pool. Uses on a per-layer basis are unique per
-        // occurrence — a Mix referencing the same layer twice still counts
-        // twice.
         let layer = graph.get(id).unwrap();
         for input in layer.kind.inputs() {
             if let Some(remaining_uses) = remaining.get_mut(&input) {
@@ -415,35 +365,24 @@ fn plan_from(graph: &Graph, roots: &[LayerId]) -> Result<Plan, ScheduleError> {
     Ok(Plan { order, slot_of, peak_slots, domain_of })
 }
 
-/// One texture per layer, no reuse — used for the per-layer preview pass
-/// where every intermediate must survive to the end so it can be read back
-/// into egui.
+/// One slot per layer, no reuse, so every intermediate survives to be
+/// previewed.
 pub fn schedule_no_reuse(graph: &Graph, ctx: &EvalCtx) -> Result<Schedule, ScheduleError> {
     schedule_previews(graph, None, ctx)
 }
 
-/// The preview schedule for `wanted` — those layers and everything they
-/// transitively read, and nothing else. `None` wants every authored layer.
+/// The preview schedule for `wanted` and everything it transitively reads,
+/// one slot per layer. `None` wants every layer.
 ///
-/// Baking a subset is what makes an edit to one corner of a graph cost one
-/// corner's worth of work. Layers outside the upstream closure of `wanted`
-/// are not dispatched, not allocated a slot, and not packed.
-///
-/// **Domains are computed over the whole graph regardless.** A layer's bake
-/// domain is decided by its *consumers* (an `EdgeMode::Extend` transform
-/// pulls its source wider), so restricting the walk to the subset would
-/// give a layer a narrower domain whenever the consumer that widened it
-/// happened to be clean — and its thumbnail would come back at a different
-/// effective resolution depending on what else was being baked. One extra
-/// topological pass buys a thumbnail that is the same picture either way.
+/// Domains are computed over the whole graph. A domain is set by a layer's
+/// consumers, so computing it over the subset would change a thumbnail's
+/// resolution depending on which other layers were being baked.
 pub fn schedule_previews(
     graph: &Graph,
     wanted: Option<&HashSet<LayerId>>,
     ctx: &EvalCtx,
 ) -> Result<Schedule, ScheduleError> {
     let ctx = &graph.resolve_params(ctx);
-    // Everything, in dependency order — what the domains are computed from,
-    // and the whole schedule when `wanted` is `None`.
     let everything: HashSet<LayerId> = graph.layers.iter().map(|l| l.id).collect();
     let full_order = topo_over(graph, &everything)?;
     let domain_of = compute_domains(graph, &full_order);
@@ -458,9 +397,8 @@ pub fn schedule_previews(
         slot_of.insert(id, i as u32);
     }
     let peak_slots = order.len() as u32;
-    // Lenient, unlike `schedule`'s: on a subset the output roots may not be
-    // scheduled at all. The preview pass never reads these — it packs each
-    // layer's own slot — so a missing root is not an error here.
+    // Lenient: on a subset the output roots may not be scheduled, and the
+    // preview pass does not read these.
     let output_slots = OutputSlots {
         color: graph.output.color.and_then(|id| slot_of.get(&id).copied()),
         roughness: scalar_slot_lenient(&graph.output.roughness, &slot_of, ctx),
@@ -492,9 +430,8 @@ fn topo_over(graph: &Graph, required: &HashSet<LayerId>) -> Result<Vec<LayerId>,
     let mut order = Vec::with_capacity(required.len());
     let mut done: HashSet<LayerId> = HashSet::new();
     let mut visiting: HashSet<LayerId> = HashSet::new();
-    // Sorted so the order is deterministic run to run: `HashSet` iteration
-    // is not, and a schedule that reshuffles between frames would make
-    // slot assignments — and so any bug in them — irreproducible.
+    // Sorted because `HashSet` order varies between runs, which would make
+    // slot assignments irreproducible.
     let mut ids: Vec<LayerId> = required.iter().copied().collect();
     ids.sort();
     for id in ids {
@@ -503,9 +440,8 @@ fn topo_over(graph: &Graph, required: &HashSet<LayerId>) -> Result<Vec<LayerId>,
     Ok(order)
 }
 
-/// Like [`scalar_to_slot`], but a layer that isn't scheduled falls back to
-/// a constant instead of failing. Only for the preview pass, which doesn't
-/// read output slots.
+/// Like [`scalar_to_slot`], but an unscheduled layer becomes 0.0 instead of
+/// an error.
 fn scalar_slot_lenient(
     s: &ScalarInput,
     slot_of: &HashMap<LayerId, u32>,
@@ -535,9 +471,7 @@ fn output_referenced(graph: &Graph) -> Vec<LayerId> {
     out
 }
 
-/// A scalar output channel is either baked (it reads a layer) or a
-/// number. A parameter is a number — resolved here, once, rather than
-/// carried to the shader as a name.
+/// Parameters are resolved to constants here.
 fn scalar_to_slot(
     s: &ScalarInput,
     slot_of: &HashMap<LayerId, u32>,
@@ -607,10 +541,9 @@ mod tests {
         .unwrap()
     }
 
-    /// Assert the schedule's slot assignment is valid: no two layers that
-    /// are simultaneously live share a slot. "Live" spans from a layer's
-    /// dispatch through its last consumer's dispatch (inclusive of Output
-    /// use, which we treat as after every dispatch).
+    /// No two layers live at the same time share a slot. A layer is live
+    /// from its dispatch through its last consumer's, or to the end if it
+    /// is an output root.
     fn assert_valid_allocation(graph: &Graph, s: &Schedule) {
         let index_of: HashMap<LayerId, usize> = s
             .order
@@ -618,7 +551,6 @@ mod tests {
             .enumerate()
             .map(|(i, id)| (*id, i))
             .collect();
-        // Live interval: [i, last_consumer_i] (or ∞ if it's an output root).
         let output_ids: HashSet<LayerId> = output_referenced(graph).into_iter().collect();
         let mut interval: HashMap<LayerId, (usize, usize)> = HashMap::new();
         for (i, &id) in s.order.iter().enumerate() {
@@ -636,7 +568,6 @@ mod tests {
                 v.1 = s.order.len();
             }
         }
-        // For each layer pair, if intervals overlap they must not share a slot.
         let items: Vec<_> = interval.iter().collect();
         for i in 0..items.len() {
             let (&id_a, &(a0, a1)) = items[i];
@@ -659,14 +590,10 @@ mod tests {
 
     #[test]
     fn linear_chain_peaks_at_two() {
-        // A -> Mix(A, A) -> Mix(prev, prev)  actually this is a real chain
-        // structure. Take: base color; every consumer only reads the previous
-        // layer so old ones can die.
         let mut g = base_graph();
-        let a = g.output.color; // the "base color" seeded by Graph::new
+        let a = g.output.color; // seeded by Graph::new
         let b = add_color(&mut g, "b");
         let ab = add_mix(&mut g, "ab", a.unwrap(), b);
-        // Overwrite output to point at the terminal.
         g.set_output(Output {
             color: Some(ab),
             roughness: ScalarInput::Const(0.5),
@@ -676,20 +603,15 @@ mod tests {
         .unwrap();
         let s = schedule(&g, &EvalCtx::default()).unwrap();
         assert_valid_allocation(&g, &s);
-        // Peak here: at the moment `ab` dispatches, both `a` and `b` are
-        // live plus `ab`'s new slot, but `a` and `b` are freed after `ab`
-        // reads them. Since inputs are freed *after* dispatch, allocation
-        // happens first — needs 3 concurrent. So peak == 3.
+        // Inputs are freed after the consumer's slot is allocated, so `a`,
+        // `b` and `ab` are live together.
         assert!(s.peak_slots >= 3, "peak_slots was {}", s.peak_slots);
     }
 
     #[test]
     fn diamond_needs_three_slots() {
-        // a -> b, a -> c, mix(b, c). While mix dispatches, b, c, mix all live.
         let mut g = base_graph();
         let a = g.output.color.unwrap();
-        // Wrap `a` in trivial transforms so we have distinct b, c layers
-        // that both consume a.
         let b = add_mix(&mut g, "b", a, a);
         let c = add_mix(&mut g, "c", a, a);
         let bc = add_mix(&mut g, "bc", b, c);
@@ -702,14 +624,11 @@ mod tests {
         .unwrap();
         let s = schedule(&g, &EvalCtx::default()).unwrap();
         assert_valid_allocation(&g, &s);
-        // At `bc` dispatch: bc, b, c all live => >= 3.
         assert!(s.peak_slots >= 3, "peak_slots was {}", s.peak_slots);
     }
 
     #[test]
     fn long_lived_leaf_stays_alive() {
-        // leaf feeds into a long chain of mixes as one operand each; leaf
-        // survives to the end.
         let mut g = base_graph();
         let leaf = g.output.color;
         let mut cur = add_color(&mut g, "seed");
@@ -785,11 +704,9 @@ mod tests {
         .unwrap();
         let s = schedule(&g, &EvalCtx::default()).unwrap();
         let d = s.domain_of[&src];
-        // Transform samples u in [0, 3]; unit baseline keeps v at [0, 1].
         assert_eq!(d.min, [0.0, 0.0]);
         assert!((d.max[0] - 3.0).abs() < 1e-6, "u max {}", d.max[0]);
         assert!((d.max[1] - 1.0).abs() < 1e-6);
-        // The transform itself stays at unit.
         assert_eq!(s.domain_of[&t], Domain::UNIT);
     }
 
@@ -815,11 +732,9 @@ mod tests {
         use texture_graph_core::EdgeMode;
         let mut g = base_graph();
         let src = g.output.color.unwrap();
-        // Two chained x2 extends: inner source needs u up to 4, chained
-        // through the middle transform's own widened domain.
         let t1 = add_transform(&mut g, "t1", src, [2.0, 1.0, 1.0], EdgeMode::Extend);
         let t2 = add_transform(&mut g, "t2", t1, [2.0, 1.0, 1.0], EdgeMode::Extend);
-        // And a huge affine scale — exact and unbounded, no cap.
+        // Affine requests are not capped.
         let big = add_transform(&mut g, "big", src, [100.0, 1.0, 1.0], EdgeMode::Extend);
         let both = add_mix(&mut g, "both", t2, big);
         g.set_output(Output {
@@ -830,10 +745,7 @@ mod tests {
         })
         .unwrap();
         let s = schedule(&g, &EvalCtx::default()).unwrap();
-        // t1's domain: widened by t2 to u in [0, 2].
         assert!((s.domain_of[&t1].max[0] - 2.0).abs() < 1e-6);
-        // src: union of t1's request over its widened domain ([0, 4]) and
-        // big's exact request ([0, 100]).
         let d = s.domain_of[&src];
         assert!((d.max[0] - 100.0).abs() < 1e-3, "u max {}", d.max[0]);
         assert_eq!(d.min[1], 0.0);
@@ -865,7 +777,6 @@ mod tests {
         })
         .unwrap();
         let s = schedule(&g, &EvalCtx::default()).unwrap();
-        // r_max ~ 40 but the radial request is conservative, so it caps.
         let d = s.domain_of[&src];
         assert!((d.max[0] - (0.5 + EXTEND_LIMIT)).abs() < 1e-4, "u max {}", d.max[0]);
     }
@@ -874,7 +785,6 @@ mod tests {
     fn unreachable_layers_are_not_scheduled_for_output_pass() {
         let mut g = base_graph();
         let _dead = add_color(&mut g, "dead");
-        // Output still points at the auto-created base color layer.
         let s = schedule(&g, &EvalCtx::default()).unwrap();
         assert_eq!(s.order.len(), 1);
     }

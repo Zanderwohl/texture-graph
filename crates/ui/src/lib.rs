@@ -37,10 +37,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Web entry point, wired up by Trunk.
-///
-/// `start` must be synchronous, so the async eframe setup is spawned onto
-/// the browser event loop where its errors can still surface.
+/// Web entry point, called by Trunk. `start` must be synchronous, so the
+/// async eframe setup is spawned onto the browser event loop.
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen(start)]
 pub fn start_web() {

@@ -9,8 +9,7 @@ use crate::eval::EvalCtx;
 use crate::kind::{ColorInput, ColorRamp, LayerKind, NoiseKernel, ScalarInput};
 use crate::param::{ParamDecl, ParamUse, ParamValue};
 
-/// Named node in the graph. Canvas position lives in [`Graph::canvases`], so
-/// identity, display and layout stay independent.
+/// A node in the graph. Its canvas position lives in [`Graph::canvases`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Layer {
     pub id: LayerId,
@@ -21,8 +20,7 @@ pub struct Layer {
 /// The graph's root, producing PBR-material channels for the renderer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Output {
-    /// Layer whose color is the material's base color. `None` renders as
-    /// the missing-texture grid.
+    /// Base color. `None` renders as the missing-texture grid.
     pub color: Option<LayerId>,
     /// 0 = smooth, 1 = rough.
     pub roughness: ScalarInput,
@@ -34,8 +32,7 @@ pub struct Output {
 }
 
 impl Output {
-    /// Every parameter the output's scalar channels read. The twin of
-    /// [`LayerKind::param_refs`].
+    /// See [`LayerKind::param_refs`].
     pub fn param_refs(&self) -> Vec<(&str, ParamUse)> {
         let mut out = Vec::new();
         for si in [&self.roughness, &self.metallic] {
@@ -62,36 +59,29 @@ impl Output {
     }
 }
 
-/// One named workspace canvas: a scatter of layer positions. Edges come from
-/// [`LayerKind::inputs`] at render time and are not stored.
+/// Layer positions on one named canvas. Edges are not stored; they come from
+/// [`LayerKind::inputs`].
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Canvas {
-    /// Layers absent from the map are unplaced, and the UI picks a spot.
+    /// Layers absent from the map are unplaced.
     pub positions: BTreeMap<LayerId, [f32; 2]>,
-    /// The Output pseudo-node. `None` is unplaced, and also what a file
-    /// without the field loads as.
+    /// The Output pseudo-node. `None` is unplaced.
     #[serde(default)]
     pub output_pos: Option<[f32; 2]>,
 }
 
-/// The full graph. Three orthogonal shapes travel with the data:
-///
-/// - **Identity** — [`Layer::id`], never reused. Layers stay ID-ascending so
-///   serialization is stable however the UI reorders them.
-/// - **List order** — [`Graph::list_order`], for the linear panel view.
-/// - **Canvas positions** — [`Graph::canvases`], one scatter per workspace.
+/// Identity ([`Layer::id`], never reused), list order and canvas positions
+/// are stored separately. `layers` stays ID-ascending so serialization does
+/// not change when the UI reorders layers.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Graph {
     /// ID-ascending. Do not reorder for display; use `list_order` instead.
     pub layers: Vec<Layer>,
-    /// Permutation of layer IDs for the linear list view.
+    /// Permutation of layer IDs for the list view.
     pub list_order: Vec<LayerId>,
-    /// Named workspace canvases. Empty by default.
     pub canvases: BTreeMap<String, Canvas>,
     pub output: Output,
-    /// Named parameters this graph exposes, keyed by
-    /// [`ParamDecl::name`]. A file without the field loads as empty, which
-    /// is what every graph written before parameters existed means.
+    /// Keyed by [`ParamDecl::name`].
     #[serde(default)]
     pub params: BTreeMap<String, ParamDecl>,
     next_id: u64,
@@ -146,10 +136,7 @@ impl Graph {
         g
     }
 
-    // ---- Lookup ---------------------------------------------------------
-
     pub fn get(&self, id: LayerId) -> Option<&Layer> {
-        // Layers are ID-sorted, so binary search.
         self.layers
             .binary_search_by_key(&id, |l| l.id)
             .ok()
@@ -167,8 +154,7 @@ impl Graph {
         self.layers.binary_search_by_key(&id, |l| l.id).is_ok()
     }
 
-    /// True if `id` is reachable from the graph's Output (i.e. actually
-    /// contributes to the final material).
+    /// True if `id` contributes to the Output.
     pub fn is_reachable(&self, id: LayerId) -> bool {
         let mut stack: Vec<LayerId> = self.output.referenced();
         let mut seen: HashSet<LayerId> = HashSet::new();
@@ -186,16 +172,8 @@ impl Graph {
         false
     }
 
-    /// True when any layer reachable from the Output actually varies along
-    /// the third (w) texture coordinate — i.e. the graph describes a solid
-    /// 3D texture rather than a flat image. The 3D preview uses this to
-    /// switch from UV mapping to volume ("solid") sampling.
-    ///
-    /// Detected sources of w-variation:
-    /// - `Noise` with `dims == D3`
-    /// - `Coordinate` on `Axis::W`
-    /// - `Transform` that routes w into the sampled plane
-    ///   (a `Permute` involving `Axis::W`, or a 3D `Radial`)
+    /// True when any layer reachable from the Output varies along `w`, so
+    /// the graph is a solid texture rather than a flat image.
     pub fn output_is_3d(&self) -> bool {
         use crate::kind::{Axis, CoordMode, NoiseDims, RadialDim};
         let mut stack: Vec<LayerId> = self.output.referenced();
@@ -225,11 +203,8 @@ impl Graph {
         false
     }
 
-    // ---- Layer mutation -------------------------------------------------
-
-    /// Add a new layer. New IDs are always the current max + 1, so pushing
-    /// keeps `layers` sorted. Name must be unique. New layer is appended
-    /// to `list_order`; canvas positions are left unset (UI decides).
+    /// Name must be unique. The layer is appended to `list_order` and left
+    /// unplaced on every canvas.
     pub fn add_layer(
         &mut self,
         name: impl Into<String>,
@@ -253,10 +228,8 @@ impl Graph {
         Ok(id)
     }
 
-    /// Remove `id`. Every input that referenced it — in other layers or in
-    /// the output — is disconnected first (falling back to `None` / const
-    /// defaults, which render as the missing-texture grid). Cleans up list
-    /// order and every canvas's position map.
+    /// Every input that referenced `id`, in layers or the output, is
+    /// disconnected first.
     pub fn remove(&mut self, id: LayerId) -> Result<(), GraphError> {
         if !self.contains(id) {
             return Err(GraphError::UnknownId(id));
@@ -291,7 +264,7 @@ impl Graph {
         Ok(())
     }
 
-    /// Rename a layer. Name must remain unique.
+    /// Name must remain unique.
     pub fn rename(
         &mut self,
         id: LayerId,
@@ -306,7 +279,7 @@ impl Graph {
         Ok(())
     }
 
-    /// Replace a layer's kind, rejecting cycles and unknown references.
+    /// Rejects cycles and unknown references, leaving the layer unchanged.
     pub fn set_kind(&mut self, id: LayerId, kind: LayerKind) -> Result<(), GraphError> {
         if !self.contains(id) {
             return Err(GraphError::UnknownId(id));
@@ -326,7 +299,7 @@ impl Graph {
         Ok(())
     }
 
-    /// Replace the output binding, rejecting unknown references.
+    /// Rejects unknown references.
     pub fn set_output(&mut self, output: Output) -> Result<(), GraphError> {
         for id in output.referenced() {
             if !self.contains(id) {
@@ -338,10 +311,8 @@ impl Graph {
         Ok(())
     }
 
-    /// Every parameter a kind reads must be declared, and declared as the
-    /// sort of thing the socket reading it can use. Checked here, at edit
-    /// time, for the same reason a `LayerId` is: the evaluator and the
-    /// baker then never have to decide what a stray name means.
+    /// Checked at edit time so the evaluator and baker never meet an
+    /// undeclared or mistyped name.
     fn validate_param_refs(&self, refs: Vec<(&str, ParamUse)>) -> Result<(), GraphError> {
         for (name, use_) in refs {
             let Some(decl) = self.params.get(name) else {
@@ -358,10 +329,7 @@ impl Graph {
         Ok(())
     }
 
-    // ---- Parameters -----------------------------------------------------
-
-    /// Declare a new parameter. The name must be unused, and the default
-    /// must be the kind the declaration says it is.
+    /// The name must be unused and the default must match the declared kind.
     pub fn declare_param(&mut self, decl: ParamDecl) -> Result<(), GraphError> {
         if self.params.contains_key(&decl.name) {
             return Err(GraphError::DuplicateParam(decl.name));
@@ -371,12 +339,9 @@ impl Graph {
         Ok(())
     }
 
-    /// Replace an existing declaration, keeping its name.
-    ///
-    /// Changing the *kind* is rejected while anything reads it — a socket
-    /// bound to a scalar cannot survive it becoming a color, and silently
-    /// unbinding every reader would lose work the user cannot see from
-    /// here. Rebind or remove the readers first.
+    /// Changing the kind or name is rejected while anything reads the
+    /// parameter, rather than silently unbinding the readers. Use
+    /// [`Graph::rename_param`] to rename.
     pub fn set_param_decl(&mut self, name: &str, decl: ParamDecl) -> Result<(), GraphError> {
         let Some(old) = self.params.get(name) else {
             return Err(GraphError::UnknownParam(name.to_string()));
@@ -387,8 +352,6 @@ impl Graph {
         validate_decl(&decl)?;
         let kind_changed = std::mem::discriminant(&old.kind) != std::mem::discriminant(&decl.kind);
         if (kind_changed || decl.name != name) && self.param_readers(name).next().is_some() {
-            // A rename is the same problem: every reader holds the old
-            // string. `rename_param` exists to do it properly.
             return Err(GraphError::ParamTypeMismatch {
                 name: name.to_string(),
                 declared: old.kind.label(),
@@ -400,7 +363,7 @@ impl Graph {
         Ok(())
     }
 
-    /// Rename a parameter, rewriting every socket that reads it.
+    /// Rewrites every socket that reads it.
     pub fn rename_param(&mut self, name: &str, new_name: &str) -> Result<(), GraphError> {
         if !self.params.contains_key(name) {
             return Err(GraphError::UnknownParam(name.to_string()));
@@ -421,11 +384,8 @@ impl Graph {
         Ok(())
     }
 
-    /// Remove a parameter. Every socket reading it falls back to the
-    /// declaration's default *as a constant*, so the graph keeps looking
-    /// the way it did — the same courtesy [`Graph::remove`] does not get
-    /// to offer a layer, because there is no constant that stands in for
-    /// one.
+    /// Every socket reading it gets the declared default as a constant, so
+    /// the graph renders the same.
     pub fn remove_param(&mut self, name: &str) -> Result<(), GraphError> {
         let Some(decl) = self.params.remove(name) else {
             return Err(GraphError::UnknownParam(name.to_string()));
@@ -438,8 +398,9 @@ impl Graph {
         Ok(())
     }
 
-    /// Every layer with a socket reading `name`. The Output is not a
-    /// layer and is checked separately by the callers that care.
+    /// Every layer with a socket reading `name`. If the Output reads it,
+    /// the Output's color layer is also yielded (if connected), so only
+    /// emptiness is reliable for the Output.
     pub fn param_readers<'a>(&'a self, name: &'a str) -> impl Iterator<Item = LayerId> + 'a {
         self.layers
             .iter()
@@ -450,22 +411,14 @@ impl Graph {
                     .param_refs()
                     .iter()
                     .any(|(n, _)| *n == name)
-                    // The Output has no id; report the color root so a
-                    // caller has something to point at. `None` when it is
-                    // unconnected, which is fine — the iterator is only
-                    // ever asked whether it is empty.
+                    // The Output has no id. Callers only test for emptiness.
                     .then_some(self.output.color)
                     .flatten(),
             )
     }
 
-    /// The value a parameter carries under `ctx`: the binding it holds,
-    /// or the declaration's default where it holds none or one of the
-    /// wrong kind. `None` when the name is not declared at all.
-    ///
-    /// Unlike [`EvalCtx::scalar_const`] this works on an *unresolved*
-    /// context, so a UI can ask about one parameter without building the
-    /// whole map.
+    /// The binding in `ctx`, or the declared default if unbound or of the
+    /// wrong kind. `None` if undeclared. Works on an unresolved context.
     pub fn param_value(&self, name: &str, ctx: &EvalCtx) -> Option<ParamValue> {
         let decl = self.params.get(name)?;
         Some(
@@ -477,12 +430,8 @@ impl Graph {
         )
     }
 
-    /// `ctx` with every declared parameter present: the binding it
-    /// carries, or the declaration's default where it carries none or
-    /// carries one of the wrong kind.
-    ///
-    /// Every entry point runs this before evaluating, so the readers
-    /// downstream are a map lookup and nothing else.
+    /// `ctx` with every declared parameter present, as in
+    /// [`Graph::param_value`]. Evaluation entry points call this first.
     pub fn resolve_params(&self, ctx: &EvalCtx) -> EvalCtx {
         let mut out = ctx.clone();
         for (name, decl) in &self.params {
@@ -493,8 +442,6 @@ impl Graph {
         }
         out
     }
-
-    // ---- List order -----------------------------------------------------
 
     /// Move `id` to slot `to` in `list_order` (clamped to len − 1).
     pub fn set_list_position(&mut self, id: LayerId, to: usize) -> Result<(), GraphError> {
@@ -511,8 +458,6 @@ impl Graph {
         self.list_order.insert(to, v);
         Ok(())
     }
-
-    // ---- Canvases -------------------------------------------------------
 
     pub fn add_canvas(&mut self, name: impl Into<String>) -> Result<(), GraphError> {
         let name = name.into();
@@ -547,7 +492,6 @@ impl Graph {
         Ok(())
     }
 
-    /// Store the Output pseudo-node's position on a canvas.
     pub fn set_output_position(
         &mut self,
         canvas: &str,
@@ -561,15 +505,10 @@ impl Graph {
         Ok(())
     }
 
-    // ---- Cycle detection ------------------------------------------------
-
-    /// True if wiring `candidate_input` into an input of `node` would
-    /// create a cycle — i.e. `candidate_input` is `node` itself or
-    /// (transitively) depends on it. Exact even when the new wire replaces
-    /// an existing input: any offending path runs `candidate → … → node`
-    /// through input edges and cannot pass through the edge being
-    /// replaced. Intended for live drop-eligibility feedback; `set_kind`
-    /// remains the authoritative validator.
+    /// True if wiring `candidate_input` into `node` would create a cycle.
+    /// Exact even when the wire replaces an existing input, since any cycle
+    /// path runs `candidate → … → node` and cannot use the replaced edge.
+    /// For live UI feedback; `set_kind` is the authoritative check.
     pub fn would_cycle(&self, node: LayerId, candidate_input: LayerId) -> bool {
         if candidate_input == node {
             return true;
@@ -590,8 +529,6 @@ impl Graph {
         false
     }
 
-    /// DFS from `start` — returns true if any path revisits a node currently
-    /// on the recursion stack.
     fn has_cycle_from(&self, start: LayerId) -> bool {
         let by_id: HashMap<LayerId, &Layer> = self.layers.iter().map(|l| (l.id, l)).collect();
         let mut visiting: HashSet<LayerId> = HashSet::new();
@@ -640,8 +577,7 @@ fn validate_decl(decl: &ParamDecl) -> Result<(), GraphError> {
     Ok(())
 }
 
-/// Point every socket reading `name` at `to`, or — with `None` — leave
-/// them alone. Used by `rename_param`.
+/// `None` leaves the sockets alone.
 fn rewrite_param(kind: &mut LayerKind, name: &str, to: Option<&str>) {
     let Some(to) = to else { return };
     let scalar = |si: &mut ScalarInput| {
@@ -672,8 +608,6 @@ fn rewrite_output_param(output: &mut Output, name: &str, to: Option<&str>) {
     }
 }
 
-/// Replace every read of `name` with `value` as a constant, so removing a
-/// parameter does not change what the graph renders.
 fn freeze_param(kind: &mut LayerKind, name: &str, value: ParamValue) {
     let scalar = |si: &mut ScalarInput| {
         if matches!(si, ScalarInput::Param(n) if n == name) {
@@ -711,16 +645,13 @@ fn validate_ramp(r: &ColorRamp) -> Result<(), GraphError> {
     Ok(())
 }
 
-/// Per-variant invariants the evaluator and the baker are allowed to
-/// assume. Checked by every path that installs a kind, so neither backend
-/// has to carry a fallback for a graph that cannot exist.
+/// Per-variant invariants the evaluator and baker assume. Every path that
+/// installs a kind must call this.
 fn validate_kind(kind: &LayerKind) -> Result<(), GraphError> {
     match kind {
         LayerKind::ColorRamp(r) => validate_ramp(r),
         LayerKind::Noise(n) => {
-            // Silently dropping the period would make a graph look tiled in
-            // the editor and seam in the consumer — the one failure this
-            // feature exists to prevent.
+            // Ignoring the period would look tiled here and seam in the consumer.
             if n.kernel == NoiseKernel::Simplex && n.period != [0; 3] {
                 return Err(GraphError::PeriodicSimplex);
             }
@@ -753,22 +684,17 @@ mod tests {
     #[test]
     fn would_cycle_matches_dependency_direction() {
         let (g, a, b, c) = chain();
-        // c's inputs may not include anything that depends on c.
         assert!(g.would_cycle(c, a));
         assert!(g.would_cycle(c, b));
         assert!(g.would_cycle(b, a));
-        // Downstream nodes can take upstream ones as inputs.
         assert!(!g.would_cycle(a, c));
         assert!(!g.would_cycle(a, b));
-        // Self-connection is a cycle.
         assert!(g.would_cycle(a, a));
     }
 
     #[test]
     fn would_cycle_is_exact_under_replacement() {
         let (mut g, a, _b, c) = chain();
-        // An independent layer is fine as a's replacement input even
-        // though a already has one.
         let x = g
             .add_layer("x", LayerKind::Map(Map { value: Some(c), palette: None }))
             .unwrap();
@@ -795,9 +721,8 @@ mod tests {
                 matches!(result, Err(GraphError::Cycle(_))),
                 "disagreement wiring {input:?} into {node:?}"
             );
-            // Restore the chain for the next case.
+            // chain() assigns the same ids each time.
             g = chain().0;
-            // chain() rebuilds ids deterministically, so a/b/c stay valid.
         }
     }
 
@@ -844,8 +769,6 @@ mod tests {
         })
     }
 
-    /// A period on the simplex kernel is rejected, not dropped: a silent
-    /// no-op would look tiled here and seam in whatever samples the bake.
     #[test]
     fn a_periodic_simplex_is_rejected_by_every_path() {
         let mut periodic_simplex = value_noise([8, 8, 8]);
@@ -862,7 +785,6 @@ mod tests {
             g.set_kind(id, periodic_simplex),
             Err(GraphError::PeriodicSimplex)
         ));
-        // An unbounded period on simplex, and any period on value, are fine.
         let mut aperiodic = value_noise([0; 3]);
         let LayerKind::Noise(n) = &mut aperiodic else { panic!() };
         n.kernel = NoiseKernel::Simplex;
@@ -870,8 +792,6 @@ mod tests {
         assert!(g.add_layer("tiling value", value_noise([8, 8, 8])).is_ok());
     }
 
-    /// The rejected kind must not be left installed — `set_kind` restores
-    /// what was there on every other failure, and this one is no different.
     #[test]
     fn a_rejected_kind_leaves_the_layer_alone() {
         let mut g = Graph::new();
@@ -882,8 +802,6 @@ mod tests {
         let _ = g.set_kind(id, periodic_simplex);
         assert!(matches!(g.get(id).unwrap().kind, LayerKind::Color(_)));
     }
-
-    // ---- Parameters ----------------------------------------------------
 
     fn mix_with_factor(a: LayerId, factor: ScalarInput) -> LayerKind {
         LayerKind::Mix(crate::kind::Mix {
@@ -908,8 +826,6 @@ mod tests {
         })
     }
 
-    /// A name is checked at edit time exactly the way a `LayerId` is, so
-    /// neither backend ever has to decide what a stray one means.
     #[test]
     fn an_undeclared_parameter_is_rejected_like_an_unknown_layer() {
         let mut g = Graph::new();
@@ -925,8 +841,7 @@ mod tests {
             .is_ok());
     }
 
-    /// A scalar socket cannot read a color parameter, and the error says
-    /// which way round it went wrong.
+    /// The error names the declared and wanted kinds the right way round.
     #[test]
     fn a_socket_cannot_read_the_wrong_kind_of_parameter() {
         let mut g = Graph::new();
@@ -941,11 +856,9 @@ mod tests {
                 if name == "tint" && *declared == "color" && *wanted == "scalar"),
             "unexpected error: {err}"
         );
-        // The same name in a color socket is fine.
         assert!(g.add_layer("r", ramp_with_stop(ColorInput::Param("tint".into()))).is_ok());
     }
 
-    /// The Output's scalar channels are validated on the same path.
     #[test]
     fn the_output_validates_its_parameters_too() {
         let mut g = Graph::new();
@@ -979,8 +892,6 @@ mod tests {
         ));
     }
 
-    /// Removing a parameter freezes its readers at the declared default,
-    /// so the graph goes on rendering what it rendered.
     #[test]
     fn removing_a_parameter_freezes_its_readers() {
         let mut g = Graph::new();
@@ -1004,7 +915,6 @@ mod tests {
         let LayerKind::Mix(mix) = &g.get(m).unwrap().kind else { panic!() };
         assert!(matches!(mix.factor, ScalarInput::Const(v) if v == 0.75));
         assert!(matches!(g.output.roughness, ScalarInput::Const(v) if v == 0.75));
-        // The other parameter is untouched.
         let LayerKind::ColorRamp(ramp) = &g.get(r).unwrap().kind else { panic!() };
         assert!(matches!(ramp.stops[1].color, ColorInput::Param(ref n) if n == "tint"));
 
@@ -1016,8 +926,7 @@ mod tests {
         assert!(matches!(g.remove_param("tint"), Err(GraphError::UnknownParam(_))));
     }
 
-    /// A rename has to rewrite every reader, or the graph stops validating
-    /// against itself.
+    /// A reader left on the old name would make the graph fail validation.
     #[test]
     fn renaming_a_parameter_rewrites_its_readers() {
         let mut g = Graph::new();
@@ -1042,13 +951,10 @@ mod tests {
         assert!(matches!(mix.factor, ScalarInput::Param(ref n) if n == "punch"));
         assert!(matches!(g.output.roughness, ScalarInput::Param(ref n) if n == "punch"));
 
-        // And the graph still validates: re-setting the same kind passes.
         let kind = g.get(m).unwrap().kind.clone();
         assert!(g.set_kind(m, kind).is_ok());
     }
 
-    /// Changing a declared kind under a live reader would strand it, so it
-    /// is refused rather than silently unbinding.
     #[test]
     fn a_kind_change_is_refused_while_something_reads_it() {
         let mut g = Graph::new();
@@ -1062,16 +968,13 @@ mod tests {
             g.set_param_decl("contrast", to_color.clone()),
             Err(GraphError::ParamTypeMismatch { .. })
         ));
-        // Editing the range and default in place is fine.
         assert!(g
             .set_param_decl("contrast", ParamDecl::scalar("contrast", -1.0, 3.0, 2.0))
             .is_ok());
         assert_eq!(g.params["contrast"].default, ParamValue::Scalar(2.0));
     }
 
-    /// Resolution is "the binding, else the default" — including when the
-    /// binding is the wrong kind, which a host supplying values by name
-    /// can easily get wrong.
+    /// A binding of the wrong kind falls back to the default.
     #[test]
     fn resolution_prefers_the_binding_and_falls_back_to_the_default() {
         let mut g = Graph::new();
@@ -1084,7 +987,6 @@ mod tests {
             .with_param("contrast", ParamValue::Scalar(1.5));
         assert_eq!(g.resolve_params(&bound).params["contrast"], ParamValue::Scalar(1.5));
 
-        // Wrong kind: ignored in favour of the declared default.
         let wrong = crate::eval::EvalCtx::default().with_param(
             "contrast",
             ParamValue::Color(crate::color::oklcha(0.5, 0.0, 0.0, 1.0)),
@@ -1106,15 +1008,14 @@ mod tests {
 
     #[test]
     fn canvas_without_output_pos_deserializes() {
-        // A canvas serialized before `output_pos` existed.
         let old: Canvas = ron::from_str("(positions: {})").unwrap();
         assert_eq!(old.output_pos, None);
     }
 
     #[test]
     fn output_with_bare_color_id_deserializes() {
-        // Files from before `Output::color` became optional store a bare
-        // id; `implicit_some` (as used by file::load_from_str) wraps it.
+        // Older files store a bare id; `implicit_some`, as in
+        // `file::load_from_str`, wraps it.
         let options = ron::Options::default()
             .with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME);
         let old: Output = options

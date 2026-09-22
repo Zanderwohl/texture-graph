@@ -13,8 +13,6 @@ use crate::state::{EditCmd, UiState};
 use crate::widgets::enum_combo::enum_combo;
 use crate::widgets::{color_edit, layer_ref, node_labels, param_ref};
 
-/// Render the inspector for a single layer. Emits `EditCmd::SetKind` when
-/// any control changes.
 pub fn show(
     ui: &mut egui::Ui,
     graph: &Graph,
@@ -26,8 +24,6 @@ pub fn show(
     let mut kind = layer.kind.clone();
     let mut changed = false;
 
-    // Variant switcher — swaps the whole `LayerKind` to a fresh default of
-    // the chosen variant.
     let current = Kind::of(&kind);
     let current_label = catalog::VARIANTS
         .iter()
@@ -93,8 +89,6 @@ pub fn show(
     }
 }
 
-// ---- Variant widgets ----------------------------------------------------
-
 fn noise_widgets(ui: &mut egui::Ui, id: LayerId, n: &mut Noise) -> bool {
     let mut changed = false;
     if enum_combo(
@@ -106,9 +100,7 @@ fn noise_widgets(ui: &mut egui::Ui, id: LayerId, n: &mut Noise) -> bool {
         node_labels::kernel,
     ) {
         changed = true;
-        // Leaving a period behind on simplex would make `set_kind` reject
-        // the very edit the user just made, over a field the simplex UI
-        // does not even show.
+        // `set_kind` rejects a period on simplex, whose UI does not show one.
         if n.kernel == NoiseKernel::Simplex {
             n.period = [0; 3];
         }
@@ -148,8 +140,7 @@ fn noise_widgets(ui: &mut egui::Ui, id: LayerId, n: &mut Noise) -> bool {
         .add(egui::DragValue::new(&mut n.seed_offset).prefix("seed+"))
         .changed();
 
-    // Only the value kernel has a lattice to wrap; simplex would be
-    // rejected outright, so the control stays hidden rather than armed.
+    // Only the value kernel has a lattice to wrap; simplex rejects a period.
     if n.kernel == NoiseKernel::Value {
         ui.horizontal(|ui| {
             ui.label("period");
@@ -536,13 +527,8 @@ fn h2n_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, h: &mut HeightToNo
     changed
 }
 
-// ---- Small helpers ------------------------------------------------------
-
-/// A `ScalarInput` as a constant, a layer reference or a named parameter.
-///
-/// `ctx` carries the parameter bindings in force, so switching a bound
-/// socket back to a constant freezes it at what it currently reads rather
-/// than at an arbitrary 0.5.
+/// `ctx` lets switching a bound socket back to a constant freeze it at its
+/// current value.
 pub fn scalar_input_widget(
     ui: &mut egui::Ui,
     graph: &Graph,
@@ -552,8 +538,8 @@ pub fn scalar_input_widget(
     ctx: &EvalCtx,
 ) -> bool {
     let mut changed = false;
-    // A mode switch replaces the whole enum, which would invalidate the
-    // borrow the arm below holds. Decide inside, assign after.
+    // A mode switch replaces the enum the match arm is borrowing, so it is
+    // assigned after the match.
     let mut swap_to: Option<ScalarInput> = None;
     ui.horizontal(|ui| {
         ui.label(label);
@@ -567,8 +553,7 @@ pub fn scalar_input_widget(
                         graph.layers.first().map(|l| l.id).unwrap_or(self_id),
                     ));
                 }
-                // Only offered when a scalar parameter is declared; a
-                // button that can only fail is worse than none.
+                // Hidden when no scalar parameter exists, since it could only fail.
                 if let Some(first) = param_ref::first(graph, ParamUse::Scalar) {
                     if ui.small_button("use param").clicked() {
                         swap_to = Some(ScalarInput::Param(first));

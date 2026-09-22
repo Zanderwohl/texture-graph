@@ -1,23 +1,14 @@
-//! Getting baked pixels back off the GPU, for consumers that need them on
-//! the CPU. See `examples/bake.rs`.
+//! Reading baked pixels back to the CPU. See `examples/bake.rs`.
 //!
-//! Each reader comes in two shapes:
+//! - Blocking ([`read_rgba8`], [`read_scalar`], [`read_scalar_volume`])
+//!   waits with `Device::poll`, which does not work on
+//!   `wasm32-unknown-unknown`.
+//! - Async ([`read_rgba8_async`] and friends) awaits the map callback. On
+//!   native, something must poll the device while it waits or the future
+//!   never completes. On wasm nothing is required.
 //!
-//! - **Blocking** ([`read_rgba8`], [`read_scalar`], [`read_scalar_volume`])
-//!   resolves the buffer map with `Device::poll`. Simple, and what a test
-//!   or a CLI bake wants.
-//! - **Async** ([`read_rgba8_async`] and friends) awaits the map callback
-//!   instead. `Device::poll(wait_indefinitely)` does not work on
-//!   `wasm32-unknown-unknown` — there is no thread to block and the
-//!   browser resolves the map on its own event loop — so a wasm host has
-//!   no way to use the blocking pair at all.
-//!
-//!   On native the async pair needs the device polled while it waits; the
-//!   caller's own frame loop usually already does that, and if nothing
-//!   does the future simply never completes. On wasm nothing is required.
-//!
-//! A consumer that shares the host's device can skip all of this: a
-//! `bake_*` result is a `wgpu::Texture` it can sample directly.
+//! A consumer that shares the host's device can sample the `bake_*`
+//! texture directly instead.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -68,11 +59,8 @@ impl Image {
 
 /// A single-channel field read back from the GPU: raw texels in the
 /// format it was baked in, tightly packed (no row padding), row-major from
-/// the top-left and slice-major through `depth`.
-///
-/// The bytes are kept rather than decoded because that is what a consumer
-/// re-uploading the field wants; [`ScalarImage::value`] decodes one texel
-/// for the callers that want a number.
+/// the top-left and slice-major through `depth`. [`ScalarImage::value`]
+/// decodes one texel.
 pub struct ScalarImage {
     pub width: u32,
     pub height: u32,
@@ -108,16 +96,13 @@ impl ScalarImage {
     }
 }
 
-/// IEEE half to single. Hand-written rather than pulled in as a
-/// dependency: it is fifteen lines and this crate's only use of f16 is
-/// decoding what it just baked.
+/// IEEE half to single. Hand-written to avoid a dependency for one use.
 fn f16_to_f32(h: u16) -> f32 {
     let sign = ((h >> 15) as u32) << 31;
     let exp = ((h >> 10) & 0x1f) as u32;
     let mant = (h & 0x3ff) as u32;
     let bits = match exp {
-        // Zero or subnormal: scale the mantissa as a float instead of
-        // renormalizing by hand.
+        // Zero or subnormal.
         0 => {
             if mant == 0 {
                 sign
@@ -133,8 +118,7 @@ fn f16_to_f32(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
-/// Copy `tex` into a `MAP_READ` buffer and submit. Shared by every reader;
-/// returns the buffer and the padded row stride the caller has to strip.
+/// Returns the buffer and the padded row stride the caller has to strip.
 fn copy_to_buffer(
     ctx: &DeviceCtx,
     tex: &wgpu::Texture,
@@ -175,7 +159,6 @@ fn copy_to_buffer(
     (readback, padded_bpr)
 }
 
-/// Strip the copy's row padding out of a mapped buffer.
 fn unpad(buffer: &wgpu::Buffer, padded_bpr: u32, packed_bpr: u32, rows: u32) -> Vec<u8> {
     let data = buffer.slice(..).get_mapped_range();
     let mut out = Vec::with_capacity((packed_bpr * rows) as usize);
@@ -187,8 +170,7 @@ fn unpad(buffer: &wgpu::Buffer, padded_bpr: u32, packed_bpr: u32, rows: u32) -> 
     out
 }
 
-/// Resolve `map_async` by polling the device. Not usable on wasm, which is
-/// what [`map_async_await`] is for.
+/// Not usable on wasm.
 fn map_blocking(ctx: &DeviceCtx, buffer: &wgpu::Buffer) {
     let (tx, rx) = std::sync::mpsc::channel();
     buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
@@ -200,21 +182,13 @@ fn map_blocking(ctx: &DeviceCtx, buffer: &wgpu::Buffer) {
     rx.recv().expect("map channel").expect("map readback buffer");
 }
 
-/// The shared cell a `map_async` callback writes its result into, and the
-/// waker to nudge when it does.
 #[derive(Default)]
 struct MapSlot {
     result: Mutex<Option<Result<(), wgpu::BufferAsyncError>>>,
     waker: Mutex<Option<Waker>>,
 }
 
-/// Await `map_async` rather than polling for it — the only shape that
-/// works on wasm, where there is no thread to block.
-///
-/// Deliberately not built on a channel or an executor: a future that
-/// resolves off the callback keeps this crate free of an async runtime in
-/// its public API, which is the whole reason the blocking pair still
-/// exists alongside it.
+/// Resolves from the map callback, so the crate needs no async runtime.
 fn map_async_await(buffer: &wgpu::Buffer) -> impl Future<Output = ()> + use<> {
     let slot = Arc::new(MapSlot::default());
     let cb_slot = slot.clone();
@@ -239,10 +213,8 @@ impl Future for MapFuture {
             r.expect("map readback buffer");
             return Poll::Ready(());
         }
-        // Store the waker before re-checking would be racier than it looks
-        // if the callback could run on another thread; it cannot here —
-        // wgpu invokes it from `poll` or the browser's event loop — but
-        // taking the lock in this order costs nothing and is honest.
+        // Re-check after storing the waker, so a callback that ran in
+        // between is not missed.
         *self.slot.waker.lock().unwrap() = Some(cx.waker().clone());
         if let Some(r) = self.slot.result.lock().unwrap().take() {
             r.expect("map readback buffer");
@@ -264,7 +236,7 @@ pub fn read_rgba8(ctx: &DeviceCtx, tex: &wgpu::Texture, size: (u32, u32)) -> Ima
     Image { width, height, pixels }
 }
 
-/// [`read_rgba8`] without the device poll — see the module docs.
+/// [`read_rgba8`] without the device poll; see the module docs.
 pub async fn read_rgba8_async(ctx: &DeviceCtx, tex: &wgpu::Texture, size: (u32, u32)) -> Image {
     let (width, height) = size;
     let (buffer, padded_bpr) = copy_to_buffer(ctx, tex, (width, height, 1), 4);
@@ -283,7 +255,7 @@ pub fn read_scalar(
     read_scalar_volume(ctx, tex, (size.0, size.1, 1), format)
 }
 
-/// [`read_scalar`] without the device poll — see the module docs.
+/// [`read_scalar`] without the device poll; see the module docs.
 pub async fn read_scalar_async(
     ctx: &DeviceCtx,
     tex: &wgpu::Texture,
@@ -306,7 +278,7 @@ pub fn read_scalar_volume(
     scalar_image(&buffer, padded_bpr, size, format)
 }
 
-/// [`read_scalar_volume`] without the device poll — see the module docs.
+/// [`read_scalar_volume`] without the device poll; see the module docs.
 pub async fn read_scalar_volume_async(
     ctx: &DeviceCtx,
     tex: &wgpu::Texture,
@@ -344,7 +316,6 @@ mod tests {
         Image { width, height, pixels }
     }
 
-    /// Three bytes a pixel, no alpha and no row padding.
     #[test]
     fn ppm_has_a_p6_header_and_three_bytes_per_pixel() {
         let img = image(3, 2, |x, y| [x as u8, y as u8, 7, 255]);
@@ -353,13 +324,12 @@ mod tests {
         assert_eq!(&ppm[..header.len()], header);
         let body = &ppm[header.len()..];
         assert_eq!(body.len(), 3 * 3 * 2, "one RGB triple per pixel");
-        // Row-major from the top-left: pixel (2, 1) is the last triple.
         assert_eq!(&body[body.len() - 3..], &[2, 1, 7]);
     }
 
-    /// Dropped, not composited: transparency must not multiply the colours.
+    /// Alpha must be dropped, not composited into the color.
     #[test]
-    fn ppm_drops_alpha_without_touching_colour() {
+    fn ppm_drops_alpha_without_touching_color() {
         let img = image(2, 1, |x, _| [200, 100, 50, if x == 0 { 0 } else { 255 }]);
         let body = &img.to_ppm()[b"P6\n2 1\n255\n".len()..];
         assert_eq!(body, &[200, 100, 50, 200, 100, 50]);

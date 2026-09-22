@@ -1,11 +1,7 @@
-// LayerKind::ColorRamp — multi-stop 1D gradient, sampled along U.
+// LayerKind::ColorRamp: multi-stop gradient along U.
 //
-// Each stop is either a constant color or a reference to another layer.
-// Const stops carry the value inline; layer stops carry an `input_index`
-// into a fixed array of MAX_RAMP_INPUTS = 8 texture bindings (the CPU side
-// binds each referenced layer's intermediate texture into one of those
-// slots). More than 8 unique layer-referenced stops in one ramp is
-// rejected at bake time.
+// A layer stop's `input_index` selects one of MAX_RAMP_INPUTS = 8 texture
+// bindings. A ramp referencing more than 8 layers is rejected at bake time.
 
 struct RampParams {
     size: vec2<u32>,
@@ -19,7 +15,7 @@ struct Stop {
     color: vec4<f32>,   // Oklcha; used when kind == 0
     t: f32,
     kind: u32,          // 0 = const, 1 = sample tex[input_index]
-    input_index: u32,   // 0..7 into the input-texture array
+    input_index: u32,   // 0..7
     _p0: f32,
 }
 
@@ -35,8 +31,6 @@ struct Stop {
 @group(0) @binding(9) var in6: texture_2d<f32>;
 @group(0) @binding(10) var in7: texture_2d<f32>;
 
-// Map this dispatch's texel to its UV within the layer's bake domain
-// (dom = (min_u, min_v, ext_u, ext_v)).
 fn dom_uv(dom: vec4<f32>, gid: vec2<u32>, size: vec2<u32>) -> vec2<f32> {
     return vec2<f32>(
         dom.x + (f32(gid.x) + 0.5) / f32(size.x) * dom.z,
@@ -180,9 +174,8 @@ fn blend_stops(a: vec4<f32>, b: vec4<f32>, t: f32) -> vec4<f32> {
     }
 }
 
-// Sample one of the 8 input textures by index. Uniform indexing into a
-// texture array requires the SAMPLED_TEXTURE_ARRAY_NON_UNIFORM_INDEXING
-// feature (native-only), so we switch by index at compile-time.
+// A switch, because indexing a texture array needs
+// SAMPLED_TEXTURE_ARRAY_NON_UNIFORM_INDEXING, which is native-only.
 fn sample_input(idx: u32, coord: vec2<i32>) -> vec4<f32> {
     switch idx {
         case 0u: { return textureLoad(in0, coord, 0); }
@@ -211,7 +204,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let coord = vec2<i32>(i32(gid.x), i32(gid.y));
     let uv = dom_uv(params.dom, gid.xy, params.size);
     let u = uv.x;
-    // Find the segment containing u. Matches the CPU loop in `eval_ramp`.
+    // Must match the CPU loop in `eval_ramp`.
     var lo: u32 = 0u;
     var hi: u32 = params.stop_count - 1u;
     for (var i: u32 = 0u; i + 1u < params.stop_count; i = i + 1u) {
@@ -234,8 +227,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let span = tb - ta;
     var t: f32 = 0.0;
     if (abs(span) >= 1.1754944e-38) {
-        // Clamp so the ramp holds the outermost stop's color past either
-        // end instead of extrapolating. Matches CPU `eval_ramp`.
+        // Hold the end colors instead of extrapolating, as `eval_ramp` does.
         t = clamp((u - ta) / span, 0.0, 1.0);
     }
     let a_color = stop_color(lo, uv);

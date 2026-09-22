@@ -1,31 +1,20 @@
-// 3D preview scene — shared half. Concatenated (in Rust, at pipeline
-// creation) with exactly one variant file that supplies the material
-// bindings (1..4) and fs_main:
+// 3D preview scene, shared part. Rust prepends it to one variant file,
+// `scene_uv.wgsl` or `scene_solid.wgsl`, which supplies bindings 1..4 and
+// fs_main.
 //
-// - `scene_uv.wgsl`    — texture_2d channels sampled by mesh UV
-// - `scene_solid.wgsl` — texture_3d channels sampled at the fragment's
-//                        object-space position ("solid texturing")
-//
-// Cook-Torrance BRDF with a three-point white light rig. Tangent-space
-// normal mapping via a per-vertex TBN. Roughness/metallic store their
-// values sRGB-gamma-encoded (that's how pack_srgb8 writes scalars), so we
-// decode them to linear before use.
-//
-// Output target is `Rgba8Unorm` — we apply the sRGB gamma manually in the
-// fragment shader for consistency with `pack_srgb8` and to keep egui
-// happy sampling it.
+// Roughness/metallic arrive sRGB-encoded, as pack_srgb8 writes scalars, and
+// are decoded before use. The target is `Rgba8Unorm`, so the fragment shader
+// applies sRGB gamma itself, matching `pack_srgb8`.
 
 struct Camera {
     view_proj: mat4x4<f32>,
-    model: mat4x4<f32>,          // turntable rotation (spins with time)
+    model: mat4x4<f32>,          // turntable rotation
     camera_pos: vec4<f32>,
-    // Three-point white studio rig: key + fill + back/rim. Each vec4
-    // packs xyz = normalized direction FROM surface TO light, w = linear
-    // intensity multiplier (pre-multiplied into pure white).
+    // Key, fill, rim. xyz = direction from surface to light, w = linear
+    // intensity of a white light.
     lights: array<vec4<f32>, 3>,
-    // xyz = linear ambient tint. w = object-space → texture-space scale
-    // for solid sampling (`tex = obj_pos * w + 0.5`); unused by the UV
-    // variant.
+    // xyz = linear ambient tint. w = object-to-texture scale for the solid
+    // variant (`tex = obj_pos * w + 0.5`).
     ambient: vec4<f32>,
 }
 
@@ -43,8 +32,7 @@ struct VsOut {
     @location(2) world_tangent: vec3<f32>,
     @location(3) tangent_w: f32,
     @location(4) uv: vec2<f32>,
-    // Object-space (pre-model-rotation) position: the solid variant's
-    // sampling coordinate, so the texture spins WITH the turntable.
+    // Before model rotation, so a solid texture turns with the mesh.
     @location(5) obj_pos: vec3<f32>,
 }
 
@@ -78,8 +66,7 @@ fn vs_main(v: VsIn) -> VsOut {
     var out: VsOut;
     let world = camera.model * vec4<f32>(v.pos, 1.0);
     out.world_pos = world.xyz;
-    // Model has no non-uniform scale, so a plain rotation of normal/tangent
-    // is correct.
+    // Valid only while the model has no non-uniform scale.
     let model3 = mat3x3<f32>(
         camera.model[0].xyz,
         camera.model[1].xyz,
@@ -94,7 +81,6 @@ fn vs_main(v: VsIn) -> VsOut {
     return out;
 }
 
-// GGX / Smith terms —
 fn d_ggx(n_dot_h: f32, roughness: f32) -> f32 {
     let a  = roughness * roughness;
     let a2 = a * a;
@@ -117,14 +103,9 @@ fn f_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
     return f0 + (vec3<f32>(1.0) - f0) * pow(x, 5.0);
 }
 
-// Shared shading given the RAW channel samples the variant fetched.
-// `base_srgba`: sRGB-encoded base color + straight alpha (alpha < 1 only
-// when the bake ran with object-alpha presentation; the pipeline
-// alpha-blends the shaded fragment over the scene background);
-// `rough_enc`/`metal_enc`: sRGB-encoded scalars; `n_encoded`: raw
-// normal-map value (`n*0.5+0.5`, NOT sRGB — do not decode; a "flat"
-// (128,128,255) sample would get tilted ~40° off-axis and the whole
-// surface goes dark or oddly conical).
+// `base_srgba` is sRGB with straight alpha; `rough_enc`/`metal_enc` are
+// sRGB-encoded. `n_encoded` is `n*0.5+0.5` and not sRGB: decoding it tilts a
+// flat (128,128,255) sample about 40° off-axis.
 fn shade(
     in: VsOut,
     base_srgba: vec4<f32>,
@@ -137,7 +118,7 @@ fn shade(
     let metallic  = srgb_to_linear_c(metal_enc);
     let n_tangent = normalize(n_encoded * 2.0 - vec3<f32>(1.0));
 
-    // Build TBN. Handedness lets us flip the bitangent for mirrored UVs.
+    // tangent_w flips the bitangent for mirrored UVs.
     let N_geo   = normalize(in.world_normal);
     let T       = normalize(in.world_tangent - N_geo * dot(N_geo, in.world_tangent));
     let B       = cross(N_geo, T) * in.tangent_w;
@@ -147,7 +128,6 @@ fn shade(
     let n_dot_v = max(dot(N, V), 1e-4);
     let f0      = mix(vec3<f32>(0.04), base, metallic);
 
-    // Accumulate direct contributions from the three-point rig.
     var lo = vec3<f32>(0.0);
     for (var i: u32 = 0u; i < 3u; i = i + 1u) {
         let light  = camera.lights[i];
@@ -165,15 +145,13 @@ fn shade(
         let k_diffuse = (vec3<f32>(1.0) - f) * (1.0 - metallic);
         let diffuse   = k_diffuse * base / PI;
 
-        // Pure white light times its intensity.
         lo = lo + (diffuse + specular) * vec3<f32>(intens) * n_dot_l;
     }
 
     let ambient = camera.ambient.xyz * base;
     var color   = ambient + lo;
 
-    // Reinhard tone map — keeps hot metal specular from clipping into a
-    // solid white blob.
+    // Reinhard, so bright metal specular does not clip to white.
     color = color / (color + vec3<f32>(1.0));
 
     return vec4<f32>(linear_to_srgb3(color), clamp(base_srgba.a, 0.0, 1.0));

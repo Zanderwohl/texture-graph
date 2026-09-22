@@ -12,7 +12,6 @@ use crate::panels::preview::PreviewPanelState;
 use crate::previews::PreviewCache;
 use crate::state::UiState;
 
-/// Baker plus the egui-wgpu renderer baked textures are registered against.
 /// Absent if the wgpu backend failed to initialize.
 pub struct GpuBits {
     pub baker: Baker,
@@ -31,7 +30,7 @@ pub struct TextureGraphApp {
 
 impl TextureGraphApp {
     pub fn new(cc: &CreationContext<'_>) -> Self {
-        // Smaller on web, where per-frame cost bites harder.
+        // Smaller on web, where per-frame cost is higher.
         #[cfg(target_arch = "wasm32")]
         let default_size = 256;
         #[cfg(not(target_arch = "wasm32"))]
@@ -72,8 +71,7 @@ impl eframe::App for TextureGraphApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Retire thumbnails invalidated last frame before anything asks for
-        // one. `None` means all of them.
+        // Must run before anything asks for a thumbnail. `None` means all.
         let dirty = self.ui.dirty_previews.replace(HashSet::new());
         self.previews.begin_frame(
             &self.graph,
@@ -100,9 +98,8 @@ impl eframe::App for TextureGraphApp {
                 );
             });
 
-        // Left, because a parameter is an input to the whole graph rather
-        // than a property of any node; the right panel is what the graph
-        // produces.
+        // Left: parameters are inputs to the whole graph; the right panel
+        // shows what it produces.
         egui::Panel::left("params")
             .resizable(true)
             .default_size(220.0)
@@ -126,15 +123,12 @@ impl eframe::App for TextureGraphApp {
             );
         });
 
-        // Both platforms run the dialog off the UI thread and report back
-        // through `poll_pending`: blocking on it deadlocks on macOS.
         file_io::handle_wants_save(&self.graph, &mut self.ui, ui.ctx());
         file_io::handle_wants_open(&mut self.ui, ui.ctx());
         file_io::poll_pending(&mut self.ui);
 
-        // Apply queued mutations. `dirty_previews` is consumed at the top of
-        // the next frame; `state.dirty` belongs to the preview panel, so it
-        // stays set here.
+        // `dirty_previews` is consumed at the top of the next frame;
+        // `state.dirty` belongs to the preview panel, so it stays set here.
         self.ui.drain_into(&mut self.graph);
     }
 }

@@ -1,7 +1,5 @@
-// Smoke pipeline: writes a uniform Oklcha value to every texel of an
-// Rgba32Float storage texture. Exists so the wgpu init / bind group /
-// dispatch / readback stack has one thing to prove itself against before
-// any real filter shader lands.
+// Smoke test: one Oklcha value in every texel, to check init, bind group,
+// dispatch and readback without any filter shader.
 
 struct Params {
     color: vec4<f32>,

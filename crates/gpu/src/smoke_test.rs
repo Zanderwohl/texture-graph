@@ -1,8 +1,5 @@
-//! Proves the wgpu init + compute + readback stack works end-to-end.
-//!
-//! Dispatches a trivial pipeline that writes a chosen Oklcha value into
-//! every texel of an Rgba32Float texture, then copies one row to a mapped
-//! staging buffer and asserts the pixel round-trips exactly.
+//! Checks wgpu init, a compute dispatch and readback: a constant Oklcha
+//! value must round-trip exactly through an Rgba32Float texture.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -97,8 +94,7 @@ fn run_smoke() -> [f32; 4] {
         ],
     });
 
-    // Row layout: wgpu requires 256-byte-aligned bytes-per-row for copies.
-    // 8 pixels * 16 B = 128 B < 256, so pad row stride to 256 B.
+    // Copies need 256-byte-aligned rows; 8 px * 16 B = 128 B.
     let bytes_per_row = 256u32;
     let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("smoke-readback"),

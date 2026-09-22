@@ -1,12 +1,9 @@
 //! Right panel: preview of the graph's `Output`.
 //!
-//! **Flat** shows the four PBR channels as textures; **Quad**, **Sphere**
-//! and **Cube** light them through the `SceneRenderer`.
-//!
-//! The Baker always produces the four textures. Flat mode registers them with
-//! egui-wgpu directly; 3D modes feed the scene renderer, which draws into a
-//! persistent colour target rebuilt only on a size or shape change, so
-//! auto-spin doesn't churn allocations at 60 fps.
+//! Flat shows the four PBR channels as textures; Quad, Sphere and Cube
+//! light them through the `SceneRenderer`, which draws into a persistent
+//! color target rebuilt only on a size or shape change, so auto-spin does
+//! not allocate every frame.
 
 use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
 use texture_graph_core::color::to_srgb8;
@@ -34,7 +31,7 @@ pub struct PreviewPanelState {
     /// Baked only for a 3D graph shown on a 3D shape. Never registered with
     /// egui; only the scene pass samples it.
     pub volume: Option<VolumeOutput>,
-    /// Persistent 3D render target + its egui id; rebuilt on size change.
+    /// Rebuilt only on size change.
     pub scene: Option<Scene3d>,
     pub size: u32,
     pub shape: PreviewShape,
@@ -55,9 +52,8 @@ pub struct PreviewPanelState {
     /// A change invalidates both bake products, so switching what a node
     /// previews rebakes at once.
     last_preview_target: Option<LayerId>,
-    /// Spaces out rebakes of a product that is merely out of date; see
-    /// [`crate::throttle`]. Missing, resized or re-moded products bake at
-    /// once.
+    /// Spaces out rebakes of a product that is merely out of date. Missing,
+    /// resized or re-moded products bake at once.
     throttle: Throttle,
 }
 
@@ -71,9 +67,8 @@ pub struct GpuChannels {
     pub metallic_id: egui::TextureId,
     pub normal_id: egui::TextureId,
     pub size: u32,
-    /// Which alpha presentation this bake used: `false` = gray checker
-    /// composited (flat preview), `true` = real alpha kept (3D preview
-    /// blends the object). Mode switches rebake on mismatch.
+    /// `false`: gray checker composited (flat). `true`: real alpha kept, so
+    /// the 3D object blends. A mode switch rebakes on mismatch.
     pub object_alpha: bool,
 }
 
@@ -104,8 +99,6 @@ pub enum PreviewShape {
 }
 
 impl PreviewShape {
-    /// Whether this shape is drawn by the 3D scene renderer (everything
-    /// except `Flat`, which blits the baked channel textures directly).
     fn is_3d(self) -> bool {
         !matches!(self, PreviewShape::Flat)
     }
@@ -134,10 +127,8 @@ impl PreviewPanelState {
     }
 }
 
-/// Build the graph the preview renders for a single-node "Preview": the
-/// node's color as albedo, with default roughness/metallic/normal (a plain
-/// lit look, not the graph's real PBR channels). The Output-node preview
-/// uses the real graph unchanged.
+/// For a single-node preview: the node's color as albedo over default
+/// roughness, metallic and normal.
 fn preview_graph(graph: &Graph, id: LayerId) -> Graph {
     let mut g = graph.clone();
     g.output = Output {
@@ -157,9 +148,7 @@ pub fn show(
     eval_ctx: &EvalCtx,
     mut gpu: Option<&mut GpuBits>,
 ) {
-    // Resolve the preview target. A layer target shows just that node's
-    // color; the Output node (`None`) shows the full material. A deleted
-    // target (its layer removed) falls back to the full material.
+    // A deleted target falls back to the full material.
     let preview_target = state.preview_target.filter(|id| graph.contains(*id));
     state.preview_target = preview_target;
     if preview.last_preview_target != preview_target {
@@ -179,7 +168,6 @@ pub fn show(
     ui.horizontal(|ui| {
         ui.heading("Preview");
         ui.add_space(8.0);
-        // Shape selector (Flat / Sphere / Cube).
         let prev_shape = preview.shape;
         egui::ComboBox::from_id_salt("preview_shape")
             .selected_text(shape_label(preview.shape))
@@ -199,8 +187,7 @@ pub fn show(
                 }
             });
         if preview.shape != prev_shape {
-            // Coming back to Flat, we can drop the 3D target; going into
-            // 3D we lazily build it next frame.
+            // The 3D target is rebuilt lazily on the way back into 3D.
             if preview.shape == PreviewShape::Flat {
                 if let (Some(g), Some(scene)) = (gpu.as_ref(), preview.scene.take()) {
                     g.renderer.write().free_texture(&scene.id);
@@ -249,25 +236,20 @@ pub fn show(
     });
     ui.separator();
 
-    // Consume the dirty flag once; both bake products go stale and each
-    // rebakes when its mode needs it (the other lazily, on mode switch).
     if state.dirty {
         preview.channels_stale = true;
         preview.volume_stale = true;
         state.dirty = false;
     }
 
-    // Solid 3D sampling: when a 3D shape displays a graph that actually
-    // varies along w (`Graph::output_is_3d`), bake the graph as a volume
-    // and sample it by object-space position instead of UV-wrapping a
-    // flat slice. Falls back to the UV path if the volume bake fails.
+    // A 3D shape showing a graph that varies along w samples a baked volume
+    // by object-space position instead of UV-wrapping a flat slice. Falls
+    // back to UV if the volume bake fails.
     let want_solid = preview.shape.is_3d() && graph.output_is_3d();
     let mut solid_active = false;
     if want_solid {
         if let Some(gpu) = gpu.as_deref_mut() {
             let vol_res = preview.size.min(VOLUME_RES_CAP);
-            // A size-button change invalidates the volume like it does the
-            // flat channels: rebake when the resolution no longer matches.
             if preview.volume.as_ref().is_some_and(|v| v.size.0 != vol_res) {
                 preview.volume = None;
             }
@@ -325,11 +307,8 @@ pub fn show(
         }
     }
 
-    // 1. Ensure the flat material textures are baked (Flat mode displays
-    //    them; the UV-mapped 3D path samples them). Skipped while solid
-    //    sampling covers the 3D view — it has its own product above.
-    //    3D shapes want real alpha (the object blends); Flat wants the
-    //    gray backing checker composited in.
+    // Flat mode displays these and the UV-mapped 3D path samples them; the
+    // solid path does not need them.
     let want_object_alpha = preview.shape.is_3d();
     let must_bake = (preview.gpu_channels.is_none() && preview.texture.is_none())
         || preview
@@ -380,15 +359,13 @@ pub fn show(
         preview.channels_stale = false;
     }
 
-    // 2. In 3D mode, keep a persistent scene target + rerender each frame.
     if preview.shape.is_3d()
         && gpu.is_some()
         && (solid_active || preview.gpu_channels.is_some())
     {
-        // Rebuild the target first (borrows `preview` + `gpu` mutably).
+        // Takes `preview` and `gpu` mutably, so it runs before the split
+        // borrows below.
         ensure_scene_target(preview, gpu.as_deref_mut().unwrap());
-        // Then render into it. Split borrows: pull the pieces we need out
-        // as separate references so the borrow checker sees no overlap.
         let gpu = gpu.as_deref_mut().unwrap();
         let scene = preview.scene.as_ref().unwrap();
         if preview.auto_spin {
@@ -407,8 +384,7 @@ pub fn show(
             PreviewShape::Sphere => SceneShape::Sphere,
             PreviewShape::Cube => SceneShape::Cube,
             PreviewShape::Quad => {
-                // Look down at the ground plane from a raised 3/4 angle so
-                // the whole face is visible; auto-spin turntables it in place.
+                // Raised 3/4 view so the whole face is visible.
                 camera.pitch = 0.95;
                 camera.distance = 2.6;
                 SceneShape::Quad
@@ -444,7 +420,6 @@ pub fn show(
         }
     }
 
-    // 3. Display.
     let avail = ui.available_size();
     let side = avail.x.min(avail.y).max(64.0);
     match preview.shape {
@@ -477,20 +452,16 @@ pub fn show(
                         .fit_to_exact_size(egui::vec2(side, side))
                         .sense(egui::Sense::drag()),
                 );
-                // Drag-orbit. egui only starts a drag when the press began
-                // inside the widget, so a button already held down when the
-                // pointer enters never grabs the model.
+                // egui only starts a drag when the press began inside the
+                // widget, so a button held down on entry never grabs the model.
                 if resp.drag_started_by(egui::PointerButton::Primary) {
                     preview.auto_spin = false;
                 }
                 if resp.dragged_by(egui::PointerButton::Primary) {
                     let d = resp.drag_delta();
                     if d != egui::Vec2::ZERO {
-                        // Trackball on a large sphere: the grabbed surface
-                        // point follows the pointer. Screen-space delta
-                        // (right, down) maps to a world rotation axis
-                        // (x=down-drag, y=right-drag); magnitude scales by
-                        // the sphere radius (half the viewport).
+                        // Trackball with radius half the viewport: a down
+                        // drag rotates about x, a right drag about y.
                         let radius = (side * 0.5).max(1.0);
                         let axis = glam::Vec3::new(d.y, d.x, 0.0);
                         let angle = axis.length() / radius;
@@ -512,8 +483,6 @@ pub fn show(
     }
 }
 
-/// Create-or-reuse the persistent scene render target. Rebuilds when the
-/// panel size changes; frees the old egui id first so we don't leak.
 fn ensure_scene_target(preview: &mut PreviewPanelState, gpu: &mut GpuBits) {
     let needs_new = match &preview.scene {
         Some(s) => s.size != preview.size,

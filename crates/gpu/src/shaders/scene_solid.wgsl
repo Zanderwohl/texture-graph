@@ -1,11 +1,9 @@
-// Solid-texture material variant: the four PBR channels are 3D volumes
-// (`Baker::bake_volume`) sampled at each fragment's OBJECT-space position,
-// as if the mesh were carved out of the material. No UV seams, no pole
-// pinching — and the texture spins with the turntable because obj_pos is
-// pre-model-rotation. Appended to scene_common.wgsl.
+// Solid-texture material: 3D PBR volumes (`Baker::bake_volume`) sampled at
+// the object-space position, which is before model rotation, so the
+// texture turns with the mesh. Appended to scene_common.wgsl.
 //
-// `camera.ambient.w` maps object space into [0,1]³ texture space:
-// tex = obj_pos * ambient.w + 0.5 (sphere radius 1 → 0.5; cube side 1 → 1).
+// tex = obj_pos * camera.ambient.w + 0.5 maps object space into [0,1]³
+// (sphere radius 1 → 0.5; cube side 1 → 1).
 
 @group(0) @binding(1) var color_tex:  texture_3d<f32>;
 @group(0) @binding(2) var rough_tex:  texture_3d<f32>;
