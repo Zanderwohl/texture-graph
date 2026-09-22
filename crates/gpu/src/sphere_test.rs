@@ -442,3 +442,31 @@ fn a_sphere_bake_refuses_a_layer_moved_two_ways() {
         .err();
     assert!(matches!(refused, Some(BakeError::Unsupported(_))), "got {refused:?}");
 }
+
+/// A constant reads no position, so feeding a moved and an unmoved branch
+/// is one bake, not two. The earthlike clouds share their `zero` this way.
+#[test]
+fn a_constant_can_feed_moved_and_unmoved_branches() {
+    let mut g = Graph::new();
+    let zero = g.add_layer("zero", LayerKind::Color(oklcha(0.0, 0.0, 0.0, 1.0))).unwrap();
+    let n = g.add_layer("n", LayerKind::Noise(Noise::default())).unwrap();
+    let weather = blend(&mut g, "weather", zero, n, 0.5);
+    let moved = g
+        .add_layer(
+            "moved",
+            LayerKind::Transform(Transform {
+                source: Some(weather),
+                offset: [0.0, 0.5, 0.0],
+                rotate_uv: 0.0,
+                scale: [1.0, 1.8, 1.0],
+                coord_mode: CoordMode::Passthrough,
+                edge_mode: EdgeMode::Extend,
+            }),
+        )
+        .unwrap();
+    let out = blend(&mut g, "out", zero, moved, 0.5);
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    Baker::new(ctx)
+        .bake_scalar_cube(&g, out, 8, ScalarFormat::R8Unorm, &EvalCtx::default())
+        .expect("one placement for the constant");
+}

@@ -42,8 +42,16 @@ pub(crate) enum Placement {
 /// Every layer `root` depends on, and where it bakes.
 pub(crate) fn plan(graph: &Graph, root: LayerId) -> Result<HashMap<LayerId, Placement>, BakeError> {
     let mut placed = HashMap::new();
+    let mut positional = HashMap::new();
     let mut stack = vec![(root, Placement::Sphere(IDENTITY))];
     while let Some((id, at)) = stack.pop() {
+        // What reads no position is the same wherever it bakes, as a constant feeding two
+        // differently moved branches is.
+        let at = if is_positional(graph, id, &mut positional) {
+            at
+        } else {
+            Placement::Sphere(IDENTITY)
+        };
         if let Some(&before) = placed.get(&id) {
             if before != at {
                 return Err(BakeError::Unsupported(
@@ -95,6 +103,29 @@ pub(crate) fn plan(graph: &Graph, root: LayerId) -> Result<HashMap<LayerId, Plac
         }
     }
     Ok(placed)
+}
+
+/// Whether `id`'s value depends on where it is sampled.
+fn is_positional(graph: &Graph, id: LayerId, memo: &mut HashMap<LayerId, bool>) -> bool {
+    if let Some(&known) = memo.get(&id) {
+        return known;
+    }
+    let Some(layer) = graph.get(id) else {
+        // An unconnected input reads the missing-texture grid, which is positional.
+        return true;
+    };
+    let own = matches!(
+        layer.kind,
+        LayerKind::Noise(_)
+            | LayerKind::Coordinate(_)
+            | LayerKind::ColorRamp(_)
+            | LayerKind::Transform(_)
+            | LayerKind::Warp(_)
+            | LayerKind::HeightToNormal(_)
+    );
+    let answer = own || layer.kind.inputs().into_iter().any(|i| is_positional(graph, i, memo));
+    memo.insert(id, answer);
+    answer
 }
 
 /// `apply_transform` in `core::eval`, for [`CoordMode::Passthrough`]:
