@@ -372,17 +372,19 @@ fn apply_transform(t: &Transform, s: Sample) -> Sample {
 }
 
 fn eval_mix(m: &Mix, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &EvalCtx) -> Color {
+    use palette::convert::IntoColorUnclamped;
     use palette::{IntoColor, LinSrgb, Oklab, Oklch, WithAlpha};
     let a = eval_opt(m.a, s, by_id, ctx);
     let b = eval_opt(m.b, s, by_id, ctx);
     match m.mode {
         // Oklab, where chroma is a Cartesian (a, b) vector that sums.
+        // Unclamped to match the GPU; `into_color` clamps L to [0, 1].
         BlendMode::Add | BlendMode::Subtract => {
             let sign = if matches!(m.mode, BlendMode::Add) { 1.0 } else { -1.0 };
-            let al: Oklab = a.color.into_color();
-            let bl: Oklab = b.color.into_color();
+            let al: Oklab = a.color.into_color_unclamped();
+            let bl: Oklab = b.color.into_color_unclamped();
             let combined = Oklab::new(al.l + sign * bl.l, al.a + sign * bl.a, al.b + sign * bl.b);
-            let back: Oklch = combined.into_color();
+            let back: Oklch = combined.into_color_unclamped();
             back.with_alpha(a.alpha)
         }
         // Linear sRGB, for optical darkening.
@@ -902,6 +904,21 @@ mod tests {
     use super::*;
     use crate::color::{BlendSpace, oklcha};
     use crate::kind::{ColorStop, LayerKind};
+
+    /// A sum past 1 and a difference below 0 survive, as on the GPU.
+    #[test]
+    fn add_and_subtract_leave_l_unclamped() {
+        let mut g = Graph::new();
+        let a = g.add_layer("a", LayerKind::Color(oklcha(0.7, 0.0, 0.0, 1.0))).unwrap();
+        let b = g.add_layer("b", LayerKind::Color(oklcha(0.9, 0.0, 0.0, 1.0))).unwrap();
+        let mix = |mode| Mix { a: Some(a), b: Some(b), mode, factor: ScalarInput::Const(0.0), space: BlendSpace::Oklch };
+        let sum = g.add_layer("sum", LayerKind::Mix(mix(BlendMode::Add))).unwrap();
+        let diff = g.add_layer("diff", LayerKind::Mix(mix(BlendMode::Subtract))).unwrap();
+        let at = Sample::new(0.5, 0.5, 0.5);
+        let ctx = EvalCtx::default();
+        assert!((evaluate(&g, sum, at, &ctx).l - 1.6).abs() < 1e-5);
+        assert!((evaluate(&g, diff, at, &ctx).l + 0.2).abs() < 1e-5);
+    }
 
     #[test]
     fn evaluate_default_material_matches_placeholder_color() {

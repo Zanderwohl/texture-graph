@@ -6,6 +6,8 @@ pub mod color_convert;
 pub mod file_io;
 pub mod panels;
 pub mod previews;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod screenshot;
 pub mod state;
 pub mod throttle;
 pub mod widgets;

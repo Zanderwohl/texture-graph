@@ -431,11 +431,11 @@ fn map_gray_value_through_bw_ramp_matches_ramp_lookup() {
     }).unwrap();
     let out = baker.bake_output(&graph, (16, 16), &EvalCtx::default(), false).expect("bake map");
     let px = readback_first_pixel(&ctx, &out.color);
-    // t = 0.5 lands on palette column 8, whose center is u = 0.53125.
-    let expected = to_srgb8(Color::new(0.53125, 0.0, 0.0, 1.0));
+    // t = 0.5 is halfway between the centers of palette columns 7 and 8.
+    let expected = to_srgb8(Color::new(0.5, 0.0, 0.0, 1.0));
     for i in 0..3 {
         let d = (expected[i] as i32 - px[i] as i32).abs();
-        assert!(d <= 3, "map channel {i}: expect {} got {} (delta {d})", expected[i], px[i]);
+        assert!(d <= 1, "map channel {i}: expect {} got {} (delta {d})", expected[i], px[i]);
     }
 }
 
