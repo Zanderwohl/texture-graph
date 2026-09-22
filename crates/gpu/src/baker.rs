@@ -24,13 +24,15 @@ use texture_graph_core::EdgeMode;
 use crate::device::DeviceCtx;
 use crate::sphere::{self, Placement, PointMap};
 use crate::schedule::{
-    Domain, OutputSlots, ScalarSlot, Schedule, schedule, schedule_layer, schedule_previews,
+    Domain, IdList, OutputSlots, ScalarSlot, Schedule, schedule, schedule_layer,
+    schedule_previews,
 };
 
 const MAX_RAMP_STOPS: usize = 16;
 /// Filterable on WebGPU, and unclamped, so a height past `[0, 1]` keeps its
 /// slope.
 const BUMP_FORMAT: ScalarFormat = ScalarFormat::R16Float;
+const POOL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 /// Bindings are declared at pipeline creation, so this is a hard cap.
 const MAX_RAMP_INPUTS: usize = 8;
 
@@ -92,6 +94,7 @@ pub struct VolumeJob {
     volumes: Vec<wgpu::Texture>,
     chan_doms: [[f32; 4]; 4],
     bump: Option<BumpJob>,
+    started: BakeTimer,
 }
 
 impl VolumeJob {
@@ -310,6 +313,7 @@ impl Baker {
         let (pack_pipeline, pack_bgl) = make_pack_pipeline(&ctx.device);
         let (solid_pipeline, solid_bgl) = make_solid_pipeline(&ctx.device);
         let (scalar_shader, scalar_bgl) = make_scalar_pack_shader(&ctx.device);
+        log::debug!("baker created compute_pipelines=14 pool_format={:?}", POOL_FORMAT);
         Self {
             ctx,
             pool: Vec::new(),
@@ -362,10 +366,19 @@ impl Baker {
         wanted: Option<&HashSet<LayerId>>,
     ) -> Result<HashMap<LayerId, wgpu::Texture>, BakeError> {
         const PREVIEW_SIZE: (u32, u32) = (128, 128);
+        let t0 = BakeTimer::start();
+        log::debug!(
+            "bake_previews start size={}x{} wanted={:?} graph_layers={}",
+            PREVIEW_SIZE.0,
+            PREVIEW_SIZE.1,
+            wanted.map(|w| w.len()),
+            graph.layers.len(),
+        );
         let eval_ctx = &graph.resolve_params(eval_ctx);
         let sched = schedule_previews(graph, wanted, eval_ctx)?;
         let size = PREVIEW_SIZE;
         let device = self.ctx.device.clone();
+        log_dispatches(graph, &sched, eval_ctx);
 
         // Not `self.pool`, which is sized to the output resolution.
         let mut inter_texs: Vec<wgpu::Texture> =
@@ -406,6 +419,14 @@ impl Baker {
             output_views.insert(id, view);
             outputs.insert(id, tex);
         }
+        log::debug!(
+            "bake_previews alloc inter={} format={:?} out={} size={}x{}",
+            sched.peak_slots,
+            POOL_FORMAT,
+            packed.len(),
+            size.0,
+            size.1,
+        );
 
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -456,6 +477,12 @@ impl Baker {
         }
 
         self.ctx.queue.submit([encoder.finish()]);
+        log::debug!(
+            "bake_previews done layers={} packed={} record+submit={:?}",
+            sched.order.len(),
+            packed.len(),
+            t0.elapsed(),
+        );
         Ok(outputs)
     }
 
@@ -473,6 +500,12 @@ impl Baker {
         missing_view: &wgpu::TextureView,
     ) -> Result<(), BakeError> {
         let w = at.w();
+        log::trace!(
+            "dispatch layer id={} kind={} slot={dst_slot} w={w} face={}",
+            layer.id,
+            layer.kind.category_label(),
+            at.face_code(),
+        );
         let resolve = |opt: Option<texture_graph_core::LayerId>| -> &wgpu::TextureView {
             match opt {
                 Some(id) => &pool_views[slot_of(sched, id) as usize],
@@ -672,6 +705,12 @@ impl Baker {
             }
             LayerKind::ColorRamp(r) => {
                 if r.stops.len() > MAX_RAMP_STOPS {
+                    log::debug!(
+                        "dispatch unsupported id={} name={:?} stops={} max={MAX_RAMP_STOPS}",
+                        layer.id,
+                        layer.name,
+                        r.stops.len(),
+                    );
                     return Err(BakeError::Unsupported("ColorRamp (>16 stops)"));
                 }
                 dispatch_ramp(
@@ -687,7 +726,14 @@ impl Baker {
                     &self.dummy_input_view,
                     size,
                     own_dom,
-                )?;
+                )
+                .inspect_err(|e| {
+                    log::debug!(
+                        "dispatch unsupported id={} name={:?} err={e}",
+                        layer.id,
+                        layer.name,
+                    );
+                })?;
             }
         }
         Ok(())
@@ -696,6 +742,14 @@ impl Baker {
     fn ensure_pool(&mut self, size: (u32, u32), needed: u32) {
         let resize = self.pool_size != size;
         if resize {
+            log::debug!(
+                "pool resize from={}x{} to={}x{} dropped={}",
+                self.pool_size.0,
+                self.pool_size.1,
+                size.0,
+                size.1,
+                self.pool.len(),
+            );
             self.pool.clear();
             self.pool_views.clear();
             self.pool_size = size;
@@ -706,6 +760,16 @@ impl Baker {
             let (tex, view) = make_missing_texture(&self.ctx.device, size);
             self.missing_tex = Some(tex);
             self.missing_view = Some(view);
+        }
+        if self.pool.len() < needed as usize {
+            log::debug!(
+                "pool grow from={} to={needed} size={}x{} format={:?} bytes≈{}MiB",
+                self.pool.len(),
+                size.0,
+                size.1,
+                POOL_FORMAT,
+                (needed as u64) * (size.0 as u64) * (size.1 as u64) * 16 / (1024 * 1024),
+            );
         }
         while self.pool.len() < needed as usize {
             let tex = make_pool_texture(&self.ctx.device, size);
@@ -727,10 +791,18 @@ impl Baker {
         object_alpha: bool,
     ) -> Result<BakeOutput, BakeError> {
         let t0 = BakeTimer::start();
+        log::debug!(
+            "bake_output start size={}x{} object_alpha={object_alpha} seed={} graph_layers={}",
+            size.0,
+            size.1,
+            eval_ctx.seed,
+            graph.layers.len(),
+        );
         // After this, a `Param` socket is a constant.
         let eval_ctx = &graph.resolve_params(eval_ctx);
         let sched = schedule(graph, eval_ctx)?;
         self.ensure_pool(size, sched.peak_slots.max(1));
+        log_dispatches(graph, &sched, eval_ctx);
 
         let mut encoder = self
             .ctx
@@ -884,9 +956,17 @@ impl Baker {
         format: ScalarFormat,
         eval_ctx: &EvalCtx,
     ) -> Result<wgpu::Texture, BakeError> {
+        let t0 = BakeTimer::start();
+        log::debug!(
+            "bake_scalar start layer={layer} size={}x{} format={format:?} seed={}",
+            size.0,
+            size.1,
+            eval_ctx.seed,
+        );
         let eval_ctx = &graph.resolve_params(eval_ctx);
         let sched = schedule_layer(graph, layer)?;
         self.ensure_pool(size, sched.peak_slots.max(1));
+        log_dispatches(graph, &sched, eval_ctx);
 
         let device = self.ctx.device.clone();
         let dst = make_scalar_texture(&device, size, format, "tg-scalar");
@@ -905,6 +985,13 @@ impl Baker {
             eval_ctx,
         )?;
         self.ctx.queue.submit([encoder.finish()]);
+        log::debug!(
+            "bake_scalar {}x{} ({format:?}): layers={} record+submit={:?}",
+            size.0,
+            size.1,
+            sched.order.len(),
+            t0.elapsed(),
+        );
         Ok(dst)
     }
 
@@ -921,10 +1008,16 @@ impl Baker {
         eval_ctx: &EvalCtx,
     ) -> Result<ScalarVolume, BakeError> {
         let t0 = BakeTimer::start();
+        log::debug!(
+            "bake_scalar_volume start layer={layer} res={res} depth={depth} format={format:?} \
+             seed={}",
+            eval_ctx.seed,
+        );
         let eval_ctx = &graph.resolve_params(eval_ctx);
         let sched = schedule_layer(graph, layer)?;
         let size = (res, res);
         self.ensure_pool(size, sched.peak_slots.max(1));
+        log_dispatches(graph, &sched, eval_ctx);
 
         let device = self.ctx.device.clone();
         // WebGPU has no 2D view of a 3D texture, so render to a 2D slice and
@@ -939,6 +1032,7 @@ impl Baker {
                     label: Some("tg-bake-scalar-volume"),
                 });
             let w = (z as f32 + 0.5) / depth as f32;
+            log::trace!("bake_scalar_volume slice z={z} w={w}");
             self.record_scalar_slice(
                 &mut encoder, graph, &sched, layer, size, &|_| Slice::Plane { w }, format,
                 &slice_view,
@@ -986,10 +1080,17 @@ impl Baker {
         eval_ctx: &EvalCtx,
     ) -> Result<ScalarCube, BakeError> {
         let t0 = BakeTimer::start();
+        log::debug!(
+            "bake_scalar_cube start layer={layer} face={face} format={format:?} seed={}",
+            eval_ctx.seed,
+        );
         let eval_ctx = &graph.resolve_params(eval_ctx);
-        let (sched, placed) = Self::sphere_schedule(graph, layer)?;
+        let (sched, placed) = Self::sphere_schedule(graph, layer).inspect_err(|e| {
+            log::debug!("bake_scalar_cube unsupported err={e}");
+        })?;
         let size = (face, face);
         self.ensure_pool(size, sched.peak_slots.max(1));
+        log_dispatches(graph, &sched, eval_ctx);
 
         let device = self.ctx.device.clone();
         let slice = make_scalar_texture(&device, size, format, "tg-scalar-cube-face");
@@ -997,6 +1098,7 @@ impl Baker {
         let texture = make_scalar_cube_texture(&device, face, format, "tg-scalar-cube");
 
         for k in 0..texture_graph_core::CUBE_FACES {
+            log::trace!("bake_scalar_cube face k={k}");
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("tg-bake-scalar-cube"),
             });
@@ -1107,14 +1209,18 @@ impl Baker {
         eval_ctx: &EvalCtx,
     ) -> Result<ColorCube, BakeError> {
         let t0 = BakeTimer::start();
+        log::debug!("bake_color_cube start face={face} seed={}", eval_ctx.seed);
         let eval_ctx = &graph.resolve_params(eval_ctx);
         let root = graph
             .output
             .color
             .ok_or(BakeError::Unsupported("a color cube of a graph with no color output"))?;
-        let (sched, placed) = Self::sphere_schedule(graph, root)?;
+        let (sched, placed) = Self::sphere_schedule(graph, root).inspect_err(|e| {
+            log::debug!("bake_color_cube unsupported err={e}");
+        })?;
         let size = (face, face);
         self.ensure_pool(size, sched.peak_slots.max(1));
+        log_dispatches(graph, &sched, eval_ctx);
 
         let device = self.ctx.device.clone();
         let slice = make_output_texture(&device, size, "tg-color-cube-face");
@@ -1175,6 +1281,11 @@ impl Baker {
     /// Returns a clone (an `Arc` bump) so `self` is not borrowed afterwards.
     fn scalar_pipeline(&mut self, format: ScalarFormat) -> wgpu::RenderPipeline {
         let tf = format.texture_format();
+        if self.scalar_pipelines.contains_key(&tf) {
+            log::trace!("scalar pipeline reused format={tf:?}");
+        } else {
+            log::debug!("scalar pipeline compiled format={tf:?} shader=pack_scalar.wgsl");
+        }
         self.scalar_pipelines
             .entry(tf)
             .or_insert_with(|| {
@@ -1220,10 +1331,25 @@ impl Baker {
         depth: u32,
         eval_ctx: &EvalCtx,
     ) -> Result<VolumeJob, BakeError> {
+        let started = BakeTimer::start();
+        log::debug!(
+            "begin_volume start res={res} depth={depth} seed={} graph_layers={}",
+            eval_ctx.seed,
+            graph.layers.len(),
+        );
         let eval_ctx = graph.resolve_params(eval_ctx);
         let sched = schedule(graph, &eval_ctx)?;
         let size = (res, res);
         let device = &self.ctx.device;
+        log_dispatches(graph, &sched, &eval_ctx);
+        log::debug!(
+            "begin_volume alloc pool={} format={:?} size={res}x{res} slices=4 volumes=4 \
+             volume_format={:?} volume_bytes≈{}MiB",
+            sched.peak_slots.max(1),
+            POOL_FORMAT,
+            wgpu::TextureFormat::Rgba8Unorm,
+            4 * (res as u64) * (res as u64) * (depth as u64) * 4 / (1024 * 1024),
+        );
 
         let pool: Vec<wgpu::Texture> =
             (0..sched.peak_slots.max(1)).map(|_| make_pool_texture(device, size)).collect();
@@ -1296,6 +1422,7 @@ impl Baker {
             volumes,
             chan_doms,
             bump,
+            started,
         })
     }
 
@@ -1419,13 +1546,23 @@ impl Baker {
             job.next_z = z + 1;
         }
 
-        log::debug!(
+        log::trace!(
             "bake_volume {}³ slices {first}..{}: layers/slice={} record+submit={:?}",
             job.res,
             job.next_z,
             job.sched.order.len(),
             t0.elapsed(),
         );
+        if job.is_done() && first < job.next_z {
+            log::debug!(
+                "bake_volume {}x{}x{} done: layers/slice={} since_begin={:?}",
+                job.res,
+                job.res,
+                job.depth,
+                job.sched.order.len(),
+                job.started.elapsed(),
+            );
+        }
         Ok(job.is_done())
     }
 }
@@ -2573,6 +2710,49 @@ fn dispatch_solid(
     cpass.dispatch_workgroups(wg_x, wg_y, 1);
 }
 
+/// The shader a layer kind dispatches, for logs.
+fn pipeline_name(kind: &LayerKind) -> &'static str {
+    match kind {
+        LayerKind::Color(_) => "color.wgsl",
+        LayerKind::Noise(_) => "noise.wgsl",
+        LayerKind::Coordinate(_) => "coordinate.wgsl",
+        LayerKind::Transform(_) => "transform.wgsl",
+        LayerKind::Mix(_) => "mix.wgsl",
+        LayerKind::Map(_) => "map.wgsl",
+        LayerKind::MinMax(_) => "min_max.wgsl",
+        LayerKind::HeightToNormal(_) => "height_to_normal.wgsl",
+        LayerKind::Warp(_) => "warp.wgsl",
+        LayerKind::Wave(_) => "wave.wgsl",
+        LayerKind::ColorRamp(_) => "color_ramp.wgsl",
+    }
+}
+
+/// One line per layer a bake will dispatch, logged once per bake rather
+/// than per slice.
+fn log_dispatches(graph: &Graph, sched: &Schedule, eval_ctx: &EvalCtx) {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+    for &id in &sched.order {
+        let Some(layer) = graph.get(id) else { continue };
+        let params: Vec<String> = layer
+            .kind
+            .param_refs()
+            .iter()
+            .map(|(name, _)| format!("{name}={:?}", eval_ctx.params.get(*name)))
+            .collect();
+        log::debug!(
+            "dispatch layer id={id} name={:?} kind={} pipeline={} slot={} inputs={} params=[{}]",
+            layer.name,
+            layer.kind.category_label(),
+            pipeline_name(&layer.kind),
+            slot_of(sched, id),
+            IdList(&layer.kind.inputs()),
+            params.join(", "),
+        );
+    }
+}
+
 /// Wall-clock for the bake timing logs. Absent on wasm, where
 /// `std::time::Instant::now()` compiles and then panics.
 #[derive(Copy, Clone)]
@@ -2644,7 +2824,7 @@ fn make_pool_texture(device: &wgpu::Device, size: (u32, u32)) -> wgpu::Texture {
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba32Float,
+        format: POOL_FORMAT,
         usage: wgpu::TextureUsages::STORAGE_BINDING
             | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_SRC,

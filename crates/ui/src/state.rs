@@ -6,7 +6,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use texture_graph_core::{ConstValue, Graph, InputKey, LayerId, LayerKind, Output, ParamDecl};
+use texture_graph_core::{
+    ConstValue, Graph, InputKey, InputSocket, LayerId, LayerKind, Output, ParamDecl, SocketValue,
+};
 
 /// UI-only state (not persisted with the graph).
 #[derive(Debug)]
@@ -188,6 +190,11 @@ impl UiState {
         let mut changed = false;
         let mut refused = false;
         let mut evaluated = false;
+        // The quietest level any landed edit was logged at, so a batch of
+        // per-frame drags summarizes at trace.
+        let mut batch_level = log::Level::Trace;
+        let mut all_dirty = false;
+        let mut dirty_count = 0usize;
         for cmd in std::mem::take(&mut self.pending) {
             let affects_eval = cmd.affects_evaluation();
             let roots = affects_eval.then(|| dirty_roots(&cmd)).flatten();
@@ -199,9 +206,13 @@ impl UiState {
                 downstream(graph, roots.iter().copied(), &mut dirty);
             }
             let localized = !affects_eval || roots.is_some();
+            let label = cmd.label();
             match self.apply(cmd, graph) {
-                Ok(()) => {
+                Ok(level) => {
                     changed = true;
+                    if affects_eval {
+                        batch_level = batch_level.min(level);
+                    }
                     evaluated |= affects_eval;
                     if affects_eval {
                         self.dirty = true;
@@ -210,15 +221,18 @@ impl UiState {
                         downstream(graph, roots.iter().copied(), &mut dirty);
                     }
                     if localized {
+                        dirty_count += dirty.len();
                         // `None` already means "all of them"; nothing to add.
                         if let Some(known) = &mut self.dirty_previews {
                             known.extend(dirty);
                         }
                     } else {
+                        all_dirty = true;
                         self.dirty_previews = None;
                     }
                 }
                 Err(e) => {
+                    log::debug!("edit refused cmd={label} error={e:?}");
                     refused = true;
                     self.last_error = Some(e);
                 }
@@ -226,6 +240,20 @@ impl UiState {
         }
         if evaluated {
             self.revision += 1;
+            if log::log_enabled!(batch_level) {
+                let pending = match &self.dirty_previews {
+                    None => "all".to_string(),
+                    Some(ids) => ids.len().to_string(),
+                };
+                log::log!(
+                    batch_level,
+                    "previews dirty revision={} reason={} layers={} pending={}",
+                    self.revision,
+                    if all_dirty { "global" } else { "local" },
+                    if all_dirty { "all".to_string() } else { dirty_count.to_string() },
+                    pending,
+                );
+            }
         }
         // A refusal stays shown until an edit lands cleanly.
         if changed && !refused {
@@ -253,17 +281,30 @@ impl UiState {
     /// Apply one command. Here rather than on [`EditCmd`] because of the
     /// UI-side bookkeeping: a removed layer must stop being the selection,
     /// the preview target and a `saved_consts` key.
-    fn apply(&mut self, cmd: EditCmd, graph: &mut Graph) -> Result<(), String> {
+    ///
+    /// Returns the level the edit was logged at: trace for the ones a drag
+    /// sends every frame, debug for the rest.
+    fn apply(&mut self, cmd: EditCmd, graph: &mut Graph) -> Result<log::Level, String> {
+        let logging = log::log_enabled!(log::Level::Debug);
         match cmd {
             EditCmd::AddLayer { name, kind, pos } => {
                 let id = graph.add_layer(name, kind).map_err(|e| e.to_string())?;
                 self.selected = Some(id);
-                if let Some((canvas, pos)) = pos {
+                if let Some((canvas, pos)) = &pos {
                     // The layer exists either way; a vanished canvas just
                     // leaves it unplaced.
-                    let _ = graph.set_position(&canvas, id, pos);
+                    let _ = graph.set_position(canvas, id, *pos);
                 }
-                Ok(())
+                if let Some(layer) = graph.get(id) {
+                    log::debug!(
+                        "add layer id={} name={:?} kind={} canvas={:?}",
+                        id.0,
+                        layer.name,
+                        layer.kind.category_label(),
+                        pos.as_ref().map(|(c, _)| c.as_str()),
+                    );
+                }
+                Ok(log::Level::Debug)
             }
             EditCmd::Remove(id) => {
                 if self.selected == Some(id) {
@@ -276,43 +317,216 @@ impl UiState {
                     self.renaming = None;
                 }
                 self.saved_consts.retain(|(n, _), _| *n != NodeRef::Layer(id));
-                graph.remove(id).map_err(|e| e.to_string())
+                let name = logging.then(|| graph.get(id).map(|l| l.name.clone())).flatten();
+                graph.remove(id).map_err(|e| e.to_string())?;
+                log::debug!("remove layer id={} name={:?}", id.0, name.unwrap_or_default());
+                Ok(log::Level::Debug)
             }
-            EditCmd::Rename(id, new) => graph.rename(id, new).map_err(|e| e.to_string()),
-            EditCmd::SetKind(id, k) => graph.set_kind(id, k).map_err(|e| e.to_string()),
-            EditCmd::SetOutput(o) => graph.set_output(o).map_err(|e| e.to_string()),
+            EditCmd::Rename(id, new) => {
+                let old = logging.then(|| graph.get(id).map(|l| l.name.clone())).flatten();
+                graph.rename(id, new).map_err(|e| e.to_string())?;
+                log::debug!(
+                    "rename layer id={} from={:?} to={:?}",
+                    id.0,
+                    old.unwrap_or_default(),
+                    graph.get(id).map_or("", |l| l.name.as_str()),
+                );
+                Ok(log::Level::Debug)
+            }
+            EditCmd::SetKind(id, k) => {
+                let old = logging.then(|| graph.get(id).map(|l| l.kind.clone())).flatten();
+                graph.set_kind(id, k).map_err(|e| e.to_string())?;
+                Ok(match (old, graph.get(id)) {
+                    (Some(old), Some(layer)) => log_kind_change(id, &old, &layer.kind),
+                    _ => log::Level::Trace,
+                })
+            }
+            EditCmd::SetOutput(o) => {
+                let old = logging.then(|| graph.output.input_sockets());
+                graph.set_output(o).map_err(|e| e.to_string())?;
+                Ok(match old {
+                    Some(old) => {
+                        let new = graph.output.input_sockets();
+                        let noted = log_socket_changes("output", &old, &new);
+                        if noted {
+                            log::Level::Debug
+                        } else {
+                            log::trace!("set output values");
+                            log::Level::Trace
+                        }
+                    }
+                    None => log::Level::Trace,
+                })
+            }
             EditCmd::SetListPos(id, to) => {
-                graph.set_list_position(id, to).map_err(|e| e.to_string())
+                graph.set_list_position(id, to).map_err(|e| e.to_string())?;
+                log::debug!("move layer in list id={} to={}", id.0, to);
+                Ok(log::Level::Debug)
             }
             EditCmd::SetPos { canvas, id, pos } => {
-                graph.set_position(&canvas, id, pos).map_err(|e| e.to_string())
+                graph.set_position(&canvas, id, pos).map_err(|e| e.to_string())?;
+                log::trace!("set position layer id={} canvas={:?} pos={:?}", id.0, canvas, pos);
+                Ok(log::Level::Trace)
             }
-            EditCmd::SetOutputPos { canvas, pos } => graph
-                .set_output_position(&canvas, pos)
-                .map_err(|e| e.to_string()),
-            EditCmd::AddCanvas(name) => graph.add_canvas(name).map_err(|e| e.to_string()),
+            EditCmd::SetOutputPos { canvas, pos } => {
+                graph.set_output_position(&canvas, pos).map_err(|e| e.to_string())?;
+                log::trace!("set position output canvas={:?} pos={:?}", canvas, pos);
+                Ok(log::Level::Trace)
+            }
+            EditCmd::AddCanvas(name) => {
+                let logged = logging.then(|| name.clone());
+                graph.add_canvas(name).map_err(|e| e.to_string())?;
+                log::debug!("add canvas name={:?}", logged.unwrap_or_default());
+                Ok(log::Level::Debug)
+            }
             EditCmd::RemoveCanvas(name) => {
-                graph.remove_canvas(&name).map_err(|e| e.to_string())
+                graph.remove_canvas(&name).map_err(|e| e.to_string())?;
+                log::debug!("remove canvas name={:?}", name);
+                Ok(log::Level::Debug)
             }
             EditCmd::Replace(new) => {
                 *graph = new;
                 self.reset_for_new_graph();
-                Ok(())
+                log::debug!(
+                    "replace graph layers={} params={}",
+                    graph.layers.len(),
+                    graph.params.len()
+                );
+                Ok(log::Level::Debug)
             }
             EditCmd::DeclareParam(decl) => {
-                graph.declare_param(decl).map_err(|e| e.to_string())
+                let logged = logging.then(|| (decl.name.clone(), decl.kind.label()));
+                graph.declare_param(decl).map_err(|e| e.to_string())?;
+                if let Some((name, kind)) = logged {
+                    log::debug!("declare param name={:?} kind={}", name, kind);
+                }
+                Ok(log::Level::Debug)
             }
             EditCmd::SetParamDecl(name, decl) => {
-                graph.set_param_decl(&name, decl).map_err(|e| e.to_string())
+                graph.set_param_decl(&name, decl).map_err(|e| e.to_string())?;
+                log::trace!("set param decl name={:?}", name);
+                Ok(log::Level::Trace)
             }
             EditCmd::RenameParam { from, to } => {
-                graph.rename_param(&from, &to).map_err(|e| e.to_string())
+                graph.rename_param(&from, &to).map_err(|e| e.to_string())?;
+                log::debug!("rename param from={:?} to={:?}", from, to);
+                Ok(log::Level::Debug)
             }
             EditCmd::RemoveParam(name) => {
-                graph.remove_param(&name).map_err(|e| e.to_string())
+                graph.remove_param(&name).map_err(|e| e.to_string())?;
+                log::debug!("remove param name={:?}", name);
+                Ok(log::Level::Debug)
             }
         }
     }
+}
+
+/// Where a socket reads from, stripped of constant values so tweaking one
+/// doesn't register as a rewire.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Source<'a> {
+    Const,
+    Layer(LayerId),
+    Param(&'a str),
+}
+
+fn source(v: &SocketValue) -> Source<'_> {
+    if let Some(id) = v.connected_to() {
+        Source::Layer(id)
+    } else if let Some(name) = v.bound_param() {
+        Source::Param(name)
+    } else {
+        Source::Const
+    }
+}
+
+/// Logs each rewired socket at debug; returns whether there was any.
+fn log_socket_changes(node: &str, old: &[InputSocket], new: &[InputSocket]) -> bool {
+    let mut noted = false;
+    for n in new {
+        let Some(o) = old.iter().find(|o| o.key == n.key) else { continue };
+        let (from, to) = (source(&o.value), source(&n.value));
+        if from == to {
+            continue;
+        }
+        noted = true;
+        match (from, to) {
+            (Source::Layer(a), Source::Layer(b)) => log::debug!(
+                "rebind input node={node} input={:?} from={} to={}",
+                n.key,
+                a.0,
+                b.0
+            ),
+            (_, Source::Layer(b)) => {
+                log::debug!("connect input node={node} input={:?} from={}", n.key, b.0)
+            }
+            (_, Source::Param(p)) => {
+                log::debug!("bind param node={node} input={:?} param={:?}", n.key, p)
+            }
+            (Source::Layer(a), Source::Const) => {
+                log::debug!("disconnect input node={node} input={:?} from={}", n.key, a.0)
+            }
+            (Source::Param(p), Source::Const) => {
+                log::debug!("freeze param node={node} input={:?} param={:?}", n.key, p)
+            }
+            (Source::Const, Source::Const) => {}
+        }
+    }
+    noted
+}
+
+/// Debug for anything structural (kind, wiring, parameter binding, stop
+/// count), trace for a value tweak, which a slider sends every frame.
+fn log_kind_change(id: LayerId, old: &LayerKind, new: &LayerKind) -> log::Level {
+    if old.category_label() != new.category_label() {
+        log::debug!(
+            "set kind layer id={} from={} to={}",
+            id.0,
+            old.category_label(),
+            new.category_label()
+        );
+        return log::Level::Debug;
+    }
+    let node = format!("layer:{}", id.0);
+    let (mut old_s, mut new_s) = (old.input_sockets(), new.input_sockets());
+    let mut reordered = false;
+    if let (LayerKind::ColorRamp(a), LayerKind::ColorRamp(b)) = (old, new) {
+        // Stop keys are positional. The ramp bar logs inserts, removals and
+        // reorders; diffing shifted indices would only report bogus rewires.
+        let (sa, sb) = (sources(&old_s), sources(&new_s));
+        if a.stops.len() != b.stops.len() || (sa != sb && same_multiset(&sa, &sb)) {
+            old_s.retain(|s| !matches!(s.key, InputKey::RampStop(_)));
+            new_s.retain(|s| !matches!(s.key, InputKey::RampStop(_)));
+            if a.stops.len() != b.stops.len() {
+                log::debug!(
+                    "ramp stops layer id={} from={} to={}",
+                    id.0,
+                    a.stops.len(),
+                    b.stops.len()
+                );
+                log_socket_changes(&node, &old_s, &new_s);
+                return log::Level::Debug;
+            }
+            reordered = true;
+        }
+    }
+    if log_socket_changes(&node, &old_s, &new_s) || reordered {
+        log::Level::Debug
+    } else {
+        log::trace!("set kind values layer id={}", id.0);
+        log::Level::Trace
+    }
+}
+
+fn sources(sockets: &[InputSocket]) -> Vec<Source<'_>> {
+    sockets.iter().map(|s| source(&s.value)).collect()
+}
+
+fn same_multiset(a: &[Source<'_>], b: &[Source<'_>]) -> bool {
+    let mut rest: Vec<_> = b.to_vec();
+    a.iter().all(|x| {
+        rest.iter().position(|y| y == x).map(|i| rest.swap_remove(i)).is_some()
+    }) && rest.is_empty()
 }
 
 /// The layers an edit changes the value *of*, before consumers are folded
@@ -391,6 +605,26 @@ pub enum EditCmd {
 }
 
 impl EditCmd {
+    fn label(&self) -> &'static str {
+        match self {
+            EditCmd::AddLayer { .. } => "add_layer",
+            EditCmd::Remove(_) => "remove",
+            EditCmd::Rename(_, _) => "rename",
+            EditCmd::SetKind(_, _) => "set_kind",
+            EditCmd::SetOutput(_) => "set_output",
+            EditCmd::SetListPos(_, _) => "set_list_pos",
+            EditCmd::SetPos { .. } => "set_pos",
+            EditCmd::SetOutputPos { .. } => "set_output_pos",
+            EditCmd::AddCanvas(_) => "add_canvas",
+            EditCmd::RemoveCanvas(_) => "remove_canvas",
+            EditCmd::Replace(_) => "replace",
+            EditCmd::DeclareParam(_) => "declare_param",
+            EditCmd::SetParamDecl(_, _) => "set_param_decl",
+            EditCmd::RenameParam { .. } => "rename_param",
+            EditCmd::RemoveParam(_) => "remove_param",
+        }
+    }
+
     /// Whether this can change what the baker produces. Layout-only edits
     /// must not flip `dirty`: dragging a node emits `SetPos` every frame,
     /// and rebaking on each would make thumbnails flash.

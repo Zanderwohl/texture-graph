@@ -55,6 +55,9 @@ pub struct PreviewPanelState {
     /// Spaces out rebakes of a product that is merely out of date. Missing,
     /// resized or re-moded products bake at once.
     throttle: Throttle,
+    /// A failed volume bake is retried every frame; only the first failure
+    /// of a run is logged.
+    volume_failing: bool,
 }
 
 pub struct GpuChannels {
@@ -123,6 +126,7 @@ impl PreviewPanelState {
             volume_job: None,
             last_preview_target: None,
             throttle: Throttle::default(),
+            volume_failing: false,
         }
     }
 }
@@ -152,6 +156,11 @@ pub fn show(
     let preview_target = state.preview_target.filter(|id| graph.contains(*id));
     state.preview_target = preview_target;
     if preview.last_preview_target != preview_target {
+        log::debug!(
+            "preview target from={:?} to={:?}",
+            preview.last_preview_target.map(|id| id.0),
+            preview_target.map(|id| id.0)
+        );
         preview.last_preview_target = preview_target;
         preview.channels_stale = true;
         preview.volume_stale = true;
@@ -187,6 +196,7 @@ pub fn show(
                 }
             });
         if preview.shape != prev_shape {
+            log::debug!("preview shape from={:?} to={:?}", prev_shape, preview.shape);
             // The 3D target is rebuilt lazily on the way back into 3D.
             if preview.shape == PreviewShape::Flat {
                 if let (Some(g), Some(scene)) = (gpu.as_ref(), preview.scene.take()) {
@@ -210,6 +220,13 @@ pub fn show(
                             .selectable_label(preview.channel == ch, channel_label(ch))
                             .clicked()
                         {
+                            if preview.channel != ch {
+                                log::debug!(
+                                    "preview channel from={:?} to={:?}",
+                                    preview.channel,
+                                    ch
+                                );
+                            }
                             preview.channel = ch;
                         }
                     }
@@ -220,6 +237,7 @@ pub fn show(
         for &s in &[128u32, 256, 512, 1024] {
             let picked = preview.size == s;
             if ui.selectable_label(picked, format!("{s}")).clicked() && !picked {
+                log::debug!("preview size from={} to={}", preview.size, s);
                 preview.size = s;
                 preview.texture = None;
                 if let Some(g) = gpu.as_ref() {
@@ -237,6 +255,7 @@ pub fn show(
     ui.separator();
 
     if state.dirty {
+        log::trace!("preview stale reason=edit revision={}", state.revision);
         preview.channels_stale = true;
         preview.volume_stale = true;
         state.dirty = false;
@@ -251,9 +270,11 @@ pub fn show(
         if let Some(gpu) = gpu.as_deref_mut() {
             let vol_res = preview.size.min(VOLUME_RES_CAP);
             if preview.volume.as_ref().is_some_and(|v| v.size.0 != vol_res) {
+                log::debug!("volume dropped reason=resolution res={vol_res}");
                 preview.volume = None;
             }
             if preview.volume_job.as_ref().is_some_and(|j| j.res() != vol_res) {
+                log::debug!("volume job canceled reason=resolution res={vol_res}");
                 preview.volume_job = None;
             }
             // A running job is left to finish rather than restarted, or an
@@ -266,6 +287,13 @@ pub fn show(
                     preview.volume_stale && preview.throttle.allow(ui.ctx())
                 };
             if go {
+                let quiet = preview.volume_failing;
+                log::log!(
+                    if quiet { log::Level::Trace } else { log::Level::Debug },
+                    "volume bake start res={vol_res} shape={:?} reason={}",
+                    preview.shape,
+                    if preview.volume.is_none() { "missing" } else { "stale" },
+                );
                 preview.gpu_error = None;
                 match gpu.baker.begin_volume(graph, vol_res, vol_res, eval_ctx) {
                     Ok(job) => {
@@ -273,6 +301,7 @@ pub fn show(
                         preview.volume_stale = false;
                     }
                     Err(e) => {
+                        note_volume_failure(preview, "begin", &e);
                         preview.gpu_error =
                             Some(format!("volume bake failed, using UV mapping: {e}"));
                         preview.volume = None;
@@ -292,10 +321,16 @@ pub fn show(
                 match gpu.baker.step_volume(job, slices) {
                     Ok(true) => {
                         let job = preview.volume_job.take().unwrap();
+                        log::debug!("volume bake done res={}", job.res());
+                        preview.volume_failing = false;
                         preview.volume = Some(job.into_output());
                     }
-                    Ok(false) => ui.ctx().request_repaint(),
+                    Ok(false) => {
+                        log::trace!("volume bake step slices={slices}");
+                        ui.ctx().request_repaint()
+                    }
                     Err(e) => {
+                        note_volume_failure(preview, "step", &e);
                         preview.gpu_error =
                             Some(format!("volume bake failed, using UV mapping: {e}"));
                         preview.volume = None;
@@ -323,6 +358,11 @@ pub fn show(
             preview.channels_stale && preview.throttle.allow(ui.ctx())
         };
     if needs_bake {
+        log::debug!(
+            "preview bake start size={} object_alpha={want_object_alpha} reason={}",
+            preview.size,
+            if must_bake { "missing_or_resized" } else { "stale" },
+        );
         preview.gpu_error = None;
         let baked_on_gpu = if let Some(gpu) = gpu.as_deref_mut() {
             match gpu.baker.bake_output(
@@ -342,9 +382,11 @@ pub fn show(
                         want_object_alpha,
                     ));
                     preview.texture = None;
+                    log::debug!("preview bake done path=gpu size={}", preview.size);
                     true
                 }
                 Err(e) => {
+                    log::warn!("preview gpu bake failed fallback=cpu error={e}");
                     preview.gpu_error = Some(format!("gpu bake fell back to CPU: {e}"));
                     false
                 }
@@ -353,6 +395,11 @@ pub fn show(
             false
         };
         if !baked_on_gpu {
+            log::debug!(
+                "preview bake path=cpu size={} channel={:?}",
+                preview.size,
+                preview.channel
+            );
             preview.texture =
                 Some(bake_cpu(ui.ctx(), graph, preview.size, preview.channel, eval_ctx));
         }
@@ -491,6 +538,11 @@ fn ensure_scene_target(preview: &mut PreviewPanelState, gpu: &mut GpuBits) {
     if !needs_new {
         return;
     }
+    log::debug!(
+        "scene target rebuild size={} previous={:?}",
+        preview.size,
+        preview.scene.as_ref().map(|s| s.size)
+    );
     if let Some(old) = preview.scene.take() {
         gpu.renderer.write().free_texture(&old.id);
     }
@@ -512,6 +564,17 @@ fn ensure_scene_target(preview: &mut PreviewPanelState, gpu: &mut GpuBits) {
         id,
         size: preview.size,
     });
+}
+
+/// The error also reaches the panel, but a bake failing on every frame
+/// would flood the log; one warning per run of failures.
+fn note_volume_failure(preview: &mut PreviewPanelState, stage: &str, e: &dyn std::fmt::Display) {
+    if preview.volume_failing {
+        log::trace!("volume bake failed again stage={stage} error={e}");
+    } else {
+        log::warn!("volume bake failed fallback=uv stage={stage} error={e}");
+        preview.volume_failing = true;
+    }
 }
 
 fn shape_label(sh: PreviewShape) -> &'static str {

@@ -59,6 +59,8 @@ pub struct PreviewCache {
     rebuilt_this_frame: bool,
     /// Spaces out rebakes of images that are merely out of date.
     throttle: Throttle,
+    /// A failed bulk bake retries every frame; only the first is logged.
+    bake_failing: bool,
 }
 
 impl PreviewCache {
@@ -77,8 +79,14 @@ impl PreviewCache {
         self.revision = revision;
         self.rebuilt_this_frame = false;
         match dirty {
-            None => self.forced += 1,
+            None => {
+                self.forced += 1;
+                log::trace!("thumbnails retired all revision={revision}");
+            }
             Some(ids) => {
+                if !ids.is_empty() {
+                    log::trace!("thumbnails retired count={} revision={revision}", ids.len());
+                }
                 for id in ids {
                     self.stale_at.insert(*id, revision);
                 }
@@ -119,6 +127,7 @@ impl PreviewCache {
                 self.throttle.allow(egui_ctx)
             };
             if go {
+                log::trace!("thumbnail rebuild trigger layer={} cold={cold}", id.0);
                 self.rebuilt_this_frame = true;
                 self.rebuild(graph, eval_ctx, gpu);
             }
@@ -131,6 +140,7 @@ impl PreviewCache {
             return Some(thumb.handle.id());
         }
         // The bulk bake failed or there is no GPU.
+        log::debug!("thumbnail bake cpu layer={} size={PREVIEW_SIZE}", id.0);
         let handle = bake_cpu(egui_ctx, graph, id, eval_ctx);
         let tid = handle.id();
         self.cpu_entries.insert(
@@ -160,16 +170,36 @@ impl PreviewCache {
         }
 
         let Some(gpu) = gpu else {
+            log::debug!("thumbnails stale path=cpu count={}", wanted.len());
             // `get_or_build` rebakes these lazily on the CPU.
             self.cpu_entries.retain(|id, _| !wanted.contains(id));
             return;
         };
-        let Ok(new_texs) = gpu.baker.bake_previews(graph, eval_ctx, Some(&wanted)) else {
-            // Keep the last good images and retry next frame. Failures are
-            // usually transient, so a retry per frame beats a thumbnail that
-            // never returns.
-            return;
+        log::log!(
+            if self.bake_failing { log::Level::Trace } else { log::Level::Debug },
+            "thumbnail bake start path=gpu count={} size={PREVIEW_SIZE} revision={}",
+            wanted.len(),
+            self.revision
+        );
+        let new_texs = match gpu.baker.bake_previews(graph, eval_ctx, Some(&wanted)) {
+            Ok(t) => t,
+            Err(e) => {
+                // Keep the last good images and retry next frame. Failures
+                // are usually transient, so a retry per frame beats a
+                // thumbnail that never returns.
+                if self.bake_failing {
+                    log::trace!("thumbnail bake failed again error={e}");
+                } else {
+                    log::warn!("thumbnail bake failed, retrying each frame error={e}");
+                    self.bake_failing = true;
+                }
+                return;
+            }
         };
+        if std::mem::take(&mut self.bake_failing) {
+            log::debug!("thumbnail bake recovered");
+        }
+        log::debug!("thumbnail bake done count={}", new_texs.len());
 
         let device = gpu.baker.ctx().device.clone();
         let mut r = gpu.renderer.write();

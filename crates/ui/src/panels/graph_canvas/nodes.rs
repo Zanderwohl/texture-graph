@@ -139,6 +139,7 @@ fn body_interact(
                 if ui.button("Duplicate").clicked() {
                     if let Some(layer) = graph.get(id) {
                         let name = crate::catalog::unique_name(graph, &layer.name);
+                        log::debug!("duplicate layer id={} as={:?}", id.0, name);
                         let pos = [world.x + DUPLICATE_OFFSET, world.y + DUPLICATE_OFFSET];
                         state.push(EditCmd::AddLayer {
                             name,
@@ -567,6 +568,7 @@ fn apply_stop_action(
             };
             let t = ramp::duplicate_t(&r.stops, i);
             let j = ramp::insert_index(&r.stops, t);
+            log::debug!("duplicate ramp stop node={node:?} index={i} at={j} t={t:.3}");
             r.stops.insert(j, ColorStop { t, ..src });
             // The copy inherits no saved const: those belong to the stop a
             // wire displaced one on, and the remap moves keys, not copies.
@@ -579,6 +581,7 @@ fn apply_stop_action(
                 return false;
             }
             r.stops.remove(i);
+            log::debug!("remove ramp stop node={node:?} index={i}");
             state.remap_ramp_consts(node, move |k| match k.cmp(&i) {
                 std::cmp::Ordering::Less => Some(k),
                 std::cmp::Ordering::Equal => None,
@@ -771,6 +774,7 @@ fn ramp_bar(
                 if ramp.stops[drag.stop].t != t {
                     let (new_i, swaps) = ramp::drag_stop_to(&mut ramp.stops, drag.stop, t);
                     for (a, b) in swaps {
+                        log::debug!("reorder ramp stops layer id={} swap={a}<->{b}", id.0);
                         state.remap_ramp_consts(NodeRef::Layer(id), move |j| {
                             Some(if j == a {
                                 b
@@ -801,6 +805,7 @@ fn ramp_bar(
                     .collect();
                 let color = ramp::sample_display(&display, ramp.space, t);
                 let i = ramp::insert_index(&ramp.stops, t);
+                log::debug!("add ramp stop layer id={} index={i} t={t:.3}", id.0);
                 ramp.stops.insert(i, ColorStop { t, color: ColorInput::Const(color) });
                 state.remap_ramp_consts(NodeRef::Layer(id), move |j| {
                     Some(if j >= i { j + 1 } else { j })

@@ -163,6 +163,12 @@ impl SceneRenderer {
         let sphere = build_mesh(device, &sphere_verts_indices(128, 64), "sphere");
         let cube   = build_mesh(device, &cube_verts_indices(),        "cube");
         let quad   = build_mesh(device, &quad_verts_indices(),        "quad");
+        log::debug!(
+            "scene renderer created pipelines=3 sphere_indices={} cube_indices={} quad_indices={}",
+            sphere.index_count,
+            cube.index_count,
+            quad.index_count,
+        );
 
         Self {
             pipeline_uv,
@@ -181,6 +187,12 @@ impl SceneRenderer {
     /// The caller keeps it alive and re-registers it with egui-wgpu each time
     /// it is recreated.
     pub fn make_color_target(&self, device: &wgpu::Device, size: (u32, u32)) -> wgpu::Texture {
+        log::debug!(
+            "scene target create kind=color size={}x{} format={:?}",
+            size.0,
+            size.1,
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some("scene-color"),
             size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
@@ -196,6 +208,12 @@ impl SceneRenderer {
     }
 
     pub fn make_depth_target(&self, device: &wgpu::Device, size: (u32, u32)) -> wgpu::Texture {
+        log::debug!(
+            "scene target create kind=depth size={}x{} format={:?}",
+            size.0,
+            size.1,
+            wgpu::TextureFormat::Depth32Float,
+        );
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some("scene-depth"),
             size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
@@ -247,6 +265,14 @@ impl SceneRenderer {
         size: (u32, u32),
         camera: &SceneCamera,
     ) {
+        log::trace!(
+            "scene render shape={shape:?} layers={} size={}x{} distance={} pitch={}",
+            layers.len(),
+            size.0,
+            size.1,
+            camera.distance,
+            camera.pitch,
+        );
         let mesh = match shape {
             SceneShape::Sphere => &self.sphere,
             SceneShape::Cube   => &self.cube,

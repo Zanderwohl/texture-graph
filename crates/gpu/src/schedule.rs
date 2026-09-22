@@ -235,6 +235,12 @@ impl std::error::Error for ScheduleError {}
 
 /// Only layers reachable from `Output` are included.
 pub fn schedule(graph: &Graph, ctx: &EvalCtx) -> Result<Schedule, ScheduleError> {
+    let result = schedule_output(graph, ctx);
+    log_result("output", graph, &result);
+    result
+}
+
+fn schedule_output(graph: &Graph, ctx: &EvalCtx) -> Result<Schedule, ScheduleError> {
     let ctx = &graph.resolve_params(ctx);
     let output_roots = output_referenced(graph);
     let plan = plan_from(graph, &output_roots)?;
@@ -262,6 +268,12 @@ pub fn schedule(graph: &Graph, ctx: &EvalCtx) -> Result<Schedule, ScheduleError>
 /// `output_slots.color` points at `root`; the other channels are
 /// placeholders.
 pub fn schedule_layer(graph: &Graph, root: LayerId) -> Result<Schedule, ScheduleError> {
+    let result = schedule_root(graph, root);
+    log_result("layer", graph, &result);
+    result
+}
+
+fn schedule_root(graph: &Graph, root: LayerId) -> Result<Schedule, ScheduleError> {
     if graph.get(root).is_none() {
         return Err(ScheduleError::UnknownLayer(root));
     }
@@ -382,6 +394,16 @@ pub fn schedule_previews(
     wanted: Option<&HashSet<LayerId>>,
     ctx: &EvalCtx,
 ) -> Result<Schedule, ScheduleError> {
+    let result = schedule_previews_inner(graph, wanted, ctx);
+    log_result("previews", graph, &result);
+    result
+}
+
+fn schedule_previews_inner(
+    graph: &Graph,
+    wanted: Option<&HashSet<LayerId>>,
+    ctx: &EvalCtx,
+) -> Result<Schedule, ScheduleError> {
     let ctx = &graph.resolve_params(ctx);
     let everything: HashSet<LayerId> = graph.layers.iter().map(|l| l.id).collect();
     let full_order = topo_over(graph, &everything)?;
@@ -483,6 +505,63 @@ fn scalar_to_slot(
         ));
     }
     Ok(ScalarSlot::Const(ctx.scalar_const(s).unwrap_or(0.0)))
+}
+
+/// Formats layer ids as `[L1, L2]`.
+pub(crate) struct IdList<'a>(pub &'a [LayerId]);
+
+impl std::fmt::Display for IdList<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[")?;
+        for (i, id) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{id}")?;
+        }
+        f.write_str("]")
+    }
+}
+
+fn log_result(mode: &str, graph: &Graph, result: &Result<Schedule, ScheduleError>) {
+    let s = match result {
+        Ok(s) => s,
+        Err(e) => {
+            log::debug!("schedule failed mode={mode} err={e}");
+            return;
+        }
+    };
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+    log::debug!(
+        "schedule done mode={mode} layers={} peak_slots={} order={} outputs={:?}",
+        s.order.len(),
+        s.peak_slots,
+        IdList(&s.order),
+        s.output_slots,
+    );
+    for &id in &s.order {
+        let Some(layer) = graph.get(id) else { continue };
+        let reads: Vec<String> = layer
+            .kind
+            .inputs()
+            .iter()
+            .map(|input| match s.slot_of.get(input) {
+                Some(slot) => format!("{input}@{slot}"),
+                None => format!("{input}@none"),
+            })
+            .collect();
+        let dom = s.domain_of.get(&id).copied().unwrap_or(Domain::UNIT);
+        log::debug!(
+            "schedule layer id={id} name={:?} writes_slot={} reads=[{}] domain_min={:?} domain_max={:?}",
+            layer.name,
+            s.slot_of.get(&id).copied().unwrap_or(u32::MAX),
+            reads.join(", "),
+            dom.min,
+            dom.max,
+        );
+    }
 }
 
 fn topo_dfs(

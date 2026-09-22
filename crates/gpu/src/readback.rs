@@ -128,6 +128,12 @@ fn copy_to_buffer(
     let (width, height, depth) = size;
     let packed_bpr = width * bytes_per_texel;
     let padded_bpr = packed_bpr.div_ceil(COPY_ALIGN) * COPY_ALIGN;
+    log::debug!(
+        "readback request size={width}x{height}x{depth} format={:?} bytes_per_texel={bytes_per_texel} \
+         padded_bpr={padded_bpr} buffer_bytes={}",
+        tex.format(),
+        padded_bpr * height * depth,
+    );
 
     let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("tg-readback"),
@@ -167,6 +173,7 @@ fn unpad(buffer: &wgpu::Buffer, padded_bpr: u32, packed_bpr: u32, rows: u32) -> 
     }
     drop(data);
     buffer.unmap();
+    log::debug!("readback complete rows={rows} bytes={}", out.len());
     out
 }
 

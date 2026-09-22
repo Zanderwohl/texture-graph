@@ -4,6 +4,8 @@
 //! cargo run -p texture-graph-gpu --example bake -- out.ppm [graph.tg] [size]
 //! ```
 //!
+//! `RUST_LOG=texture_graph_gpu=debug` shows the schedule and each dispatch.
+//!
 //! `cargo test` compiles examples, so this stops building if the crate
 //! gains a dependency on egui, eframe or winit.
 //!
@@ -18,6 +20,10 @@ use texture_graph_core::{
 use texture_graph_gpu::{Baker, DeviceCtx, readback};
 
 fn main() {
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn,texture_graph_gpu=info"),
+    )
+    .init();
     let mut args = std::env::args().skip(1);
     let out_path = PathBuf::from(args.next().unwrap_or_else(|| {
         eprintln!("usage: bake <out.ppm> [graph.tg] [size]");

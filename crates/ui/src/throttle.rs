@@ -13,6 +13,8 @@ pub const BAKE_INTERVAL: f64 = 0.1;
 #[derive(Debug, Default)]
 pub struct Throttle {
     last: Option<f64>,
+    /// Requests turned away since the last bake, for the log.
+    deferred: u32,
 }
 
 impl Throttle {
@@ -23,8 +25,14 @@ impl Throttle {
         let wait = self.last.map_or(0.0, |t| t + BAKE_INTERVAL - now);
         if wait <= 0.0 {
             self.last = Some(now);
+            if self.deferred > 0 {
+                log::debug!("throttle release coalesced={}", self.deferred);
+                self.deferred = 0;
+            }
             true
         } else {
+            self.deferred += 1;
+            log::trace!("throttle defer wait_ms={:.0}", wait * 1000.0);
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
             false
         }
@@ -33,5 +41,9 @@ impl Throttle {
     /// Record a bake that ran without asking [`Self::allow`].
     pub fn mark(&mut self, ctx: &egui::Context) {
         self.last = Some(ctx.input(|i| i.time));
+        if self.deferred > 0 {
+            log::debug!("throttle bypass coalesced={}", self.deferred);
+            self.deferred = 0;
+        }
     }
 }

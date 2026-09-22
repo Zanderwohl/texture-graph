@@ -52,6 +52,12 @@ impl TextureGraphApp {
         if gpu.is_none() {
             log::warn!("no wgpu render state on eframe — preview will use CPU path");
         }
+        log::info!(
+            "startup platform={} render_state={} preview_size={}",
+            if cfg!(target_arch = "wasm32") { "web" } else { "native" },
+            gpu.is_some(),
+            default_size,
+        );
 
         Self {
             graph: Graph::new(),

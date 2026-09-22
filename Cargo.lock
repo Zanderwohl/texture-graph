@@ -2795,11 +2795,11 @@ name = "texture-graph-gpu"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "env_logger",
  "glam",
  "log",
  "pollster",
  "texture-graph-core",
- "wasm-bindgen-futures",
  "wgpu",
 ]
 
@@ -2819,7 +2819,6 @@ dependencies = [
  "png",
  "pollster",
  "rfd",
- "serde",
  "texture-graph-core",
  "texture-graph-gpu",
  "wasm-bindgen",

@@ -7,6 +7,7 @@ pub fn show(ui: &mut egui::Ui, _graph: &Graph, state: &mut UiState) {
     egui::MenuBar::new().ui(ui, |ui| {
         ui.menu_button("File", |ui| {
             if ui.button("New").clicked() {
+                log::info!("new graph");
                 state.push(EditCmd::Replace(Graph::new()));
                 state.last_loaded_name = None;
                 ui.close();

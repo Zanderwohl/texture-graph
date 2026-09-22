@@ -53,3 +53,19 @@ all unclaimed on crates.io as of 2026-09-21.
 - [ ] `cargo clippy --workspace --all-targets` clean.
 - [ ] Add CI (test, clippy, doc, a wasm32 build of `ui`).
 - [ ] Add a `CHANGELOG.md`.
+
+## Logging
+
+The editor and the `bake` example log through `env_logger`. With `RUST_LOG` unset, only
+startup and file open/save print, at `info`. Turn on more detail per area:
+
+```bash
+RUST_LOG=texture_graph_gpu=debug cargo run -p texture-graph-ui
+```
+
+- `texture_graph_gpu=debug`: bake start and finish, schedule and slot assignment, each layer
+  dispatched, texture allocations, readback.
+- `texture_graph_ui=debug`: graph edits, rebake triggers and throttling, preview changes,
+  file dialogs.
+- `trace` on either adds per-frame and per-dispatch detail.
+- Narrow further by module, e.g. `texture_graph_gpu::schedule=debug`.

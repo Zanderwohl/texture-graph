@@ -23,6 +23,7 @@ impl DeviceCtx {
         device: Arc<wgpu::Device>,
         queue: Arc<wgpu::Queue>,
     ) -> Self {
+        log_device("shared", &adapter, &device);
         Self { adapter, device, queue }
     }
 
@@ -38,7 +39,10 @@ impl DeviceCtx {
                 compatible_surface: None,
             })
             .await
-            .map_err(|_| DeviceInitError::NoAdapter)?;
+            .map_err(|e| {
+                log::debug!("request_adapter failed err={e}");
+                DeviceInitError::NoAdapter
+            })?;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("texture-graph headless device"),
@@ -49,13 +53,35 @@ impl DeviceCtx {
                 ..Default::default()
             })
             .await
-            .map_err(DeviceInitError::RequestDevice)?;
+            .map_err(|e| {
+                log::debug!("request_device failed err={e}");
+                DeviceInitError::RequestDevice(e)
+            })?;
+        log_device("headless", &adapter, &device);
         Ok(Self {
             adapter: Arc::new(adapter),
             device: Arc::new(device),
             queue: Arc::new(queue),
         })
     }
+}
+
+fn log_device(source: &str, adapter: &wgpu::Adapter, device: &wgpu::Device) {
+    let info = adapter.get_info();
+    let limits = device.limits();
+    log::info!(
+        "gpu device source={source} adapter={:?} backend={:?} type={:?} driver={:?} \
+         max_texture_2d={} max_texture_3d={} max_storage_textures_per_stage={} \
+         max_buffer_size={}",
+        info.name,
+        info.backend,
+        info.device_type,
+        info.driver,
+        limits.max_texture_dimension_2d,
+        limits.max_texture_dimension_3d,
+        limits.max_storage_textures_per_shader_stage,
+        limits.max_buffer_size,
+    );
 }
 
 #[derive(Debug)]

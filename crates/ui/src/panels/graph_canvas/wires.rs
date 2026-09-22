@@ -196,7 +196,15 @@ pub fn advance_wire_drag(
         Some(c) => {
             if detached == Some((c.node, c.key)) {
                 // Dropped back where it came from: nothing happened.
+                log::trace!("wire drop unchanged node={:?} input={:?}", c.node, c.key);
             } else if let Some(why) = refused {
+                log::debug!(
+                    "wire refused node={:?} input={:?} from={} reason={:?}",
+                    c.node,
+                    c.key,
+                    c.src.0,
+                    why
+                );
                 // The wire it was detached from stays where it is.
                 state.last_error = Some(why);
             } else {
@@ -211,6 +219,7 @@ pub fn advance_wire_drag(
         // Dropped on empty space: a detached wire is gone, a fresh one
         // never existed.
         None => {
+            log::trace!("wire drop empty detached={:?}", detached);
             if let Some((n0, k0)) = detached {
                 apply_socket_edits(graph, state, &[(n0, k0, None)]);
             }

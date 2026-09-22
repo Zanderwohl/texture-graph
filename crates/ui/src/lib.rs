@@ -16,7 +16,10 @@ pub use app::TextureGraphApp;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn run_native() -> eframe::Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(
+        "warn,texture_graph=info,texture_graph_ui=info,texture_graph_gpu=info,texture_graph_core=info",
+    ))
+    .init();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])

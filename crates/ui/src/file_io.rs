@@ -69,17 +69,22 @@ fn finish_dialog(outcome: Option<native::Outcome>, ctx: &egui::Context) {
 fn do_save(state: &mut UiState, file: TextureGraphFile, ctx: &egui::Context) {
     use std::sync::atomic::Ordering;
     if native::DIALOG_OPEN.swap(true, Ordering::SeqCst) {
+        log::debug!("save ignored reason=dialog_open");
         return;
     }
     let text = match texture_graph_core::save_to_string(&file) {
         Ok(s) => s,
         Err(e) => {
+            log::warn!("save failed stage=serialize error={e}");
             state.last_error = Some(format!("serialize failed: {e}"));
             native::DIALOG_OPEN.store(false, Ordering::SeqCst);
             return;
         }
     };
     let filename = format!("{}.{}", file.metadata.name, FILE_EXTENSION);
+    let layers = file.graph.layers.len();
+    let version = file.format_version;
+    log::debug!("save dialog filename={:?}", filename);
     let ctx = ctx.clone();
     std::thread::spawn(move || {
         let outcome = pollster::block_on(
@@ -91,10 +96,24 @@ fn do_save(state: &mut UiState, file: TextureGraphFile, ctx: &egui::Context) {
         .map(|handle| {
             let path = handle.path().to_path_buf();
             match std::fs::write(&path, text) {
-                Ok(()) => native::Outcome::Saved { stem: file_stem(&path) },
-                Err(e) => native::Outcome::Failed(format!("write failed: {e}")),
+                Ok(()) => {
+                    log::info!(
+                        "saved file path={:?} layers={} format_version={}",
+                        path,
+                        layers,
+                        version
+                    );
+                    native::Outcome::Saved { stem: file_stem(&path) }
+                }
+                Err(e) => {
+                    log::warn!("save failed stage=write path={:?} error={e}", path);
+                    native::Outcome::Failed(format!("write failed: {e}"))
+                }
             }
         });
+        if outcome.is_none() {
+            log::debug!("save canceled");
+        }
         finish_dialog(outcome, &ctx);
     });
 }
@@ -103,8 +122,10 @@ fn do_save(state: &mut UiState, file: TextureGraphFile, ctx: &egui::Context) {
 fn do_open(_state: &mut UiState, ctx: &egui::Context) {
     use std::sync::atomic::Ordering;
     if native::DIALOG_OPEN.swap(true, Ordering::SeqCst) {
+        log::debug!("open ignored reason=dialog_open");
         return;
     }
+    log::debug!("open dialog");
     let ctx = ctx.clone();
     std::thread::spawn(move || {
         let outcome = pollster::block_on(
@@ -115,10 +136,19 @@ fn do_open(_state: &mut UiState, ctx: &egui::Context) {
         .map(|handle| {
             let path = handle.path().to_path_buf();
             match std::fs::read_to_string(&path) {
-                Ok(text) => native::Outcome::Opened { stem: file_stem(&path), text },
-                Err(e) => native::Outcome::Failed(format!("read failed: {e}")),
+                Ok(text) => {
+                    log::debug!("read file path={:?} bytes={}", path, text.len());
+                    native::Outcome::Opened { stem: file_stem(&path), text }
+                }
+                Err(e) => {
+                    log::warn!("open failed stage=read path={:?} error={e}", path);
+                    native::Outcome::Failed(format!("read failed: {e}"))
+                }
             }
         });
+        if outcome.is_none() {
+            log::debug!("open canceled");
+        }
         finish_dialog(outcome, &ctx);
     });
 }
@@ -136,9 +166,15 @@ thread_local! {
 fn do_save(_state: &mut UiState, file: TextureGraphFile, _ctx: &egui::Context) {
     let s = match texture_graph_core::save_to_string(&file) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(e) => {
+            log::warn!("save failed stage=serialize error={e}");
+            return;
+        }
     };
     let filename = format!("{}.{}", file.metadata.name, FILE_EXTENSION);
+    let layers = file.graph.layers.len();
+    let version = file.format_version;
+    log::debug!("save dialog filename={:?}", filename);
     wasm_bindgen_futures::spawn_local(async move {
         if let Some(handle) = rfd::AsyncFileDialog::new()
             .set_file_name(&filename)
@@ -146,13 +182,24 @@ fn do_save(_state: &mut UiState, file: TextureGraphFile, _ctx: &egui::Context) {
             .save_file()
             .await
         {
-            let _ = handle.write(s.as_bytes()).await;
+            match handle.write(s.as_bytes()).await {
+                Ok(()) => log::info!(
+                    "saved file name={:?} layers={} format_version={}",
+                    handle.file_name(),
+                    layers,
+                    version
+                ),
+                Err(e) => log::warn!("save failed stage=write error={e}"),
+            }
+        } else {
+            log::debug!("save canceled");
         }
     });
 }
 
 #[cfg(target_arch = "wasm32")]
 fn do_open(_state: &mut UiState, ctx: &egui::Context) {
+    log::debug!("open dialog");
     let ctx = ctx.clone();
     wasm_bindgen_futures::spawn_local(async move {
         if let Some(handle) = rfd::AsyncFileDialog::new()
@@ -161,8 +208,11 @@ fn do_open(_state: &mut UiState, ctx: &egui::Context) {
             .await
         {
             let bytes = handle.read().await;
+            log::debug!("read file name={:?} bytes={}", handle.file_name(), bytes.len());
             PENDING_LOAD.with(|cell| *cell.borrow_mut() = Some(bytes));
             ctx.request_repaint();
+        } else {
+            log::debug!("open canceled");
         }
     });
 }
@@ -175,7 +225,10 @@ pub fn poll_pending(state: &mut UiState) {
         if let Some(bytes) = bytes {
             match String::from_utf8(bytes) {
                 Ok(s) => apply_loaded(state, None, &s),
-                Err(_) => state.last_error = Some("load failed: not UTF-8".into()),
+                Err(_) => {
+                    log::warn!("open failed stage=decode error=\"not UTF-8\"");
+                    state.last_error = Some("load failed: not UTF-8".into());
+                }
             }
         }
     }
@@ -199,12 +252,22 @@ pub fn poll_pending(state: &mut UiState) {
 fn apply_loaded(state: &mut UiState, stem: Option<String>, text: &str) {
     match texture_graph_core::load_from_str(text) {
         Ok(file) => {
+            log::info!(
+                "opened file name={:?} layers={} params={} format_version={}",
+                stem.as_deref().unwrap_or(&file.metadata.name),
+                file.graph.layers.len(),
+                file.graph.params.len(),
+                file.format_version,
+            );
             if stem.is_some() {
                 state.last_loaded_name = stem;
             }
             state.push(EditCmd::Replace(file.graph));
             state.last_error = None;
         }
-        Err(e) => state.last_error = Some(format!("load failed: {e}")),
+        Err(e) => {
+            log::warn!("open failed stage=parse error={e}");
+            state.last_error = Some(format!("load failed: {e}"));
+        }
     }
 }
