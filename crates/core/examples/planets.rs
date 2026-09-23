@@ -42,6 +42,13 @@ fn main() {
              provinces, small dusty polar caps.",
             marslike(),
         ),
+        (
+            "rocky.tgraph",
+            "Rocky",
+            "Any rocky world with air, from Mars to Earth to a snowball: sea level, ice, \
+             life, oxidation and sand are parameters a host derives from what the world is.",
+            rocky(),
+        ),
     ] {
         let meta = FileMetadata {
             name: name.into(),
@@ -262,6 +269,157 @@ fn marslike() -> Graph {
     let dust_rough = b.gray("dust roughness", 0.92);
     let ice_rough = b.gray("ice roughness", 0.55);
     let roughness = b.blend("roughness", dust_rough, ice_rough, ice);
+
+    b.finish(color, roughness, Some(normal))
+}
+
+/// The whole gamut of rocky worlds with air, in one graph. Earth and Mars are two settings of
+/// it rather than two graphs: every parameter is a quantity a host derives from what the world
+/// is made of -- how much water, how cold, whether anything lives there -- not a knob to taste.
+fn rocky() -> Graph {
+    let mut b = Builder::new();
+    b.param("sea", 0.0, 1.0, 0.52, "Sea level on the height field. A host picks it from the share of the surface the ocean covers.");
+    b.param("ice", -0.3, 1.0, 0.1, "Share of the surface under polar ice: the caps' edge is at |sin latitude| = 1 - ice.");
+    b.param("life", 0.0, 1.0, 0.0, "How much of the wet land is green.");
+    b.param("rust", 0.0, 1.0, 0.5, "How oxidized bare ground is: gray basalt at 0, Mars at 1.");
+    b.param("sand", 0.0, 1.0, 0.0, "How much of the dry land is pale sorted sand, which takes wind and water to make.");
+    b.param("aridity", -0.3, 0.3, 0.0, "Widens the desert belts.");
+    b.param("dark", -0.3, 0.3, 0.0, "More dark basaltic provinces when positive.");
+
+    let y = b.add_layer("y", LayerKind::Coordinate(Coordinate { axis: Axis::V }));
+    let abs_lat = b.wave("abs latitude", y, WaveShape::Triangle, 1.0, 0.25);
+
+    // Continents, plus Mars's hemispheric dichotomy at a lower frequency.
+    let continents = b.fbm("continents", 0, 1.3, 8, 0.52, FractalMode::Standard);
+    let dichotomy = b.fbm("dichotomy", 1, 0.55, 3, 0.5, FractalMode::Standard);
+    let heights = b.weighted_sum("heights", &[(continents, 0.85), (dichotomy, 0.25)]);
+    // Relief above the sea, centered on a half so a Map's clamp to [0, 1] has room each side.
+    let sea = b.param_gray("sea level", "sea");
+    let half = b.gray("half", 0.5);
+    let below = b.sub("heights over sea", heights, sea);
+    let relief = b.add("relief", below, half);
+
+    let inland = b.remap("inland", relief, 0.51, 0.62);
+    let ridges = b.fbm("ridges", 2, 2.6, 7, 0.5, FractalMode::Ridged);
+    let ranges = b.mask("ranges", ridges, inland);
+    // The creases of ridged noise make canyon networks.
+    let creases = b.fbm("creases", 4, 1.7, 6, 0.5, FractalMode::Ridged);
+    let canyons = b.remap("canyons", creases, 0.72, 0.86);
+    let terrain = b.weighted_sum("terrain", &[(relief, 1.0), (ranges, 0.3), (canyons, -0.06)]);
+
+    let floor = b.max("surface height", terrain, half);
+    let normal = b.add_layer(
+        "normal",
+        LayerKind::HeightToNormal(HeightToNormal { source: Some(floor), strength: 0.12 }),
+    );
+
+    let land = b.remap("land", terrain, 0.498, 0.504);
+    let elevation = b.remap("elevation", terrain, 0.5, 0.9);
+    let depth = b.remap("depth", terrain, 0.3, 0.5);
+
+    let ocean_palette = b.ramp(
+        "ocean palette",
+        &[
+            (0.0, oklcha(0.42, 0.08, 258.0, 1.0)),
+            (0.7, oklcha(0.47, 0.09, 248.0, 1.0)),
+            (0.93, oklcha(0.55, 0.10, 230.0, 1.0)),
+            (1.0, oklcha(0.64, 0.09, 205.0, 1.0)),
+        ],
+    );
+    let ocean_color = b.map("ocean color", depth, ocean_palette);
+
+    // Bare ground, between unweathered basalt and Mars.
+    let basalt_palette = b.ramp(
+        "basalt palette",
+        &[
+            (0.0, oklcha(0.42, 0.012, 60.0, 1.0)),
+            (0.5, oklcha(0.51, 0.016, 65.0, 1.0)),
+            (1.0, oklcha(0.62, 0.012, 70.0, 1.0)),
+        ],
+    );
+    let rust_palette = b.ramp(
+        "rust palette",
+        &[
+            (0.0, oklcha(0.46, 0.07, 38.0, 1.0)),
+            (0.35, oklcha(0.56, 0.12, 44.0, 1.0)),
+            (0.6, oklcha(0.63, 0.13, 50.0, 1.0)),
+            (1.0, oklcha(0.74, 0.10, 64.0, 1.0)),
+        ],
+    );
+    let gray_rock = b.map("gray rock", elevation, basalt_palette);
+    let rusty_rock = b.map("rusty rock", elevation, rust_palette);
+    let barren = b.mix("barren", gray_rock, rusty_rock, BlendMode::Blend, ScalarInput::Param("rust".into()));
+
+    // Dark provinces, kept off the high ground where dust settles.
+    let albedo = b.fbm("albedo", 5, 1.9, 7, 0.55, FractalMode::Standard);
+    let dark_param = b.param_gray("dark level", "dark");
+    let dark_drive = b.weighted_sum("dark drive", &[(albedo, 1.0), (elevation, -0.25), (dark_param, 1.0)]);
+    let dark = b.remap("dark", dark_drive, 0.45, 0.55);
+    let basalt = b.gray_color("basalt", oklcha(0.40, 0.03, 40.0, 1.0));
+    let dark_mix = b.scale("dark amount", dark, 0.55);
+    let rock = b.blend("rock", barren, basalt, dark_mix);
+    let canyon_shade = b.gray_color("canyon floor", oklcha(0.40, 0.05, 36.0, 1.0));
+    let canyon_mix = b.scale("canyon amount", canyons, 0.5);
+    let rock = b.blend("rock with canyons", rock, canyon_shade, canyon_mix);
+
+    // Deserts about |y| = 0.42 (25 degrees), wet belts at the equator and in the temperate zone.
+    let arid_belt = b.wave("arid belt", y, WaveShape::Sine, 2.38, -1.44);
+    let moisture = b.fbm("moisture", 6, 2.2, 6, 0.55, FractalMode::Standard);
+    let arid_param = b.param_gray("aridity level", "aridity");
+    let aridity = b.weighted_sum("aridity", &[(arid_belt, 0.55), (moisture, 0.8), (arid_param, 1.0)]);
+    let desert = b.remap("desert", aridity, 0.8, 0.92);
+    let white = b.gray("one", 1.0);
+    let zero = b.black();
+    let wet = b.blend("wet", white, zero, desert);
+
+    let sand_palette = b.ramp(
+        "sand palette",
+        &[
+            (0.0, oklcha(0.76, 0.07, 82.0, 1.0)),
+            (0.4, oklcha(0.70, 0.085, 70.0, 1.0)),
+            (0.8, oklcha(0.58, 0.07, 52.0, 1.0)),
+            (1.0, oklcha(0.56, 0.04, 50.0, 1.0)),
+        ],
+    );
+    let sand = b.map("sand", elevation, sand_palette);
+    let sand_amount = b.mix("sand amount", zero, desert, BlendMode::Blend, ScalarInput::Param("sand".into()));
+    let dry = b.blend("dry land", rock, sand, sand_amount);
+
+    let lush_palette = b.ramp(
+        "lush palette",
+        &[
+            (0.0, oklcha(0.70, 0.06, 90.0, 1.0)),
+            (0.02, oklcha(0.54, 0.10, 138.0, 1.0)),
+            (0.25, oklcha(0.50, 0.09, 132.0, 1.0)),
+            (0.5, oklcha(0.53, 0.06, 95.0, 1.0)),
+            (0.72, oklcha(0.55, 0.04, 60.0, 1.0)),
+            (0.86, oklcha(0.64, 0.015, 60.0, 1.0)),
+            (0.93, oklcha(0.90, 0.005, 240.0, 1.0)),
+            (1.0, oklcha(0.92, 0.0, 0.0, 1.0)),
+        ],
+    );
+    let lush = b.map("lush", elevation, lush_palette);
+    let green = b.mix("green", zero, wet, BlendMode::Blend, ScalarInput::Param("life".into()));
+    let land_color = b.blend("land color", dry, lush, green);
+    let ground = b.blend("ground", ocean_color, land_color, land);
+
+    // Kept under 1 where it matters: a Map clamps its value to [0, 1] before the lookup, and
+    // above the threshold a clamp changes nothing. The noise's mean is 0.1, so the edge sits
+    // at |y| = 1 - ice.
+    let ice_noise = b.fbm("ice noise", 3, 4.0, 6, 0.5, FractalMode::Standard);
+    let ice_param = b.param_gray("ice level", "ice");
+    let ice_drive = b.weighted_sum("ice drive", &[(abs_lat, 0.75), (ice_noise, 0.2), (ice_param, 0.75)]);
+    let ice = b.remap("ice", ice_drive, 0.84, 0.86);
+    let clean_ice = b.gray_color("clean ice", oklcha(0.92, 0.012, 230.0, 1.0));
+    let dusty_ice = b.gray_color("dusty ice", oklcha(0.90, 0.03, 70.0, 1.0));
+    let ice_color = b.mix("ice color", clean_ice, dusty_ice, BlendMode::Blend, ScalarInput::Param("rust".into()));
+    let color = b.blend("color", ground, ice_color, ice);
+
+    let water_rough = b.gray("water roughness", 0.22);
+    let land_rough = b.gray("land roughness", 0.85);
+    let ice_rough = b.gray("ice roughness", 0.5);
+    let ground_rough = b.blend("ground roughness", water_rough, land_rough, land);
+    let roughness = b.blend("roughness", ground_rough, ice_rough, ice);
 
     b.finish(color, roughness, Some(normal))
 }
