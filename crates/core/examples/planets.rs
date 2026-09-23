@@ -314,7 +314,8 @@ fn rocky() -> Graph {
     );
 
     let land = b.remap("land", terrain, 0.498, 0.504);
-    let elevation = b.remap("elevation", terrain, 0.5, 0.9);
+    // Wide, so most land is lowland: a range is what climbs out of it.
+    let elevation = b.remap("elevation", terrain, 0.5, 1.0);
     let depth = b.remap("depth", terrain, 0.3, 0.5);
 
     let ocean_palette = b.ramp(
