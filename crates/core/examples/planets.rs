@@ -279,7 +279,7 @@ fn marslike() -> Graph {
 fn rocky() -> Graph {
     let mut b = Builder::new();
     b.param("sea", 0.0, 1.0, 0.52, "Sea level on the height field. A host picks it from the share of the surface the ocean covers.");
-    b.param("ice", -0.3, 1.0, 0.1, "Share of the surface under polar ice: the caps' edge is at |sin latitude| = 1 - ice.");
+    b.param("ice", -0.3, 1.5, 0.1, "Where the polar ice reaches: about the share of the surface under it, but a host measures that. Past one freezes the equator too.");
     b.param("life", 0.0, 1.0, 0.0, "How much of the wet land is green.");
     b.param("rust", 0.0, 1.0, 0.5, "How oxidized bare ground is: gray basalt at 0, Mars at 1.");
     b.param("sand", 0.0, 1.0, 0.0, "How much of the dry land is pale sorted sand, which takes wind and water to make.");
@@ -404,12 +404,17 @@ fn rocky() -> Graph {
     let ground = b.blend("ground", ocean_color, land_color, land);
 
     // Kept under 1 where it matters: a Map clamps its value to [0, 1] before the lookup, and
-    // above the threshold a clamp changes nothing. The noise's mean is 0.1, so the edge sits
-    // at |y| = 1 - ice.
-    let ice_noise = b.fbm("ice noise", 3, 4.0, 6, 0.5, FractalMode::Standard);
+    // above the threshold a clamp changes nothing. The noise's mean is 0.15, so the edge sits
+    // at |y| = 1 - ice; the coarse and fine octaves together make it ragged rather than a
+    // circle of latitude, and high ground holds ice further from the pole.
+    let ice_noise = b.fbm("ice noise", 3, 2.2, 7, 0.6, FractalMode::Standard);
     let ice_param = b.param_gray("ice level", "ice");
-    let ice_drive = b.weighted_sum("ice drive", &[(abs_lat, 0.75), (ice_noise, 0.2), (ice_param, 0.75)]);
-    let ice = b.remap("ice", ice_drive, 0.84, 0.86);
+    let highland = b.mask("highland", elevation, land);
+    let ice_drive = b.weighted_sum(
+        "ice drive",
+        &[(abs_lat, 0.75), (ice_noise, 0.3), (highland, 0.08), (ice_param, 0.75)],
+    );
+    let ice = b.remap("ice", ice_drive, 0.895, 0.915);
     let clean_ice = b.gray_color("clean ice", oklcha(0.92, 0.012, 230.0, 1.0));
     let dusty_ice = b.gray_color("dusty ice", oklcha(0.90, 0.03, 70.0, 1.0));
     let ice_color = b.mix("ice color", clean_ice, dusty_ice, BlendMode::Blend, ScalarInput::Param("rust".into()));
