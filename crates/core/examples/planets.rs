@@ -280,11 +280,13 @@ fn rocky() -> Graph {
     let mut b = Builder::new();
     b.param("sea", 0.0, 1.0, 0.52, "Sea level on the height field. A host picks it from the share of the surface the ocean covers.");
     b.param("ice", -0.3, 1.5, 0.1, "Where the polar ice reaches: about the share of the surface under it, but a host measures that. Past one freezes the equator too.");
-    b.param("life", 0.0, 1.0, 0.0, "How much of the wet land is green.");
+    b.param("life", 0.0, 1.0, 0.0, "How much of the wet land is alive.");
     b.param("rust", 0.0, 1.0, 0.5, "How oxidized bare ground is: gray basalt at 0, Mars at 1.");
     b.param("sand", 0.0, 1.0, 0.0, "How much of the dry land is pale sorted sand, which takes wind and water to make.");
     b.param("aridity", -0.3, 0.3, 0.0, "Widens the desert belts.");
     b.param("dark", -0.3, 0.3, 0.0, "More dark basaltic provinces when positive.");
+    b.param_color("foliage", oklcha(0.54, 0.10, 138.0, 1.0), "Lowland growth. A host picks it from the star: gold under a hot one, dark under a red dwarf.");
+    b.param_color("foliage high", oklcha(0.50, 0.09, 132.0, 1.0), "The sparser growth higher up.");
 
     let y = b.add_layer("y", LayerKind::Coordinate(Coordinate { axis: Axis::V }));
     let abs_lat = b.wave("abs latitude", y, WaveShape::Triangle, 1.0, 0.25);
@@ -386,17 +388,17 @@ fn rocky() -> Graph {
     let sand_amount = b.mix("sand amount", zero, desert, BlendMode::Blend, ScalarInput::Param("sand".into()));
     let dry = b.blend("dry land", rock, sand, sand_amount);
 
-    let lush_palette = b.ramp(
+    let lush_palette = b.ramp_inputs(
         "lush palette",
         &[
-            (0.0, oklcha(0.70, 0.06, 90.0, 1.0)),
-            (0.02, oklcha(0.54, 0.10, 138.0, 1.0)),
-            (0.25, oklcha(0.50, 0.09, 132.0, 1.0)),
-            (0.5, oklcha(0.53, 0.06, 95.0, 1.0)),
-            (0.72, oklcha(0.55, 0.04, 60.0, 1.0)),
-            (0.86, oklcha(0.64, 0.015, 60.0, 1.0)),
-            (0.93, oklcha(0.90, 0.005, 240.0, 1.0)),
-            (1.0, oklcha(0.92, 0.0, 0.0, 1.0)),
+            (0.0, ColorInput::Const(oklcha(0.70, 0.06, 90.0, 1.0))),
+            (0.02, ColorInput::Param("foliage".into())),
+            (0.25, ColorInput::Param("foliage high".into())),
+            (0.5, ColorInput::Const(oklcha(0.53, 0.06, 95.0, 1.0))),
+            (0.72, ColorInput::Const(oklcha(0.55, 0.04, 60.0, 1.0))),
+            (0.86, ColorInput::Const(oklcha(0.64, 0.015, 60.0, 1.0))),
+            (0.93, ColorInput::Const(oklcha(0.90, 0.005, 240.0, 1.0))),
+            (1.0, ColorInput::Const(oklcha(0.92, 0.0, 0.0, 1.0))),
         ],
     );
     let lush = b.map("lush", elevation, lush_palette);
