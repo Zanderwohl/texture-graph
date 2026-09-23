@@ -285,8 +285,8 @@ fn rocky() -> Graph {
     b.param("sand", 0.0, 1.0, 0.0, "How much of the dry land is pale sorted sand, which takes wind and water to make.");
     b.param("aridity", -0.3, 0.3, 0.0, "Widens the desert belts.");
     b.param("dark", -0.3, 0.3, 0.0, "More dark basaltic provinces when positive.");
-    b.param_color("foliage", oklcha(0.54, 0.10, 138.0, 1.0), "Lowland growth. A host picks it from the star: gold under a hot one, dark under a red dwarf.");
-    b.param_color("foliage high", oklcha(0.50, 0.09, 132.0, 1.0), "The sparser growth higher up.");
+    b.param_color("foliage", oklcha(0.40, 0.12, 145.0, 1.0), "Lowland growth. A host picks it from the star: gold under a hot one, dark under a red dwarf.");
+    b.param_color("foliage high", oklcha(0.43, 0.10, 130.0, 1.0), "The sparser growth higher up.");
 
     let y = b.add_layer("y", LayerKind::Coordinate(Coordinate { axis: Axis::V }));
     let abs_lat = b.wave("abs latitude", y, WaveShape::Triangle, 1.0, 0.25);
