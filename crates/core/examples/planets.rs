@@ -495,14 +495,16 @@ fn giant() -> Graph {
     let contrasted = b.mix("contrasted", zero, belt_raw, BlendMode::Blend, ScalarInput::Param("contrast".into()));
 
     // Polar haze, from |sin latitude| = 1 - polar out, ragged; the bands give out before it.
+    // Offset so its edge is inside [0, 1]: the GPU clamps a Map's value there and the CPU does
+    // not, so a ramp stop past one bakes differently from how it evaluates.
     let polar = b.param_gray("polar level", "polar");
     let polar_noise = b.fbm("polar noise", 5, 3.0, 4, 0.5, FractalMode::Standard);
-    let polar_drive = b.weighted_sum("polar drive", &[(abs_lat, 1.0), (polar, 1.0), (polar_noise, 0.1), (half, -0.1)]);
-    let polar_edge = b.remap("polar edge", polar_drive, 0.98, 1.02);
+    let polar_drive = b.weighted_sum("polar drive", &[(abs_lat, 1.0), (polar, 1.0), (polar_noise, 0.1), (half, -0.4)]);
+    let polar_edge = b.remap("polar edge", polar_drive, 0.83, 0.87);
     // None at all where the host says none, rather than a speck at each pole.
     let polar_on = b.remap("polar on", polar, 0.0, 0.02);
     let polar_mask = b.mask("polar", polar_edge, polar_on);
-    let band_fade = b.remap("band fade", polar_drive, 0.87, 1.0);
+    let band_fade = b.remap("band fade", polar_drive, 0.72, 0.85);
     let open = b.blend("band field", one, zero, band_fade);
 
     // Festoons: zone drawn into the belts where the eddies curl, strung along the flow.
@@ -517,13 +519,14 @@ fn giant() -> Graph {
 
     // Ovals: blobs of a band-scale noise over a threshold the storm count lowers, fewest at
     // the poles.
-    let ovals = b.fbm("ovals", 7, 7.0, 1, 0.5, FractalMode::Standard);
+    let ovals = b.fbm("ovals", 7, 14.0, 1, 0.5, FractalMode::Standard);
     let storms = b.param_gray("storm level", "storms");
     let oval_drive = b.weighted_sum("oval drive", &[(ovals, 1.0), (storms, 0.1), (abs_lat, -0.15)]);
     let small = b.remap("small ovals", oval_drive, 0.82, 0.87);
     let small = b.mask("small in the bands", small, open);
     // One great spot, 22 degrees south, three times as long as it is wide: an ellipsoid about a
-    // point on the sphere, ragged by the eddies.
+    // point on the sphere, ragged by the eddies. Each axis is clamped to its reach before it is
+    // squared, and the sum quartered, because the CPU caps a Multiply at one and the GPU does not.
     let spot_at = [22f32.to_radians().cos() * 0.5 + 0.5, 0.5 - 22f32.to_radians().sin() * 0.5, 0.5];
     let mut axes = Vec::new();
     for (name, coord, center, reach) in [("x", u, spot_at[0], 0.09), ("y", y, spot_at[1], 0.045), ("z", w, spot_at[2], 0.13)] {
@@ -531,11 +534,11 @@ fn giant() -> Graph {
         let ahead = b.sub(&format!("spot {name} ahead"), coord, at);
         let behind = b.sub(&format!("spot {name} behind"), at, coord);
         let off = b.max(&format!("spot {name} off"), ahead, behind);
-        let scaled = b.scale(&format!("spot {name} reach"), off, 1.0 / reach);
+        let scaled = b.remap(&format!("spot {name} reach"), off, 0.0, reach);
         axes.push(b.multiply(&format!("spot {name} squared"), scaled, scaled));
     }
-    let reach = b.weighted_sum("spot reach", &[(axes[0], 1.0), (axes[1], 1.0), (axes[2], 1.0), (eddies, 0.5)]);
-    let inside = b.remap("spot outside", reach, 0.95, 1.2);
+    let reach = b.weighted_sum("spot reach", &[(axes[0], 0.25), (axes[1], 0.25), (axes[2], 0.25), (eddies, 0.12)]);
+    let inside = b.remap("spot outside", reach, 0.28, 0.33);
     let great_raw = b.blend("spot inside", one, zero, inside);
     let great_spot = b.mix("great spot", zero, great_raw, BlendMode::Blend, ScalarInput::Param("spot".into()));
     let storm = b.max("storm", small, great_spot);
