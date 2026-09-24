@@ -37,7 +37,8 @@ const MAX_CLASSES: u32 = 6u;
 const DATUM: f32 = 0.5;
 const R_MAX: f32 = 0.2;
 const EXTENT: f32 = 2.5;
-const RAYS: u32 = 6u;
+const RAY_EXTENT: f32 = 7.0;
+const RAYS: u32 = 8u;
 
 fn dom_uv(dom: vec4<f32>, gid: vec2<u32>, size: vec2<u32>) -> vec2<f32> {
     return vec2<f32>(
@@ -72,9 +73,11 @@ fn cell_hash(seed: u32, k: u32, c: vec3<i32>) -> u32 {
     return pcg(h + bitcast<u32>(c.z));
 }
 
-fn ray_lobes(h_in: u32, dir: vec3<f32>) -> f32 {
+// Returns (rays at the rim, rays at x).
+fn rays(h_in: u32, n: vec3<f32>, dir: vec3<f32>, x: f32) -> vec2<f32> {
     var h = h_in;
-    var sum = 0.0;
+    var at_rim = 0.0;
+    var here = 0.0;
     for (var i = 0u; i < RAYS; i++) {
         h = pcg(h);
         let a = unit(h) * 2.0 - 1.0;
@@ -82,14 +85,23 @@ fn ray_lobes(h_in: u32, dir: vec3<f32>) -> f32 {
         let b = unit(h) * 2.0 - 1.0;
         h = pcg(h);
         let c = unit(h) * 2.0 - 1.0;
-        let len = max(sqrt(a * a + b * b + c * c), 1.0e-3);
-        var l = saturate(dot(dir, vec3<f32>(a / len, b / len, c / len)));
-        for (var k = 0; k < 5; k++) {
+        h = pcg(h);
+        let reach = 3.0 + (RAY_EXTENT - 3.0) * unit(h);
+        let along = a * n.x + b * n.y + c * n.z;
+        let t = vec3<f32>(a - along * n.x, b - along * n.y, c - along * n.z);
+        let len = max(sqrt(dot(t, t)), 1.0e-3);
+        var l = saturate(dot(dir, t / len));
+        for (var k = 0; k < 6; k++) {
             l *= l;
         }
-        sum += l;
+        at_rim += l;
+        here += l * saturate(1.0 - (x - 1.0) / (reach - 1.0));
     }
-    return saturate(sum);
+    return vec2<f32>(saturate(at_rim), saturate(here));
+}
+
+fn broken(ray: f32, rayed: f32) -> f32 {
+    return mix(1.0, 0.35 + 0.65 * ray, rayed);
 }
 
 fn craters(p: vec3<f32>, under: f32, density: f32) -> f32 {
@@ -106,9 +118,11 @@ fn craters(p: vec3<f32>, under: f32, density: f32) -> f32 {
     for (var k = 0u; k < classes; k++) {
         let q = p * frequency;
         let base = vec3<i32>(floor(q));
-        for (var dz = -1; dz <= 1; dz++) {
-            for (var dy = -1; dy <= 1; dy++) {
-                for (var dx = -1; dx <= 1; dx++) {
+        let reach = select(1, 2, params.ejecta == 1u);
+        let limit = select(EXTENT, RAY_EXTENT, params.ejecta == 1u);
+        for (var dz = -reach; dz <= reach; dz++) {
+            for (var dy = -reach; dy <= reach; dy++) {
+                for (var dx = -reach; dx <= reach; dx++) {
                     let c = base + vec3<i32>(dx, dy, dz);
                     var h = cell_hash(params.seed, k, c);
                     let present = saturate((occupancy - unit(h)) * 20.0);
@@ -128,7 +142,7 @@ fn craters(p: vec3<f32>, under: f32, density: f32) -> f32 {
                     let r = R_MAX * size;
                     let rho2 = max(dot(v, v) - across * across, 0.0);
                     let x = sqrt(rho2) / r;
-                    if (x >= EXTENT) { continue; }
+                    if (x >= limit) { continue; }
                     let weight = present * slab;
                     let t = (x - 1.0) / (EXTENT - 1.0);
                     let cover = select((1.0 - t) * (1.0 - t), 1.0, x < 1.0);
@@ -136,11 +150,17 @@ fn craters(p: vec3<f32>, under: f32, density: f32) -> f32 {
                     if (params.ejecta == 1u) {
                         let tangent = v - across * n;
                         let dir = tangent / max(sqrt(dot(tangent, tangent)), 1.0e-6);
-                        let lobes = ray_lobes(pcg(h), dir);
-                        let rim = mix(1.0, 0.35 + 0.65 * lobes, params.rays);
-                        let x2 = x * x;
-                        let bright = select(rim, mix(0.55, rim, x2 * x2), x < 1.0);
-                        out = mix(out, bright * (1.0 - params.age), weight * cover);
+                        let ray = rays(pcg(h), n, dir, max(x, 1.0));
+                        let rayed = params.rays * saturate(2.0 * size * shrink);
+                        let blanket = saturate(1.0 - t);
+                        var bright = 1.0;
+                        var amount = max(blanket * blanket * broken(ray.y, rayed), rayed * ray.y);
+                        if (x < 1.0) {
+                            let x4 = x * x * x * x;
+                            bright = mix(0.55, 1.0, x4);
+                            amount = mix(1.0, broken(ray.x, rayed), x4);
+                        }
+                        out = mix(out, bright * (1.0 - params.age), weight * amount);
                     } else {
                         let d = params.depth * (1.0 - 0.5 * big) * (1.0 - 0.75 * params.age);
                         let rim_h = 0.3 * d * (1.0 - 0.4 * params.age);

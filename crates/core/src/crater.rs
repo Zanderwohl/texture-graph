@@ -9,9 +9,10 @@
 //! A cell holds at most one crater, at a hashed point inside it. A crater is
 //! seen only from the slab `|h| < 1/2` cell about the surface, `h` measured
 //! along the surface normal, so every orientation of the surface against the
-//! lattice sees one layer of centers. Its extent is at most half a cell
-//! across the slab, so every crater that can reach a sample lies in the 27
-//! cells around it and the field is continuous across cell faces.
+//! lattice sees one layer of centers. A crater's relief reaches at most half
+//! a cell, so every crater that can touch a sample lies in the 27 cells
+//! around it and the field is continuous across cell faces. Rays reach a
+//! cell and a half, so ejecta searches the 125.
 //!
 //! Distance is measured in the tangent plane, so a crater is round on a
 //! sphere rather than a slice through a ball.
@@ -39,11 +40,15 @@ pub const DATUM: f32 = 0.5;
 /// half a cell.
 const R_MAX: f32 = 0.2;
 
-/// How far the ejecta reaches, in rim radii.
+/// How far the relief and the continuous ejecta blanket reach, in rim radii.
 const EXTENT: f32 = 2.5;
 
+/// How far the longest ray reaches, in rim radii: a cell and a half at
+/// [`R_MAX`].
+const RAY_EXTENT: f32 = 7.0;
+
 /// Rays per crater.
-const RAYS: u32 = 6;
+const RAYS: u32 = 8;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Spec {
@@ -103,11 +108,12 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-/// Brightness of the ejecta toward `dir`, a unit tangent: `RAYS` narrow lobes
-/// about hashed directions, summed.
-fn ray_lobes(h: u32, dir: [f32; 3]) -> f32 {
+/// The rays at `x` rim radii out toward `dir`, a unit tangent: `RAYS` narrow
+/// lobes about hashed tangent directions, each fading out at its own length.
+/// The first is the rays at the rim, which the blanket needs to meet.
+fn rays(h: u32, n: [f32; 3], dir: [f32; 3], x: f32) -> (f32, f32) {
     let mut h = h;
-    let mut sum = 0.0;
+    let (mut at_rim, mut here) = (0.0, 0.0);
     for _ in 0..RAYS {
         h = pcg(h);
         let a = unit(h) * 2.0 - 1.0;
@@ -115,16 +121,19 @@ fn ray_lobes(h: u32, dir: [f32; 3]) -> f32 {
         let b = unit(h) * 2.0 - 1.0;
         h = pcg(h);
         let c = unit(h) * 2.0 - 1.0;
-        let len = (a * a + b * b + c * c).sqrt().max(1.0e-3);
-        // Out of the tangent plane a direction shortens, which narrows its lobe
-        // further: variety for nothing.
-        let mut l = saturate(dot(dir, [a / len, b / len, c / len]));
-        for _ in 0..5 {
+        h = pcg(h);
+        let reach = 3.0 + (RAY_EXTENT - 3.0) * unit(h);
+        let along = a * n[0] + b * n[1] + c * n[2];
+        let t = [a - along * n[0], b - along * n[1], c - along * n[2]];
+        let len = dot(t, t).sqrt().max(1.0e-3);
+        let mut l = saturate(dot(dir, [t[0] / len, t[1] / len, t[2] / len]));
+        for _ in 0..6 {
             l *= l;
         }
-        sum += l;
+        at_rim += l;
+        here += l * saturate(1.0 - (x - 1.0) / (reach - 1.0));
     }
-    saturate(sum)
+    (saturate(at_rim), saturate(here))
 }
 
 /// The field at `p`, a point in sample space, over `under`, with `density`
@@ -144,9 +153,10 @@ pub fn sample(spec: &Spec, seed: u32, p: [f32; 3], under: f32, density: f32) -> 
     for class in 0..spec.classes.clamp(1, MAX_CLASSES) {
         let q = [p[0] * frequency, p[1] * frequency, p[2] * frequency];
         let base = [q[0].floor() as i32, q[1].floor() as i32, q[2].floor() as i32];
-        for dz in -1..=1 {
-            for dy in -1..=1 {
-                for dx in -1..=1 {
+        let reach = if spec.ejecta { 2 } else { 1 };
+        for dz in -reach..=reach {
+            for dy in -reach..=reach {
+                for dx in -reach..=reach {
                     let c = [base[0] + dx, base[1] + dy, base[2] + dz];
                     let mut h = cell_hash(seed, class, c);
                     // Soft, so a density between two craters' draws fades one in.
@@ -171,7 +181,7 @@ pub fn sample(spec: &Spec, seed: u32, p: [f32; 3], under: f32, density: f32) -> 
                     let r = R_MAX * size;
                     let rho2 = (dot(v, v) - across * across).max(0.0);
                     let x = rho2.sqrt() / r;
-                    if x >= EXTENT {
+                    if x >= if spec.ejecta { RAY_EXTENT } else { EXTENT } {
                         continue;
                     }
                     let weight = present * slab;
@@ -184,15 +194,20 @@ pub fn sample(spec: &Spec, seed: u32, p: [f32; 3], under: f32, density: f32) -> 
                         let tangent = [v[0] - across * n[0], v[1] - across * n[1], v[2] - across * n[2]];
                         let len = dot(tangent, tangent).sqrt().max(1.0e-6);
                         let dir = [tangent[0] / len, tangent[1] / len, tangent[2] / len];
-                        let lobes = ray_lobes(pcg(h), dir);
-                        let rim = mix(1.0, 0.35 + 0.65 * lobes, spec.rays);
-                        let bright = if x < 1.0 {
-                            let x2 = x * x;
-                            mix(0.55, rim, x2 * x2)
+                        let (at_rim, here) = rays(pcg(h), n, dir, x.max(1.0));
+                        // The blanket is broken up by the rays as much as `rays` says,
+                        // and beyond it only the rays go on. Small craters throw a halo
+                        // rather than rays.
+                        let rayed = spec.rays * saturate(2.0 * size * shrink);
+                        let broken = |ray: f32| mix(1.0, 0.35 + 0.65 * ray, rayed);
+                        let blanket = saturate(1.0 - t);
+                        let (bright, amount) = if x < 1.0 {
+                            let x4 = x * x * x * x;
+                            (mix(0.55, 1.0, x4), mix(1.0, broken(at_rim), x4))
                         } else {
-                            rim
+                            (1.0, (blanket * blanket * broken(here)).max(rayed * here))
                         };
-                        out = mix(out, bright * (1.0 - spec.age), weight * cover);
+                        out = mix(out, bright * (1.0 - spec.age), weight * amount);
                     } else {
                         let d = spec.depth * (1.0 - 0.5 * big) * (1.0 - 0.75 * spec.age);
                         let rim_h = 0.3 * d * (1.0 - 0.4 * spec.age);
@@ -307,13 +322,14 @@ mod tests {
     }
 
     #[test]
-    fn height_and_ejecta_mark_the_same_craters() {
+    fn ejecta_covers_every_crater() {
         let mut both = 0;
         for p in sphere_points(3000) {
             let h = sample(&spec(), 5, p, DATUM, 0.7);
             let e = sample(&Spec { ejecta: true, ..spec() }, 5, p, 0.0, 0.7);
             assert!((0.0..=1.0).contains(&e), "ejecta {e} out of range");
-            assert_eq!(h == DATUM, e == 0.0, "at {p:?}: height {h}, ejecta {e}");
+            // Rays run on past the relief, so only one way round.
+            assert!(h == DATUM || e > 0.0, "at {p:?}: height {h}, ejecta {e}");
             both += usize::from(e > 0.0);
         }
         assert!(both > 300, "{both}");

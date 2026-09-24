@@ -57,6 +57,15 @@ fn main() {
              its chemistry.",
             giant(),
         ),
+        (
+            "airless.tgraph",
+            "Airless",
+            "Any airless rocky world, from the Moon to Mercury: three series of craters, \
+             the oldest flooded by dark lava in its basins, with fresh ejecta and rays on top. \
+             Crater densities, the lava's extent and the colors are parameters. Its \"height\" \
+             layer is the relief about zero, for a host to light.",
+            airless(),
+        ),
     ] {
         let meta = FileMetadata {
             name: name.into(),
@@ -559,6 +568,136 @@ fn giant() -> Graph {
     let color = b.linear_blend("color", stormed, polar_c, polar_mask);
 
     let roughness = b.gray("roughness", 0.8);
+    b.finish(color, roughness, None)
+}
+
+/// Heights out of a Craters node per unit of sample space. A host lighting the
+/// "height" layer divides by it.
+const CRATER_RELIEF: f32 = 8.0;
+
+fn airless() -> Graph {
+    let mut b = Builder::new();
+    b.param("ancient craters", 0.0, 1.0, 1.0, "The oldest series, which the lava floods: 1 is a surface saturated with craters.");
+    b.param("later craters", 0.0, 1.0, 0.35, "The series after the lava, which lands on the maria too.");
+    b.param("fresh craters", 0.0, 1.0, 0.2, "The youngest series, sharp and bright-rayed.");
+    b.param("maria", 0.0, 1.0, 0.4, "How far dark lava floods the low basins: 0 is none. A host picks it from the share of the surface flooded.");
+    b.param("rays", 0.0, 1.0, 0.7, "How bright fresh ejecta is over the ground it lands on.");
+    b.param_color("highland", oklcha(0.66, 0.014, 75.0, 1.0), "The old cratered ground, at its brightest.");
+    b.param_color("mare", oklcha(0.47, 0.007, 255.0, 1.0), "The lava plains.");
+    b.param_color("ejecta", oklcha(0.86, 0.008, 80.0, 1.0), "Fresh ejecta, before space weathering darkens it.");
+
+    let sphere = |c: Craters| Craters { surface: CraterSurface::Sphere, relief: CRATER_RELIEF, ..c };
+    let ancient = b.add_layer(
+        "ancient",
+        LayerKind::Craters(sphere(Craters {
+            density: ScalarInput::Param("ancient craters".into()),
+            frequency: 1.5,
+            classes: 6,
+            depth: 0.35,
+            age: 0.7,
+            ..Craters::default()
+        })),
+    );
+
+    // Lava wells up where the crust is thin and pools in the lowest ground, which is the
+    // floors of the oldest basins; it fills their craters to the datum and leaves the rims
+    // standing as ghosts.
+    let basins = b.fbm("basins", 20, 0.9, 4, 0.5, FractalMode::Standard);
+    let maria = b.param_gray("maria level", "maria");
+    let lava = b.gray("lava", crater::DATUM);
+    let low = b.sub("low ground", lava, ancient);
+    // Centered on a half, since a Map clamps its value to [0, 1] before the lookup.
+    let mare_drive = b.weighted_sum("mare drive", &[(basins, 1.0), (maria, 1.0), (low, 1.5), (lava, -1.0)]);
+    let mare = b.remap("mare", mare_drive, 0.49, 0.51);
+    let filled = b.max("filled", ancient, lava);
+    let flooded = b.blend("flooded", ancient, filled, mare);
+
+    let later = b.add_layer(
+        "later",
+        LayerKind::Craters(sphere(Craters {
+            under: ScalarInput::Layer(flooded),
+            density: ScalarInput::Param("later craters".into()),
+            seed_offset: 1,
+            frequency: 2.5,
+            classes: 5,
+            gain: 1.0,
+            depth: 0.4,
+            age: 0.35,
+            ..Craters::default()
+        })),
+    );
+    let fresh_series = sphere(Craters {
+        under: ScalarInput::Layer(later),
+        density: ScalarInput::Param("fresh craters".into()),
+        seed_offset: 2,
+        frequency: 3.0,
+        classes: 5,
+        gain: 1.15,
+        depth: 0.45,
+        peak: 0.6,
+        rays: 0.8,
+        ..Craters::default()
+    });
+    let fresh = b.add_layer("fresh", LayerKind::Craters(fresh_series.clone()));
+    let datum = b.gray("datum", crater::DATUM);
+    b.sub("height", fresh, datum);
+
+    let ejecta = b.add_layer(
+        "ejecta",
+        LayerKind::Craters(Craters {
+            under: ScalarInput::Const(0.0),
+            output: CraterOutput::Ejecta,
+            ..fresh_series
+        }),
+    );
+
+    let one = b.gray("one", 1.0);
+    let zero = b.black();
+    let upland = b.blend("upland", one, zero, mare);
+    // Linear light between the two, where Oklch would swing the hue through purple.
+    let ground_palette = b.add_layer(
+        "ground palette",
+        LayerKind::ColorRamp(ColorRamp {
+            stops: vec![
+                ColorStop { t: 0.0, color: ColorInput::Param("mare".into()) },
+                ColorStop { t: 1.0, color: ColorInput::Param("highland".into()) },
+            ],
+            space: BlendSpace::LinearSrgb,
+        }),
+    );
+    let ground = b.map("ground", upland, ground_palette);
+    // Darkening in linear light keeps the hue, where an Oklch lerp toward black would
+    // swing it toward zero.
+    let mottle = b.fbm("mottle", 21, 5.0, 6, 0.55, FractalMode::Standard);
+    let shade = b.scale("shade", mottle, 0.35);
+    let mottled = b.add_layer(
+        "mottled",
+        LayerKind::Mix(Mix {
+            a: Some(ground),
+            b: Some(zero),
+            mode: BlendMode::Blend,
+            factor: ScalarInput::Layer(shade),
+            space: BlendSpace::LinearSrgb,
+        }),
+    );
+    let ejecta_palette = b.ramp_inputs(
+        "ejecta palette",
+        &[(0.0, ColorInput::Param("ejecta".into())), (1.0, ColorInput::Param("ejecta".into()))],
+    );
+    let ejecta_color = b.map("ejecta color", zero, ejecta_palette);
+    let bright = b.mix("bright", zero, ejecta, BlendMode::Blend, ScalarInput::Param("rays".into()));
+    let color = b.add_layer(
+        "color",
+        LayerKind::Mix(Mix {
+            a: Some(mottled),
+            b: Some(ejecta_color),
+            mode: BlendMode::Blend,
+            factor: ScalarInput::Layer(bright),
+            space: BlendSpace::LinearSrgb,
+        }),
+    );
+
+    let roughness = b.gray("roughness", 0.9);
     b.finish(color, roughness, None)
 }
 
