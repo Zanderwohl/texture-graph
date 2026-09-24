@@ -70,6 +70,7 @@ pub(crate) fn plan(graph: &Graph, root: LayerId) -> Result<HashMap<LayerId, Plac
             LayerKind::Color(_)
             | LayerKind::Noise(_)
             | LayerKind::Coordinate(_)
+            | LayerKind::Craters(_)
             | LayerKind::Mix(_)
             | LayerKind::MinMax(_)
             | LayerKind::Wave(_) => {
@@ -118,6 +119,7 @@ fn is_positional(graph: &Graph, id: LayerId, memo: &mut HashMap<LayerId, bool>) 
         layer.kind,
         LayerKind::Noise(_)
             | LayerKind::Coordinate(_)
+            | LayerKind::Craters(_)
             | LayerKind::ColorRamp(_)
             | LayerKind::Transform(_)
             | LayerKind::Warp(_)

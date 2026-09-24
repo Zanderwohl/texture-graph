@@ -5,8 +5,9 @@
 //! `documentation/game-consumer-features.md`, section 6.
 //!
 //! Only `ScalarInput` and `ColorInput` have a `Param` variant, so the
-//! bindable sockets are `Mix::factor`, `Wave::input`, the Output's roughness
-//! and metallic, and ColorRamp stops. A `Color` layer holds a plain `Color`
+//! bindable sockets are `Mix::factor`, `Wave::input`, `Craters::under` and
+//! `Craters::density`, the Output's roughness and metallic, and ColorRamp
+//! stops. A `Color` layer holds a plain `Color`
 //! and cannot take a param: changing its type would break saved graphs,
 //! since RON writes the variant name.
 //!

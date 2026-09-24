@@ -58,6 +58,20 @@ pub enum ParamRow {
     WarpMode,
     WarpAmount,
     CoordinateAxis,
+    CratersSurface,
+    CratersOutput,
+    CratersFrequency,
+    CratersSeed,
+    CratersClasses,
+    CratersGain,
+    CratersDepth,
+    CratersAge,
+    CratersErase,
+    CratersPeak,
+    /// Ejecta only.
+    CratersRays,
+    /// Height only.
+    CratersRelief,
 }
 
 /// Row table for a layer node. Height follows the kind, conditional rows
@@ -160,6 +174,26 @@ pub fn rows_for(kind: &LayerKind) -> Vec<Row> {
             Row::Param(ParamRow::WaveRange),
         ]),
         LayerKind::Coordinate(_) => rows.push(Row::Param(ParamRow::CoordinateAxis)),
+        LayerKind::Craters(c) => {
+            rows.extend([
+                Row::Socket(InputKey::CratersUnder),
+                Row::Socket(InputKey::CratersDensity),
+                Row::Param(ParamRow::CratersSurface),
+                Row::Param(ParamRow::CratersOutput),
+                Row::Param(ParamRow::CratersFrequency),
+                Row::Param(ParamRow::CratersSeed),
+                Row::Param(ParamRow::CratersClasses),
+                Row::Param(ParamRow::CratersGain),
+                Row::Param(ParamRow::CratersDepth),
+                Row::Param(ParamRow::CratersAge),
+                Row::Param(ParamRow::CratersErase),
+                Row::Param(ParamRow::CratersPeak),
+            ]);
+            rows.push(Row::Param(match c.output {
+                texture_graph_core::CraterOutput::Height => ParamRow::CratersRelief,
+                texture_graph_core::CraterOutput::Ejecta => ParamRow::CratersRays,
+            }));
+        }
     }
     rows
 }
@@ -180,6 +214,8 @@ pub fn socket_label(key: InputKey) -> &'static str {
         InputKey::MixB | InputKey::MinMaxB => "b",
         InputKey::MixFactor => "factor",
         InputKey::WaveInput => "input",
+        InputKey::CratersUnder => "under",
+        InputKey::CratersDensity => "density",
         InputKey::WarpBy => "by",
         InputKey::MapValue => "value",
         InputKey::MapPalette => "palette",

@@ -2,7 +2,7 @@
 //! canvas node bodies label the same field the same way.
 
 use texture_graph_core::{
-    Axis, FractalMode, NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, WarpMode, WaveShape,
+    Axis, CraterOutput, CraterSurface, FractalMode, NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, WarpMode, WaveShape,
 };
 
 pub const DIMS: &[NoiseDims] = &[NoiseDims::D1, NoiseDims::D2, NoiseDims::D3];
@@ -108,5 +108,23 @@ pub fn warp_mode(m: WarpMode) -> &'static str {
     match m {
         WarpMode::Scalar => "scalar (L)",
         WarpMode::Vector => "vector (L, C, hue)",
+    }
+}
+
+pub const CRATER_SURFACES: &[CraterSurface] = &[CraterSurface::Plane, CraterSurface::Sphere];
+
+pub fn crater_surface(s: CraterSurface) -> &'static str {
+    match s {
+        CraterSurface::Plane => "plane",
+        CraterSurface::Sphere => "sphere",
+    }
+}
+
+pub const CRATER_OUTPUTS: &[CraterOutput] = &[CraterOutput::Height, CraterOutput::Ejecta];
+
+pub fn crater_output(o: CraterOutput) -> &'static str {
+    match o {
+        CraterOutput::Height => "height",
+        CraterOutput::Ejecta => "ejecta",
     }
 }

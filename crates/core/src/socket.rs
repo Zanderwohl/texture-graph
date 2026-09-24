@@ -22,6 +22,8 @@ pub enum InputKey {
     MinMaxB,
     H2nSource,
     WaveInput,
+    CratersUnder,
+    CratersDensity,
     WarpSource,
     WarpBy,
     RampStop(usize),
@@ -160,6 +162,10 @@ impl LayerKind {
                 sock(InputKey::WarpBy, "by", SocketValue::LayerOpt(w.by)),
             ],
             LayerKind::Coordinate(_) => Vec::new(),
+            LayerKind::Craters(c) => vec![
+                sock(InputKey::CratersUnder, "under", SocketValue::Scalar(c.under.clone())),
+                sock(InputKey::CratersDensity, "density", SocketValue::Scalar(c.density.clone())),
+            ],
         }
     }
 
@@ -185,6 +191,10 @@ impl LayerKind {
                 Ok(set_opt(&mut h.source, target))
             }
             (LayerKind::Wave(w), InputKey::WaveInput) => Ok(set_scalar(&mut w.input, target)),
+            (LayerKind::Craters(c), InputKey::CratersUnder) => Ok(set_scalar(&mut c.under, target)),
+            (LayerKind::Craters(c), InputKey::CratersDensity) => {
+                Ok(set_scalar(&mut c.density, target))
+            }
             (LayerKind::Warp(w), InputKey::WarpSource) => Ok(set_opt(&mut w.source, target)),
             (LayerKind::Warp(w), InputKey::WarpBy) => Ok(set_opt(&mut w.by, target)),
             (LayerKind::ColorRamp(r), InputKey::RampStop(i)) => match r.stops.get_mut(i) {
@@ -210,6 +220,14 @@ impl LayerKind {
                 w.input = ScalarInput::Param(name);
                 Ok(())
             }
+            (LayerKind::Craters(c), InputKey::CratersUnder) => {
+                c.under = ScalarInput::Param(name);
+                Ok(())
+            }
+            (LayerKind::Craters(c), InputKey::CratersDensity) => {
+                c.density = ScalarInput::Param(name);
+                Ok(())
+            }
             (LayerKind::ColorRamp(r), InputKey::RampStop(i)) => match r.stops.get_mut(i) {
                 Some(stop) => {
                     stop.color = ColorInput::Param(name);
@@ -231,6 +249,14 @@ impl LayerKind {
             }
             (LayerKind::Wave(w), InputKey::WaveInput, ConstValue::Scalar(v)) => {
                 w.input = ScalarInput::Const(v);
+                Ok(())
+            }
+            (LayerKind::Craters(c), InputKey::CratersUnder, ConstValue::Scalar(v)) => {
+                c.under = ScalarInput::Const(v);
+                Ok(())
+            }
+            (LayerKind::Craters(c), InputKey::CratersDensity, ConstValue::Scalar(v)) => {
+                c.density = ScalarInput::Const(v);
                 Ok(())
             }
             (LayerKind::ColorRamp(r), InputKey::RampStop(i), ConstValue::Color(c)) => {
@@ -374,6 +400,11 @@ mod tests {
                 source: Some(id(14)),
                 by: Some(id(15)),
                 ..crate::kind::Warp::default()
+            }),
+            LayerKind::Craters(crate::kind::Craters {
+                under: ScalarInput::Layer(id(16)),
+                density: ScalarInput::Layer(id(17)),
+                ..crate::kind::Craters::default()
             }),
         ]
     }

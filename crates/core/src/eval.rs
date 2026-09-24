@@ -5,7 +5,8 @@ use crate::graph::{Graph, Layer};
 use crate::id::LayerId;
 use crate::param::ParamValue;
 use crate::kind::{
-    Axis, BlendMode, ColorInput, ColorRamp, CoordMode, Criterion, EXTEND_LIMIT, EdgeMode,
+    Axis, BlendMode, ColorInput, ColorRamp, CoordMode, CraterOutput, CraterSurface, Craters,
+    Criterion, EXTEND_LIMIT, EdgeMode,
     FractalMode, HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseDims,
     NoiseKernel, NoiseOutput, NoiseRange, RadialDim, ScalarInput, Transform, Warp, WarpMode,
     Wave, WaveShape,
@@ -153,6 +154,7 @@ fn eval_layer(id: LayerId, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &Ev
             };
             oklcha(at, 0.0, 0.0, 1.0)
         }
+        LayerKind::Craters(c) => eval_craters(c, s, by_id, ctx),
     }
 }
 
@@ -265,6 +267,30 @@ fn eval_noise(n: &Noise, s: Sample, ctx: &EvalCtx) -> Color {
             Color::new(nl, nc * CHROMA_SCALE, hue, 1.0)
         }
     }
+}
+
+pub fn crater_spec(c: &Craters) -> crate::crater::Spec {
+    crate::crater::Spec {
+        frequency: c.frequency,
+        classes: c.classes,
+        gain: c.gain,
+        depth: c.depth,
+        age: c.age,
+        erase: c.erase,
+        peak: c.peak,
+        rays: c.rays,
+        relief: c.relief,
+        sphere: c.surface == CraterSurface::Sphere,
+        ejecta: c.output == CraterOutput::Ejecta,
+    }
+}
+
+fn eval_craters(c: &Craters, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &EvalCtx) -> Color {
+    let under = eval_scalar(&c.under, s, by_id, ctx);
+    let density = eval_scalar(&c.density, s, by_id, ctx);
+    let seed = ctx.seed.wrapping_add(c.seed_offset);
+    let l = crate::crater::sample(&crater_spec(c), seed, [s.u, s.v, s.w], under, density);
+    Color::new(l, 0.0, 0.0, 1.0)
 }
 
 fn eval_ramp(r: &ColorRamp, s: Sample, by_id: &HashMap<LayerId, &Layer>, ctx: &EvalCtx) -> Color {

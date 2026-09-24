@@ -470,3 +470,60 @@ fn a_constant_can_feed_moved_and_unmoved_branches() {
         .bake_scalar_cube(&g, out, 8, ScalarFormat::R8Unorm, &EvalCtx::default())
         .expect("one placement for the constant");
 }
+
+/// Two series of craters, the second over the first with a density read from
+/// a layer, and the second's ejecta: every path through `craters.wgsl`.
+#[test]
+fn a_sphere_bake_holds_the_cpu_craters() {
+    use texture_graph_core::{CraterOutput, CraterSurface, Craters};
+    const FACE: u32 = 64;
+    let mut g = Graph::new();
+    let sphere = |c: Craters| LayerKind::Craters(Craters { surface: CraterSurface::Sphere, ..c });
+    let old = g
+        .add_layer(
+            "old",
+            sphere(Craters { frequency: 3.0, classes: 3, age: 0.6, density: ScalarInput::Const(0.9), ..Default::default() }),
+        )
+        .unwrap();
+    let patchy = g
+        .add_layer("patchy", LayerKind::Noise(Noise { dims: NoiseDims::D3, frequency: 2.0, ..Default::default() }))
+        .unwrap();
+    let young = Craters {
+        under: ScalarInput::Layer(old),
+        density: ScalarInput::Layer(patchy),
+        frequency: 2.0,
+        seed_offset: 5,
+        ..Default::default()
+    };
+    let height = g.add_layer("young", sphere(young.clone())).unwrap();
+    let ejecta = g
+        .add_layer(
+            "ejecta",
+            sphere(Craters { under: ScalarInput::Const(0.0), output: CraterOutput::Ejecta, ..young }),
+        )
+        .unwrap();
+
+    let ctx = pollster::block_on(DeviceCtx::request_headless()).expect("headless");
+    let mut baker = Baker::new(ctx.clone());
+    // Rays raise a dot product to the 32nd power, which is where the backends'
+    // normalizations part.
+    for (id, name, tolerance) in [(height, "height", 1.0e-3), (ejecta, "ejecta", 2.0 / 255.0)] {
+        let cube = baker
+            .bake_scalar_cube(&g, id, FACE, ScalarFormat::R32Float, &EvalCtx::default())
+            .expect("bake_scalar_cube");
+        let img = read_scalar_volume(&ctx, &cube.texture, (FACE, FACE, 6), cube.format);
+        let (mut worst, mut moved) = (0.0f32, 0);
+        for face in 0..6 {
+            for y in 0..FACE {
+                for x in 0..FACE {
+                    let got = img.value(x, y, face).unwrap();
+                    let want = cpu_on_sphere(&g, id, face, x, y, FACE);
+                    worst = worst.max((got - want).abs());
+                    moved += usize::from(want != if name == "height" { 0.5 } else { 0.0 });
+                }
+            }
+        }
+        assert!(worst <= tolerance, "{name}: worst delta over the sphere {worst}");
+        assert!(moved > (6 * FACE * FACE / 4) as usize, "{name}: only {moved} texels cratered");
+    }
+}

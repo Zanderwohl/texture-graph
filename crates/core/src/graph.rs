@@ -186,6 +186,8 @@ impl Graph {
             let is_3d = match &l.kind {
                 LayerKind::Noise(n) => matches!(n.dims, NoiseDims::D3),
                 LayerKind::Coordinate(c) => matches!(c.axis, Axis::W),
+                // Crater centers sit anywhere in their cells, `w` included.
+                LayerKind::Craters(_) => true,
                 LayerKind::Transform(t) => match &t.coord_mode {
                     CoordMode::Permute(axes) => {
                         axes.iter().any(|a| matches!(a, Axis::W))
@@ -588,6 +590,10 @@ fn rewrite_param(kind: &mut LayerKind, name: &str, to: Option<&str>) {
     match kind {
         LayerKind::Mix(m) => scalar(&mut m.factor),
         LayerKind::Wave(w) => scalar(&mut w.input),
+        LayerKind::Craters(c) => {
+            scalar(&mut c.under);
+            scalar(&mut c.density);
+        }
         LayerKind::ColorRamp(r) => {
             for stop in &mut r.stops {
                 if matches!(&stop.color, ColorInput::Param(n) if n == name) {
@@ -617,6 +623,10 @@ fn freeze_param(kind: &mut LayerKind, name: &str, value: ParamValue) {
     match kind {
         LayerKind::Mix(m) => scalar(&mut m.factor),
         LayerKind::Wave(w) => scalar(&mut w.input),
+        LayerKind::Craters(c) => {
+            scalar(&mut c.under);
+            scalar(&mut c.density);
+        }
         LayerKind::ColorRamp(r) => {
             for stop in &mut r.stops {
                 if matches!(&stop.color, ColorInput::Param(n) if n == name) {

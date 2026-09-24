@@ -8,7 +8,7 @@ use std::sync::Arc;
 use texture_graph_core::{
     Axis, BlendMode, BlendSpace, Color, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion,
     EvalCtx, Graph, InputKey, LayerId, LayerKind, MinMaxMode, NoiseKernel, RadialDim,
-    ParamUse, ScalarInput, noise::MAX_OCTAVES,
+    ParamUse, ScalarInput, crater::MAX_CLASSES as MAX_CRATER_CLASSES, noise::MAX_OCTAVES,
 };
 
 use crate::app::GpuBits;
@@ -915,6 +915,28 @@ fn socket_row(
                 |ui, v| ui.add(egui::Slider::new(v, 0.0..=1.0)),
             );
         }
+        (LayerKind::Craters(c), InputKey::CratersUnder) => {
+            ui.label(socket_label(key));
+            changed |= param_ref::scalar_socket(
+                ui,
+                graph,
+                eval_ctx,
+                ("craters-under", node),
+                &mut c.under,
+                |ui, v| ui.add(egui::DragValue::new(v).speed(0.01)),
+            );
+        }
+        (LayerKind::Craters(c), InputKey::CratersDensity) => {
+            ui.label(socket_label(key));
+            changed |= param_ref::scalar_socket(
+                ui,
+                graph,
+                eval_ctx,
+                ("craters-density", node),
+                &mut c.density,
+                |ui, v| ui.add(egui::Slider::new(v, 0.0..=1.0)),
+            );
+        }
         (LayerKind::Wave(w), InputKey::WaveInput) => {
             ui.label(socket_label(key));
             changed |= param_ref::scalar_socket(
@@ -1073,6 +1095,64 @@ fn param_row(ui: &mut egui::Ui, id: LayerId, kind: &mut LayerKind, p: ParamRow) 
             node_labels::AXES,
             node_labels::axis,
         ),
+        (LayerKind::Craters(c), ParamRow::CratersSurface) => enum_combo(
+            ui,
+            salt("craters-surface"),
+            "surface",
+            &mut c.surface,
+            node_labels::CRATER_SURFACES,
+            node_labels::crater_surface,
+        ),
+        (LayerKind::Craters(c), ParamRow::CratersOutput) => enum_combo(
+            ui,
+            salt("craters-output"),
+            "output",
+            &mut c.output,
+            node_labels::CRATER_OUTPUTS,
+            node_labels::crater_output,
+        ),
+        (LayerKind::Craters(c), ParamRow::CratersFrequency) => {
+            ui.label("freq");
+            ui.add(egui::Slider::new(&mut c.frequency, 0.5..=64.0).logarithmic(true))
+                .changed()
+        }
+        (LayerKind::Craters(c), ParamRow::CratersSeed) => {
+            ui.label("seed");
+            ui.add(egui::DragValue::new(&mut c.seed_offset)).changed()
+        }
+        (LayerKind::Craters(c), ParamRow::CratersClasses) => {
+            ui.label("sizes");
+            ui.add(egui::Slider::new(&mut c.classes, 1..=MAX_CRATER_CLASSES)).changed()
+        }
+        (LayerKind::Craters(c), ParamRow::CratersGain) => {
+            ui.label("gain");
+            ui.add(egui::Slider::new(&mut c.gain, 0.25..=2.0)).changed()
+        }
+        (LayerKind::Craters(c), ParamRow::CratersDepth) => {
+            ui.label("depth");
+            ui.add(egui::Slider::new(&mut c.depth, 0.0..=1.0)).changed()
+        }
+        (LayerKind::Craters(c), ParamRow::CratersAge) => {
+            ui.label("age");
+            ui.add(egui::Slider::new(&mut c.age, 0.0..=1.0)).changed()
+        }
+        (LayerKind::Craters(c), ParamRow::CratersErase) => {
+            ui.label("erase");
+            ui.add(egui::Slider::new(&mut c.erase, 0.0..=1.0)).changed()
+        }
+        (LayerKind::Craters(c), ParamRow::CratersPeak) => {
+            ui.label("peak");
+            ui.add(egui::Slider::new(&mut c.peak, 0.0..=1.0)).changed()
+        }
+        (LayerKind::Craters(c), ParamRow::CratersRays) => {
+            ui.label("rays");
+            ui.add(egui::Slider::new(&mut c.rays, 0.0..=1.0)).changed()
+        }
+        (LayerKind::Craters(c), ParamRow::CratersRelief) => {
+            ui.label("relief");
+            ui.add(egui::Slider::new(&mut c.relief, 0.1..=100.0).logarithmic(true))
+                .changed()
+        }
         (LayerKind::Wave(w), ParamRow::WaveShape) => enum_combo(
             ui,
             salt("wave-shape"),

@@ -6,7 +6,8 @@
 
 use texture_graph_core::color::oklcha;
 use texture_graph_core::{
-    BlendMode, BlendSpace, ColorInput, ColorRamp, ColorStop, CoordMode, Coordinate, Criterion,
+    BlendMode, BlendSpace, ColorInput, ColorRamp, ColorStop, CoordMode, Coordinate, Craters,
+    Criterion,
     EdgeMode,
     Graph, HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, ScalarInput,
     Transform, Warp, Wave,
@@ -33,6 +34,7 @@ pub enum Kind {
     Wave,
     Warp,
     Coordinate,
+    Craters,
 }
 
 impl Kind {
@@ -52,6 +54,7 @@ impl Kind {
             LayerKind::Wave(_) => Kind::Wave,
             LayerKind::Warp(_) => Kind::Warp,
             LayerKind::Coordinate(_) => Kind::Coordinate,
+            LayerKind::Craters(_) => Kind::Craters,
         }
     }
 }
@@ -70,6 +73,7 @@ pub const VARIANTS: &[Variant] = &[
     Variant { label: "Wave", kind: Kind::Wave },
     Variant { label: "Warp", kind: Kind::Warp },
     Variant { label: "Coordinate", kind: Kind::Coordinate },
+    Variant { label: "Craters", kind: Kind::Craters },
 ];
 
 /// Layer inputs start unconnected so creation can never trip the cycle
@@ -113,6 +117,7 @@ pub fn default_kind(kind: Kind) -> LayerKind {
         Kind::Wave => LayerKind::Wave(Wave::default()),
         Kind::Warp => LayerKind::Warp(Warp::default()),
         Kind::Coordinate => LayerKind::Coordinate(Coordinate::default()),
+        Kind::Craters => LayerKind::Craters(Craters::default()),
     }
 }
 
@@ -162,6 +167,7 @@ mod tests {
             Kind::Wave,
             Kind::Warp,
             Kind::Coordinate,
+            Kind::Craters,
         ];
         for kind in ALL {
             assert!(

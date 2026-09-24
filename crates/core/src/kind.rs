@@ -18,6 +18,7 @@ pub enum LayerKind {
     Wave(Wave),
     Warp(Warp),
     Coordinate(Coordinate),
+    Craters(Craters),
 }
 
 impl LayerKind {
@@ -34,6 +35,7 @@ impl LayerKind {
             LayerKind::Wave(_) => "Wave",
             LayerKind::Warp(_) => "Warp",
             LayerKind::Coordinate(_) => "Coordinate",
+            LayerKind::Craters(_) => "Craters",
         }
     }
 
@@ -78,6 +80,10 @@ impl LayerKind {
                 out.extend(w.source);
                 out.extend(w.by);
             }
+            LayerKind::Craters(c) => {
+                push_scalar(&mut out, &c.under);
+                push_scalar(&mut out, &c.density);
+            }
         }
         out
     }
@@ -102,6 +108,13 @@ impl LayerKind {
             LayerKind::Wave(w) => {
                 if let ScalarInput::Param(name) = &w.input {
                     out.push((name.as_str(), ParamUse::Scalar));
+                }
+            }
+            LayerKind::Craters(c) => {
+                for si in [&c.under, &c.density] {
+                    if let ScalarInput::Param(name) = si {
+                        out.push((name.as_str(), ParamUse::Scalar));
+                    }
                 }
             }
             LayerKind::Transform(_)
@@ -478,4 +491,82 @@ pub enum Criterion {
     Luma,
     Alpha,
     Chroma,
+}
+
+/// A scatter of impact craters over `under`, as height or as the brightness
+/// of their ejecta. See [`crate::crater`] for the field and how craters
+/// overprint what they land on; chain nodes through `under` for successive
+/// series of impacts.
+///
+/// Height is `under` plus relief in sample-space units times `relief`, about
+/// [`crate::crater::DATUM`]. Two nodes that differ only in `output` place the
+/// same craters.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Craters {
+    pub under: ScalarInput,
+    /// Share of the largest class's cells holding a crater, `[0, 1]`. A layer
+    /// is read where each pixel is, so it fades craters across its gradients
+    /// rather than deciding them whole.
+    pub density: ScalarInput,
+    pub seed_offset: u32,
+    /// Cells per unit of sample space in the largest class. A rim is at most a
+    /// fifth of a cell in radius.
+    pub frequency: f32,
+    /// Size classes, each half the last, `1..=`[`crate::crater::MAX_CLASSES`].
+    pub classes: u32,
+    /// Occupancy per class relative to the class before: 1 is a `D^-2`
+    /// cumulative count, more favors small craters.
+    pub gain: f32,
+    /// Bowl depth over rim radius, fresh and simple. The Moon's is about 0.4.
+    pub depth: f32,
+    /// `[0, 1]`: shallower bowls, lower rims and darker ejecta.
+    pub age: f32,
+    /// `[0, 1]`: how far a crater wipes out what was there before.
+    pub erase: f32,
+    /// Central peak in bowl depths, on the largest craters.
+    pub peak: f32,
+    /// `[0, 1]`: how much of the ejecta's brightness is in rays.
+    pub rays: f32,
+    pub relief: f32,
+    pub surface: CraterSurface,
+    pub output: CraterOutput,
+}
+
+impl Default for Craters {
+    fn default() -> Self {
+        Self {
+            under: ScalarInput::Const(crate::crater::DATUM),
+            density: ScalarInput::Const(0.6),
+            seed_offset: 0,
+            frequency: 4.0,
+            classes: 4,
+            gain: 1.0,
+            depth: 0.4,
+            age: 0.0,
+            erase: 1.0,
+            peak: 0.5,
+            rays: 0.5,
+            relief: 10.0,
+            surface: CraterSurface::Plane,
+            output: CraterOutput::Height,
+        }
+    }
+}
+
+/// Which way is up, so a crater is round on the surface being baked.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum CraterSurface {
+    /// `+w`, for a flat bake.
+    #[default]
+    Plane,
+    /// Away from the unit cube's center, for a sphere bake.
+    Sphere,
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum CraterOutput {
+    #[default]
+    Height,
+    /// Fresh ejecta's brightness in `[0, 1]`, rays included, over `under`.
+    Ejecta,
 }

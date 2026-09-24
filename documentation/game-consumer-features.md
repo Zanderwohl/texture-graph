@@ -311,11 +311,30 @@ volume — which spends nearly all its texels on an interior nobody sees. At
   a face's, not a position.
 
 The sphere bake supports the kinds that read their inputs at the sample itself —
-Color, Noise, Coordinate, Mix, MinMax, Wave — and refuses the rest with
+Color, Noise, Coordinate, Mix, MinMax, Wave, Craters — and refuses the rest with
 `BakeError::Unsupported`. Transform, Warp and HeightToNormal re-sample an input at
 other (u, v), and Map reads its palette along u; on a cube face those would bake
 something plausible and wrong. Each can be given a sphere meaning later. Format
 version 3.
+
+### Craters
+
+Added for airless worlds. A node cannot re-sample its input elsewhere, so a
+general "scatter this stamp" node has no meaning here; **`LayerKind::Craters`**
+is a scatter with its stamp built in. `core::crater` is the specification and
+`craters.wgsl` its twin.
+
+- Size classes halve, each a lattice of cells holding at most one crater, so
+  the count per size is set by `gain` alone: 1 is the saturated `D^-2`.
+- A crater is round on the surface: distance is taken in the tangent plane of
+  `surface` (`Plane` for a flat bake, `Sphere` for a cube).
+- It reads `under` at the same sample, pulls it toward the datum 0.5 by
+  `erase` inside its rim and less across its ejecta, then adds its own relief.
+  So a series of impacts is a node, and a later series is another node with
+  the earlier one as its `under`: flooding or anything else can go between.
+- `output: Ejecta` places the same craters and gives the brightness of their
+  ejecta, rays included, for albedo. `density` is a scalar input, so a host
+  can bind it per world.
 
 ## Suggested order
 

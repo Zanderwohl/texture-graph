@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use bytemuck::{Pod, Zeroable};
 use texture_graph_core::{
-    Axis, BlendMode, Coordinate, BlendSpace, ColorInput, ColorRamp, CoordMode, Criterion, EvalCtx,
+    Axis, BlendMode, Coordinate, Craters, BlendSpace, ColorInput, ColorRamp, CoordMode, Criterion, EvalCtx,
     FractalMode, Graph, HeightToNormal, LayerId, LayerKind, MinMax, MinMaxMode, Mix, Noise,
     NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, RadialDim, ScalarInput, Transform,
     Warp, WarpMode, Wave, WaveShape,
@@ -251,6 +251,7 @@ pub struct Baker {
     color_bgl: wgpu::BindGroupLayout,
     noise_pipeline: wgpu::ComputePipeline,
     coordinate_pipeline: wgpu::ComputePipeline,
+    craters_pipeline: wgpu::ComputePipeline,
     transform_pipeline: wgpu::ComputePipeline,
     transform_bgl: wgpu::BindGroupLayout,
     mix_pipeline: wgpu::ComputePipeline,
@@ -293,6 +294,7 @@ impl Baker {
         let (mix_pipeline, mix_bgl) = make_mix_pipeline(&ctx.device);
         let (map_pipeline, map_bgl) = make_map_pipeline(&ctx.device);
         let min_max_pipeline = make_min_max_pipeline(&ctx.device, &map_bgl);
+        let craters_pipeline = make_craters_pipeline(&ctx.device, &map_bgl);
         let (ramp_pipeline, ramp_bgl) = make_ramp_pipeline(&ctx.device);
         let h2n_pipeline = make_h2n_pipeline(&ctx.device, &transform_bgl);
         let wave_pipeline = make_wave_pipeline(&ctx.device, &transform_bgl);
@@ -313,7 +315,7 @@ impl Baker {
         let (pack_pipeline, pack_bgl) = make_pack_pipeline(&ctx.device);
         let (solid_pipeline, solid_bgl) = make_solid_pipeline(&ctx.device);
         let (scalar_shader, scalar_bgl) = make_scalar_pack_shader(&ctx.device);
-        log::debug!("baker created compute_pipelines=14 pool_format={:?}", POOL_FORMAT);
+        log::debug!("baker created compute_pipelines=15 pool_format={:?}", POOL_FORMAT);
         Self {
             ctx,
             pool: Vec::new(),
@@ -323,6 +325,7 @@ impl Baker {
             color_bgl,
             noise_pipeline,
             coordinate_pipeline,
+            craters_pipeline,
             transform_pipeline,
             transform_bgl,
             mix_pipeline,
@@ -560,6 +563,32 @@ impl Baker {
                     at.face_code(),
                     at.point_map(),
                     own_dom,
+                );
+            }
+            LayerKind::Craters(c) => {
+                // A const input is not read, but its slot must be bound.
+                let input = |si: &ScalarInput| match si {
+                    ScalarInput::Layer(id) => (resolve(Some(*id)), dom_opt(Some(*id))),
+                    ScalarInput::Const(_) | ScalarInput::Param(_) => {
+                        (missing_view, Domain::UNIT.packed())
+                    }
+                };
+                let (under_view, dom_under) = input(&c.under);
+                let (density_view, dom_density) = input(&c.density);
+                dispatch_craters(
+                    &self.ctx,
+                    encoder,
+                    &self.craters_pipeline,
+                    &self.map_bgl,
+                    &pool_views[dst_slot],
+                    [under_view, density_view],
+                    c,
+                    eval_ctx,
+                    size,
+                    w,
+                    at.face_code(),
+                    at.point_map(),
+                    [own_dom, dom_under, dom_density],
                 );
             }
             LayerKind::Transform(t) => {
@@ -2368,6 +2397,137 @@ fn dispatch_coordinate(
     cpass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct CratersParams {
+    size: [u32; 2],
+    face: u32,
+    seed: u32,
+    dom: [f32; 4],
+    dom_under: [f32; 4],
+    dom_density: [f32; 4],
+    point_map: PointMap,
+    w_coord: f32,
+    frequency: f32,
+    classes: u32,
+    gain: f32,
+    depth: f32,
+    age: f32,
+    erase: f32,
+    peak: f32,
+    rays: f32,
+    relief: f32,
+    sphere: u32,
+    ejecta: u32,
+    under_const: f32,
+    under_is_layer: u32,
+    density_const: f32,
+    density_is_layer: u32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_craters(
+    ctx: &DeviceCtx,
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::ComputePipeline,
+    bgl: &wgpu::BindGroupLayout,
+    dst_view: &wgpu::TextureView,
+    [under_view, density_view]: [&wgpu::TextureView; 2],
+    c: &Craters,
+    eval_ctx: &EvalCtx,
+    size: (u32, u32),
+    w: f32,
+    face: u32,
+    point_map: PointMap,
+    [dom, dom_under, dom_density]: [[f32; 4]; 3],
+) {
+    let spec = texture_graph_core::eval::crater_spec(c);
+    let read = |si: &ScalarInput| match eval_ctx.scalar_const(si) {
+        Some(v) => (v, 0u32),
+        None => (0.0, 1u32),
+    };
+    let (under_const, under_is_layer) = read(&c.under);
+    let (density_const, density_is_layer) = read(&c.density);
+    let params = CratersParams {
+        size: [size.0, size.1],
+        face,
+        seed: eval_ctx.seed.wrapping_add(c.seed_offset),
+        dom,
+        dom_under,
+        dom_density,
+        point_map,
+        w_coord: w,
+        frequency: spec.frequency,
+        classes: spec.classes,
+        gain: spec.gain,
+        depth: spec.depth,
+        age: spec.age,
+        erase: spec.erase,
+        peak: spec.peak,
+        rays: spec.rays,
+        relief: spec.relief,
+        sphere: spec.sphere as u32,
+        ejecta: spec.ejecta as u32,
+        under_const,
+        under_is_layer,
+        density_const,
+        density_is_layer,
+    };
+    let ubo = create_uniform(&ctx.device, bytemuck::bytes_of(&params), "craters-params");
+    let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("craters-bg"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: ubo.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(dst_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(under_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(density_view),
+            },
+        ],
+    });
+    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("craters-cpass"),
+        timestamp_writes: None,
+    });
+    cpass.set_pipeline(pipeline);
+    cpass.set_bind_group(0, &bg, &[]);
+    cpass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
+}
+
+fn make_craters_pipeline(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+) -> wgpu::ComputePipeline {
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("craters-pl"),
+        bind_group_layouts: &[Some(bgl)],
+        ..Default::default()
+    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("craters-shader"),
+        source: wgpu::ShaderSource::Wgsl(
+            concat!(include_str!("shaders/sphere.wgsl"), include_str!("shaders/craters.wgsl"))
+                .into(),
+        ),
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("craters-pipeline"),
+        layout: Some(&pl),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    })
+}
+
 fn make_coordinate_pipeline(
     device: &wgpu::Device,
     bgl: &wgpu::BindGroupLayout,
@@ -2716,6 +2876,7 @@ fn pipeline_name(kind: &LayerKind) -> &'static str {
         LayerKind::Color(_) => "color.wgsl",
         LayerKind::Noise(_) => "noise.wgsl",
         LayerKind::Coordinate(_) => "coordinate.wgsl",
+        LayerKind::Craters(_) => "craters.wgsl",
         LayerKind::Transform(_) => "transform.wgsl",
         LayerKind::Mix(_) => "mix.wgsl",
         LayerKind::Map(_) => "map.wgsl",

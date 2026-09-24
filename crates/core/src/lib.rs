@@ -8,6 +8,7 @@
 //! - Cycles are rejected at edit time, so the evaluator assumes a DAG.
 
 pub mod color;
+pub mod crater;
 pub mod eval;
 pub mod file;
 pub mod graph;
@@ -29,8 +30,8 @@ pub use file::{load_from_path, save_to_path};
 pub use graph::{Canvas, Graph, GraphError, Layer, Output};
 pub use id::LayerId;
 pub use kind::{
-    Axis, BlendMode, ColorInput, ColorRamp, ColorStop, CoordMode, Coordinate, Criterion,
-    EXTEND_LIMIT,
+    Axis, BlendMode, ColorInput, ColorRamp, ColorStop, CoordMode, Coordinate, CraterOutput,
+    CraterSurface, Craters, Criterion, EXTEND_LIMIT,
     EdgeMode, Fractal, FractalMode, HeightToNormal, LayerKind, Map, MinMax, MinMaxMode, Mix,
     Noise, NoiseDims, NoiseKernel, NoiseOutput, NoiseRange, RadialDim, ScalarInput,
     Transform, Warp, WarpMode, Wave, WaveShape,

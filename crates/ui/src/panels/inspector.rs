@@ -5,7 +5,8 @@ use texture_graph_core::color::oklcha;
 use texture_graph_core::{
     Axis, BlendMode, BlendSpace, ColorInput, ColorRamp, ColorStop, CoordMode, Criterion, Graph,
     HeightToNormal, LayerId, LayerKind, Map, MinMax, MinMaxMode, Mix, Noise, NoiseKernel,
-    EvalCtx, ParamUse, RadialDim, ScalarInput, Transform, Warp, Wave, noise::MAX_OCTAVES,
+    Craters, EvalCtx, ParamUse, RadialDim, ScalarInput, Transform, Warp, Wave,
+    crater::MAX_CLASSES, noise::MAX_OCTAVES,
 };
 
 use crate::catalog::{self, Kind};
@@ -71,6 +72,9 @@ pub fn show(
         }
         LayerKind::Warp(w) => {
             changed |= warp_widgets(ui, graph, id, w);
+        }
+        LayerKind::Craters(c) => {
+            changed |= craters_widgets(ui, graph, id, c, ctx);
         }
         LayerKind::Coordinate(c) => {
             changed |= enum_combo(
@@ -214,6 +218,64 @@ fn warp_widgets(ui: &mut egui::Ui, graph: &Graph, id: LayerId, w: &mut Warp) -> 
     if w.amount[2] != 0.0 {
         ui.weak("w displacement is CPU-only — the GPU baker cannot re-sample a slice at another w");
     }
+    changed
+}
+
+fn craters_widgets(
+    ui: &mut egui::Ui,
+    graph: &Graph,
+    id: LayerId,
+    c: &mut Craters,
+    ctx: &EvalCtx,
+) -> bool {
+    let mut changed = false;
+    changed |= scalar_input_widget(ui, graph, id, "under", &mut c.under, ctx);
+    changed |= scalar_input_widget(ui, graph, id, "density", &mut c.density, ctx);
+    changed |= enum_combo(
+        ui,
+        (id.0, "craters-surface"),
+        "surface",
+        &mut c.surface,
+        node_labels::CRATER_SURFACES,
+        node_labels::crater_surface,
+    );
+    changed |= enum_combo(
+        ui,
+        (id.0, "craters-output"),
+        "output",
+        &mut c.output,
+        node_labels::CRATER_OUTPUTS,
+        node_labels::crater_output,
+    );
+    let slider = |ui: &mut egui::Ui, v: &mut f32, range, text: &str| {
+        ui.add(egui::Slider::new(v, range).text(text)).changed()
+    };
+    changed |= ui
+        .add(
+            egui::Slider::new(&mut c.frequency, 0.5..=64.0)
+                .logarithmic(true)
+                .text("frequency (cells, largest size)"),
+        )
+        .changed();
+    changed |= ui
+        .add(egui::DragValue::new(&mut c.seed_offset).prefix("seed "))
+        .changed();
+    changed |= ui
+        .add(egui::Slider::new(&mut c.classes, 1..=MAX_CLASSES).text("sizes (halving)"))
+        .changed();
+    changed |= slider(ui, &mut c.gain, 0.25..=2.0, "gain per smaller size");
+    changed |= slider(ui, &mut c.depth, 0.0..=1.0, "depth / rim radius");
+    changed |= slider(ui, &mut c.age, 0.0..=1.0, "age");
+    changed |= slider(ui, &mut c.erase, 0.0..=1.0, "erase what is under");
+    changed |= slider(ui, &mut c.peak, 0.0..=1.0, "central peak");
+    changed |= slider(ui, &mut c.rays, 0.0..=1.0, "rays (ejecta)");
+    changed |= ui
+        .add(
+            egui::Slider::new(&mut c.relief, 0.1..=100.0)
+                .logarithmic(true)
+                .text("relief (height)"),
+        )
+        .changed();
     changed
 }
 
