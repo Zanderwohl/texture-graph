@@ -49,6 +49,14 @@ fn main() {
              life, oxidation and sand are parameters a host derives from what the world is.",
             rocky(),
         ),
+        (
+            "giant.tgraph",
+            "Giant",
+            "Any giant, from a hot Jupiter to Uranus: its band count, contrast, turbulence, \
+             storms and polar haze are parameters, and its colors are what a host derives from \
+             its chemistry.",
+            giant(),
+        ),
     ] {
         let meta = FileMetadata {
             name: name.into(),
@@ -432,6 +440,125 @@ fn rocky() -> Graph {
     b.finish(color, roughness, Some(normal))
 }
 
+fn giant() -> Graph {
+    let mut b = Builder::new();
+    b.param("bands", 1.0, 12.0, 5.7, "Belt-zone pairs pole to pole. A host picks it from how fast and how big the giant is.");
+    b.param("contrast", 0.0, 1.0, 0.9, "How far a belt departs from a zone.");
+    b.param("turbulence", 0.0, 1.0, 0.8, "How far eddies wind the bands and draw the zones' white into the belts.");
+    b.param("storms", 0.0, 1.0, 0.6, "How many ovals.");
+    b.param("polar", 0.0, 0.5, 0.1, "About the share of the sphere under polar haze.");
+    b.param("shift", 0.0, 1.0, 0.0, "Where the band pattern starts, in cycles.");
+    b.param("spot", 0.0, 1.0, 1.0, "How much of a great spot the giant has.");
+    b.param_color("zone", oklcha(0.88, 0.035, 80.0, 1.0), "The bright high deck.");
+    b.param_color("belt", oklcha(0.68, 0.06, 55.0, 1.0), "A gap down to deeper, stained cloud.");
+    b.param_color("tint", oklcha(0.58, 0.10, 45.0, 1.0), "A belt stained twice as deep: some belts, and the great spot.");
+    b.param_color("storm", oklcha(0.92, 0.01, 90.0, 1.0), "The ovals' high tops.");
+    b.param_color("polar color", oklcha(0.62, 0.03, 70.0, 1.0), "The haze over the poles.");
+
+    let u = b.add_layer("x", LayerKind::Coordinate(Coordinate { axis: Axis::U }));
+    let y = b.add_layer("y", LayerKind::Coordinate(Coordinate { axis: Axis::V }));
+    let w = b.add_layer("z", LayerKind::Coordinate(Coordinate { axis: Axis::W }));
+    let abs_lat = b.wave("abs latitude", y, WaveShape::Triangle, 1.0, 0.25);
+    let half = b.gray("half", 0.5);
+    let zero = b.black();
+    let one = b.gray("one", 1.0);
+
+    // The band phase in cycles, a twelfth at a time: a Wave's frequency is fixed, so the count
+    // scales its input instead. A Multiply of two grays multiplies their L.
+    let count = b.param_gray("band count", "bands");
+    let twelfths = b.scale("band count over twelve", count, 1.0 / 12.0);
+    let rows = b.multiply("rows", y, twelfths);
+    let shift = b.param_gray("shift level", "shift");
+    // Slow wander in longitude, and eddies at about a belt's width, both kept under a quarter
+    // cycle: past that a warp stops winding bands and starts destroying them.
+    let drift = b.fbm("drift", 1, 0.9, 3, 0.5, FractalMode::Standard);
+    let eddies = b.fbm("eddies", 2, 5.0, 5, 0.55, FractalMode::Standard);
+    let eddy = b.mix("eddy", half, eddies, BlendMode::Blend, ScalarInput::Param("turbulence".into()));
+    let phase = b.weighted_sum(
+        "phase",
+        &[(rows, 1.0), (shift, 1.0 / 12.0), (drift, 0.4 / 12.0), (eddy, 0.55 / 12.0), (half, -0.95 / 12.0)],
+    );
+    // Everything finer than a band is a function of the phase, so it runs along the flow the
+    // eddies wind rather than mottling it: the second harmonic makes no two belts the same
+    // width, and the finer ones are the streaks inside them.
+    let first = b.wave("first band", phase, WaveShape::Sine, 12.0, 0.0);
+    let second = b.wave("second band", phase, WaveShape::Sine, 12.0 * 2.37, 0.3);
+    let fine = b.wave("fine band", phase, WaveShape::Sine, 12.0 * 6.3, 0.1);
+    let finer = b.wave("finer band", phase, WaveShape::Sine, 12.0 * 13.7, 0.6);
+    let band = b.weighted_sum("band", &[(first, 0.56), (second, 0.2), (fine, 0.15), (finer, 0.09)]);
+    let belted = b.remap("belted", band, 0.44, 0.62);
+    // A belt fades and returns along its length, as Jupiter's southern one does.
+    let fading = b.fbm("fading", 4, 1.3, 2, 0.5, FractalMode::Standard);
+    let strength = b.remap("belt strength", fading, 0.25, 0.65);
+    let strength = b.mix("belt presence", strength, one, BlendMode::Blend, ScalarInput::Const(0.45));
+    let belt_raw = b.mask("belt raw", belted, strength);
+    let contrasted = b.mix("contrasted", zero, belt_raw, BlendMode::Blend, ScalarInput::Param("contrast".into()));
+
+    // Polar haze, from |sin latitude| = 1 - polar out, ragged; the bands give out before it.
+    let polar = b.param_gray("polar level", "polar");
+    let polar_noise = b.fbm("polar noise", 5, 3.0, 4, 0.5, FractalMode::Standard);
+    let polar_drive = b.weighted_sum("polar drive", &[(abs_lat, 1.0), (polar, 1.0), (polar_noise, 0.1), (half, -0.1)]);
+    let polar_edge = b.remap("polar edge", polar_drive, 0.98, 1.02);
+    // None at all where the host says none, rather than a speck at each pole.
+    let polar_on = b.remap("polar on", polar, 0.0, 0.02);
+    let polar_mask = b.mask("polar", polar_edge, polar_on);
+    let band_fade = b.remap("band fade", polar_drive, 0.87, 1.0);
+    let open = b.blend("band field", one, zero, band_fade);
+
+    // Festoons: zone drawn into the belts where the eddies curl, strung along the flow.
+    let curls = b.fbm("curls", 6, 9.0, 4, 0.5, FractalMode::Ridged);
+    let curl_band = b.weighted_sum("curl band", &[(curls, 0.7), (fine, 0.3)]);
+    let wisp_drive = b.mix("wisp drive", zero, curl_band, BlendMode::Blend, ScalarInput::Param("turbulence".into()));
+    let wisps = b.remap("wisps", wisp_drive, 0.5, 0.8);
+    let taken = b.scale("wisps taken", wisps, 0.6);
+    let kept = b.sub("belt kept", one, taken);
+    let belt_open = b.mask("belt open", contrasted, open);
+    let belt = b.mask("belt", belt_open, kept);
+
+    // Ovals: blobs of a band-scale noise over a threshold the storm count lowers, fewest at
+    // the poles.
+    let ovals = b.fbm("ovals", 7, 7.0, 1, 0.5, FractalMode::Standard);
+    let storms = b.param_gray("storm level", "storms");
+    let oval_drive = b.weighted_sum("oval drive", &[(ovals, 1.0), (storms, 0.1), (abs_lat, -0.15)]);
+    let small = b.remap("small ovals", oval_drive, 0.82, 0.87);
+    let small = b.mask("small in the bands", small, open);
+    // One great spot, 22 degrees south, three times as long as it is wide: an ellipsoid about a
+    // point on the sphere, ragged by the eddies.
+    let spot_at = [22f32.to_radians().cos() * 0.5 + 0.5, 0.5 - 22f32.to_radians().sin() * 0.5, 0.5];
+    let mut axes = Vec::new();
+    for (name, coord, center, reach) in [("x", u, spot_at[0], 0.09), ("y", y, spot_at[1], 0.045), ("z", w, spot_at[2], 0.13)] {
+        let at = b.gray(&format!("spot {name} center"), center);
+        let ahead = b.sub(&format!("spot {name} ahead"), coord, at);
+        let behind = b.sub(&format!("spot {name} behind"), at, coord);
+        let off = b.max(&format!("spot {name} off"), ahead, behind);
+        let scaled = b.scale(&format!("spot {name} reach"), off, 1.0 / reach);
+        axes.push(b.multiply(&format!("spot {name} squared"), scaled, scaled));
+    }
+    let reach = b.weighted_sum("spot reach", &[(axes[0], 1.0), (axes[1], 1.0), (axes[2], 1.0), (eddies, 0.5)]);
+    let inside = b.remap("spot outside", reach, 0.95, 1.2);
+    let great_raw = b.blend("spot inside", one, zero, inside);
+    let great_spot = b.mix("great spot", zero, great_raw, BlendMode::Blend, ScalarInput::Param("spot".into()));
+    let storm = b.max("storm", small, great_spot);
+
+    // The color, in linear light, so it mixes as the shader's masks do.
+    let zone_c = b.param_color_layer("zone color", "zone");
+    let belt_c = b.param_color_layer("belt color", "belt");
+    let tint_c = b.param_color_layer("tint color", "tint");
+    let storm_c = b.param_color_layer("storm color", "storm");
+    let polar_c = b.param_color_layer("polar haze color", "polar color");
+    let staining = b.fbm("staining", 9, 2.2, 3, 0.5, FractalMode::Standard);
+    let stained = b.remap("stained", staining, 0.5, 0.68);
+    let tint_amount = b.mask("tint amount", stained, belt);
+    let banded = b.linear_blend("banded", zone_c, belt_c, belt);
+    let tinted = b.linear_blend("tinted", banded, tint_c, tint_amount);
+    let ovals_c = b.linear_blend("oval color", storm_c, tint_c, great_spot);
+    let stormed = b.linear_blend("stormed", tinted, ovals_c, storm);
+    let color = b.linear_blend("color", stormed, polar_c, polar_mask);
+
+    let roughness = b.gray("roughness", 0.8);
+    b.finish(color, roughness, None)
+}
+
 /// Terse graph construction. Every scalar is a gray's Oklch L; `Blend` in
 /// Oklch lerps L, so it doubles as the scalar arithmetic.
 struct Builder {
@@ -539,6 +666,35 @@ impl Builder {
         self.add_layer(
             name,
             LayerKind::Mix(Mix { a: Some(a), b: Some(b), mode, factor, space: BlendSpace::Oklch }),
+        )
+    }
+
+    /// A layer that is the color parameter `param`: a palette of that one color, looked up.
+    fn param_color_layer(&mut self, name: &str, param: &str) -> LayerId {
+        let palette = self.ramp_inputs(
+            &format!("{name} palette"),
+            &[(0.0, ColorInput::Param(param.into())), (1.0, ColorInput::Param(param.into()))],
+        );
+        let half = self.gray(&format!("{name} lookup"), 0.5);
+        self.map(name, half, palette)
+    }
+
+    /// `a * b`. On grays, in linear light, which multiplies their L.
+    fn multiply(&mut self, name: &str, a: LayerId, b: LayerId) -> LayerId {
+        self.mix(name, a, b, BlendMode::Multiply, ScalarInput::Const(0.0))
+    }
+
+    /// `blend` in linear light, as a renderer mixes albedos.
+    fn linear_blend(&mut self, name: &str, a: LayerId, b: LayerId, factor: LayerId) -> LayerId {
+        self.add_layer(
+            name,
+            LayerKind::Mix(Mix {
+                a: Some(a),
+                b: Some(b),
+                mode: BlendMode::Blend,
+                factor: ScalarInput::Layer(factor),
+                space: BlendSpace::LinearSrgb,
+            }),
         )
     }
 
