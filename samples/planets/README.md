@@ -1,6 +1,6 @@
 # Planet samples
 
-Two classes of planet, not two planets. Every noise is 3D fbm on the sample
+Classes of planet, not planets. Every noise is 3D fbm on the sample
 point, so a sphere shows no seam or pole pinch; `EvalCtx::seed` picks a member
 of the class and the parameters move it along the class's obvious axes.
 
@@ -9,6 +9,8 @@ of the class and the parameters move it along the class's obvious axes.
 | `earthlike.tgraph` | Oceans, continents with ridged ranges, desert belts, polar ice. Oceans are glossy and flat; land has a normal map. | `ocean`, `ice`, `aridity` |
 | `earthlike-clouds.tgraph` | Translucent cloud deck, stretched east-west, for a shell over `earthlike`. | `cover` |
 | `marslike.tgraph` | Rust world: south-high dichotomy, canyon networks, dark provinces, dusty caps. | `ice`, `dark`, `dust` (color) |
+| `rocky.tgraph` | Any rocky world with air, Mars to Earth to a snowball. | `sea`, `ice`, `life`, `rust`, `sand`, `aridity`, `dark`, `foliage`, `foliage high` (colors) |
+| `airless.tgraph` | Any airless rocky world: three series of Craters, the oldest flooded by lava in its basins, fresh ejecta and rays on top. Its `height` layer is the relief about zero. | `ancient craters`, `later craters`, `fresh craters`, `maria`, `rays`, `highland`, `mare`, `ejecta` (colors) |
 
 The graphs are not committed. `crates/core/examples/planets.rs` generates
 them here; edit that rather than the `.tgraph` files:
