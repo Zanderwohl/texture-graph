@@ -6,12 +6,13 @@ The graph UI in `~/rust/modular-block-game` (MBG) was copied from this project a
 then improved. This document records what diverged and what is worth bringing back.
 
 **Source of truth for the port:** `~/rust/modular-block-game`, files under
-`src/common/generator/`. The direct counterpart of `crates/ui/src/panels/graph_canvas/`
+`src/common/generator/`. The direct counterpart of `crates/editor/src/panels/graph_canvas/`
 is `src/common/generator/canvas/` (`mod.rs`, `layout.rs`, `nodes.rs`, `wires.rs`),
 with supporting code in `src/common/generator/{state,previews,catalog,widgets}.rs`.
 
-Both projects are on **egui 0.35** (MBG via `bevy_egui 0.41`), so UI code ports
-almost verbatim. The mechanical substitutions are:
+Both projects were on **egui 0.35** (MBG via `bevy_egui 0.41`) when this was
+written, so UI code ported almost verbatim. The panels have since moved to
+`crates/editor` and egui 0.36. The mechanical substitutions are:
 
 | MBG | here |
 | --- | --- |
@@ -112,8 +113,8 @@ rewrite described above.
 - [x] **6. `EditCmd` housekeeping**
 - [x] **7. Canvas background fill**
 
-Landed across `crates/ui/src/state.rs`,
-`crates/ui/src/panels/graph_canvas/{mod,nodes,wires}.rs`. Builds clean, no new
+Landed across `crates/editor/src/state.rs`,
+`crates/editor/src/panels/graph_canvas/{mod,nodes,wires}.rs`. Builds clean, no new
 clippy warnings, 9 UI tests pass, app starts without panicking.
 
 **Deviations from what is described below**, all deliberate:
@@ -138,7 +139,7 @@ clippy warnings, 9 UI tests pass, app starts without panicking.
 
 ### 1. Inline node rename
 
-`EditCmd::Rename` already exists in `crates/ui/src/state.rs` and is wired to
+`EditCmd::Rename` already exists in `crates/editor/src/state.rs` and is wired to
 `Graph::rename`, but **nothing emits it** — layers cannot currently be renamed at
 all. Port from `canvas/nodes.rs`: `title()`, `title_rect()`, `rename_command()`,
 plus `Renaming { node, text, focused }` in `state.rs` and a "Rename" entry in the
@@ -292,7 +293,7 @@ visually; it is much faster than driving the app by hand.
 
 ### 8. Per-layer preview staleness — DONE
 
-Landed across `crates/ui/src/{previews,state,app}.rs` and
+Landed across `crates/editor/src/{previews,state}.rs`, `crates/ui/src/app.rs` and
 `crates/gpu/src/{schedule,baker}.rs`. 78 tests pass, clippy clean in every file
 touched.
 
@@ -338,7 +339,7 @@ What it does now:
 
 ### 8-original. Per-node preview staleness + bake budget (plan as written)
 
-The biggest win. `crates/ui/src/previews.rs` is all-or-nothing: any
+The biggest win. `crates/editor/src/previews.rs` is all-or-nothing: any
 eval-affecting edit sets `stale`, and the next `get_or_build` re-bakes **every**
 layer via `Baker::bake_previews`. Port from `src/common/generator/previews.rs`
 and `state.rs`:
@@ -364,10 +365,10 @@ stop lists).
 
 ### 9. A `catalog` module — DONE
 
-`crates/ui/src/catalog.rs` now owns the node list: `Variant { label, kind }`,
+`crates/editor/src/catalog.rs` now owns the node list: `Variant { label, kind }`,
 a `Kind` enum with `Kind::of(&LayerKind)`, `default_kind(Kind)` and
 `unique_name`. `graph_canvas/mod.rs` and `panels/inspector.rs` both read it;
-`crates/ui/src/util.rs` is gone (it held only `unique_name`).
+`crates/editor/src/util.rs` is gone (it held only `unique_name`).
 
 What this removed: two copies of the eight-entry list, a `&str` key
 (`"ColorRamp"`) that the label duplicated exactly, and a `_ =>` fallback arm in

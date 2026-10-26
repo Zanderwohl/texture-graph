@@ -12,7 +12,7 @@ use texture_graph_core::{
 };
 use texture_graph_gpu::{SceneCamera, SceneMaterial, SceneShape, VolumeJob, VolumeOutput};
 
-use crate::app::GpuBits;
+use crate::{GpuBits, TextureRegistry};
 use crate::state::UiState;
 use crate::throttle::Throttle;
 
@@ -199,8 +199,8 @@ pub fn show(
             log::debug!("preview shape from={:?} to={:?}", prev_shape, preview.shape);
             // The 3D target is rebuilt lazily on the way back into 3D.
             if preview.shape == PreviewShape::Flat {
-                if let (Some(g), Some(scene)) = (gpu.as_ref(), preview.scene.take()) {
-                    g.renderer.write().free_texture(&scene.id);
+                if let (Some(g), Some(scene)) = (gpu.as_deref_mut(), preview.scene.take()) {
+                    g.textures.free(scene.id);
                 }
             }
         }
@@ -240,12 +240,12 @@ pub fn show(
                 log::debug!("preview size from={} to={}", preview.size, s);
                 preview.size = s;
                 preview.texture = None;
-                if let Some(g) = gpu.as_ref() {
+                if let Some(g) = gpu.as_deref_mut() {
                     if let Some(old) = &preview.gpu_channels {
-                        free_channels(&g.renderer, old);
+                        free_channels(g.textures.as_mut(), old);
                     }
                     if let Some(old) = preview.scene.take() {
-                        g.renderer.write().free_texture(&old.id);
+                        g.textures.free(old.id);
                     }
                 }
                 preview.gpu_channels = None;
@@ -373,11 +373,10 @@ pub fn show(
             ) {
                 Ok(out) => {
                     if let Some(old) = preview.gpu_channels.take() {
-                        free_channels(&gpu.renderer, &old);
+                        free_channels(gpu.textures.as_mut(), &old);
                     }
                     preview.gpu_channels = Some(register_channels(
-                        &gpu.renderer,
-                        &gpu.baker,
+                        gpu.textures.as_mut(),
                         out,
                         want_object_alpha,
                     ));
@@ -544,18 +543,14 @@ fn ensure_scene_target(preview: &mut PreviewPanelState, gpu: &mut GpuBits) {
         preview.scene.as_ref().map(|s| s.size)
     );
     if let Some(old) = preview.scene.take() {
-        gpu.renderer.write().free_texture(&old.id);
+        gpu.textures.free(old.id);
     }
     let device = &gpu.baker.ctx().device;
     let color_tex = gpu.scene.make_color_target(device, (preview.size, preview.size));
     let color_view = color_tex.create_view(&wgpu::TextureViewDescriptor::default());
     let depth_tex = gpu.scene.make_depth_target(device, (preview.size, preview.size));
     let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
-    let id = gpu.renderer.write().register_native_texture(
-        device,
-        &color_view,
-        wgpu::FilterMode::Linear,
-    );
+    let id = gpu.textures.register(&color_tex, &color_view);
     preview.scene = Some(Scene3d {
         color_tex,
         color_view,
@@ -596,25 +591,17 @@ fn channel_label(ch: PreviewChannel) -> &'static str {
 }
 
 fn register_channels(
-    renderer: &egui::mutex::RwLock<egui_wgpu::Renderer>,
-    baker: &texture_graph_gpu::Baker,
+    textures: &mut dyn TextureRegistry,
     out: texture_graph_gpu::BakeOutput,
     object_alpha: bool,
 ) -> GpuChannels {
-    let device = &baker.ctx().device;
-    let color_view = out.color.create_view(&wgpu::TextureViewDescriptor::default());
-    let rough_view = out.roughness.create_view(&wgpu::TextureViewDescriptor::default());
-    let metal_view = out.metallic.create_view(&wgpu::TextureViewDescriptor::default());
-    let normal_view = out.normal.create_view(&wgpu::TextureViewDescriptor::default());
-    let mut r = renderer.write();
-    let color_id =
-        r.register_native_texture(device, &color_view, wgpu::FilterMode::Linear);
-    let roughness_id =
-        r.register_native_texture(device, &rough_view, wgpu::FilterMode::Linear);
-    let metallic_id =
-        r.register_native_texture(device, &metal_view, wgpu::FilterMode::Linear);
-    let normal_id =
-        r.register_native_texture(device, &normal_view, wgpu::FilterMode::Linear);
+    let mut register = |tex: &wgpu::Texture| {
+        textures.register(tex, &tex.create_view(&wgpu::TextureViewDescriptor::default()))
+    };
+    let color_id = register(&out.color);
+    let roughness_id = register(&out.roughness);
+    let metallic_id = register(&out.metallic);
+    let normal_id = register(&out.normal);
     GpuChannels {
         color_tex: out.color,
         roughness_tex: out.roughness,
@@ -629,15 +616,11 @@ fn register_channels(
     }
 }
 
-fn free_channels(
-    renderer: &egui::mutex::RwLock<egui_wgpu::Renderer>,
-    channels: &GpuChannels,
-) {
-    let mut r = renderer.write();
-    r.free_texture(&channels.color_id);
-    r.free_texture(&channels.roughness_id);
-    r.free_texture(&channels.metallic_id);
-    r.free_texture(&channels.normal_id);
+fn free_channels(textures: &mut dyn TextureRegistry, channels: &GpuChannels) {
+    textures.free(channels.color_id);
+    textures.free(channels.roughness_id);
+    textures.free(channels.metallic_id);
+    textures.free(channels.normal_id);
 }
 
 fn bake_cpu(

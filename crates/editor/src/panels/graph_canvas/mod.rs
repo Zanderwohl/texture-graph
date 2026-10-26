@@ -22,7 +22,7 @@ use std::collections::HashMap;
 
 use texture_graph_core::{EvalCtx, Graph, LayerId};
 
-use crate::app::GpuBits;
+use crate::GpuBits;
 use crate::catalog;
 use crate::previews::PreviewCache;
 use crate::state::{EditCmd, NodeRef, UiState};

@@ -17,7 +17,7 @@ all unclaimed on crates.io as of 2026-09-21.
 
 ### README and docs
 
-- [ ] Write this README: what it is, a screenshot of the editor, the core → gpu → ui layering,
+- [ ] Write this README: what it is, a screenshot of the editor, the core → gpu → editor → ui layering,
       and a minimal example of loading a graph and baking it.
 - [ ] Decide whether each crate gets its own README or points at this one (`readme = "../../README.md"`).
 - [ ] Give `texture-graph-ui` a crate doc beyond one line; `core` and `gpu` already have one.
@@ -33,7 +33,7 @@ all unclaimed on crates.io as of 2026-09-21.
 
 - [ ] Give the path dependencies a `version` too (`texture-graph-core = { path = "../core",
       version = "0.1.0", ... }`); crates.io refuses path-only dependencies.
-- [ ] Publish in dependency order: `core`, then `gpu`, then `ui`.
+- [ ] Publish in dependency order: `core`, then `gpu`, then `editor`, then `ui`.
 - [ ] Stop committing `crates/ui/dist/` (21 MB of Trunk output, including a `.wasm`): add it to
       `.gitignore`, `git rm --cached` it, and make sure it can't end up in a package (`exclude`).
 - [ ] Decide whether `texture-graph-ui` is published at all, or gets `publish = false`. If it is,

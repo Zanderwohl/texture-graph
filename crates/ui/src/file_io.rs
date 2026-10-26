@@ -7,7 +7,7 @@
 
 use texture_graph_core::{FILE_EXTENSION, FileMetadata, Graph, TextureGraphFile};
 
-use crate::state::{EditCmd, UiState};
+use texture_graph_editor::{EditCmd, UiState};
 
 pub fn handle_wants_save(graph: &Graph, state: &mut UiState, ctx: &egui::Context) {
     if !state.wants_save {

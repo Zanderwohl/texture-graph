@@ -2605,6 +2605,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "texture-graph-editor"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "glam",
+ "log",
+ "palette",
+ "texture-graph-core",
+ "texture-graph-gpu",
+ "wgpu",
+]
+
+[[package]]
 name = "texture-graph-gpu"
 version = "0.1.0"
 dependencies = [
@@ -2629,11 +2642,11 @@ dependencies = [
  "env_logger",
  "glam",
  "log",
- "palette",
  "png",
  "pollster 0.4.0",
  "rfd",
  "texture-graph-core",
+ "texture-graph-editor",
  "texture-graph-gpu",
  "wasm-bindgen",
  "wasm-bindgen-futures",
