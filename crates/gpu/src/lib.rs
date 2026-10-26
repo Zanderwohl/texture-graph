@@ -14,6 +14,7 @@
 
 pub mod baker;
 pub mod device;
+pub mod maps;
 pub mod readback;
 pub mod scene;
 pub mod schedule;
@@ -24,6 +25,7 @@ pub use baker::{
     VolumeOutput,
 };
 pub use device::DeviceCtx;
+pub use maps::{MaterialMapper, MaterialMaps, mip_level_count};
 
 /// What every `Rgba8Unorm` texture this crate makes may also be viewed as.
 /// Those textures hold sRGB-encoded bytes, since wgpu forbids storage writes
@@ -32,7 +34,7 @@ pub use device::DeviceCtx;
 /// GPU decodes them.
 pub const SRGB_VIEW: &[wgpu::TextureFormat] = &[wgpu::TextureFormat::Rgba8UnormSrgb];
 pub use readback::{
-    Image, ScalarImage, read_rgba8, read_rgba8_async, read_rgba8_layers, read_rgba8_layers_async, read_scalar, read_scalar_async,
+    Image, ScalarImage, read_rgba8, read_rgba8_async, read_rgba8_mip, read_rgba8_layers, read_rgba8_layers_async, read_scalar, read_scalar_async,
     read_scalar_volume, read_scalar_volume_async,
 };
 pub use scene::{SceneBackground, SceneCamera, SceneLayer, SceneMaterial, SceneRenderer, SceneShape};
@@ -43,6 +45,8 @@ pub use schedule::{
 
 #[cfg(test)]
 mod bake_test;
+#[cfg(test)]
+mod maps_test;
 
 #[cfg(test)]
 mod smoke_test;
