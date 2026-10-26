@@ -175,7 +175,7 @@ fn render_frame_with(
     });
     ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
     rx.recv().expect("map channel").expect("map");
-    let data = slice.get_mapped_range();
+    let data = slice.get_mapped_range().expect("buffer was mapped");
     let pixels: Vec<[u8; 4]> = data
         .chunks_exact(4)
         .map(|c| [c[0], c[1], c[2], c[3]])
@@ -345,7 +345,7 @@ fn read_volume_slice(ctx: &DeviceCtx, vol: &wgpu::Texture, res: u32, z: u32) -> 
     });
     ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
     rx.recv().expect("map channel").expect("map");
-    let data = slice.get_mapped_range().to_vec();
+    let data = slice.get_mapped_range().expect("buffer was mapped").to_vec();
     buf.unmap();
     data
 }
@@ -527,7 +527,7 @@ fn read_texture_2d(ctx: &DeviceCtx, tex: &wgpu::Texture, res: u32) -> Vec<u8> {
     });
     ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
     rx.recv().expect("map channel").expect("map");
-    let data = slice.get_mapped_range().to_vec();
+    let data = slice.get_mapped_range().expect("buffer was mapped").to_vec();
     buf.unmap();
     data
 }

@@ -97,7 +97,7 @@ fn readback_first_pixel(ctx: &DeviceCtx, tex: &wgpu::Texture) -> [u8; 4] {
     slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
     ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
     rx.recv().expect("chan").expect("map");
-    let data = slice.get_mapped_range();
+    let data = slice.get_mapped_range().expect("buffer was mapped");
     let px = [data[0], data[1], data[2], data[3]];
     drop(data);
     readback.unmap();
