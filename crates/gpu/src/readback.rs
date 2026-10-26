@@ -124,6 +124,7 @@ fn copy_to_buffer(
     tex: &wgpu::Texture,
     size: (u32, u32, u32),
     bytes_per_texel: u32,
+    mip_level: u32,
 ) -> (wgpu::Buffer, u32) {
     let (width, height, depth) = size;
     let packed_bpr = width * bytes_per_texel;
@@ -147,7 +148,7 @@ fn copy_to_buffer(
     enc.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: tex,
-            mip_level: 0,
+            mip_level,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
@@ -237,7 +238,18 @@ impl Future for MapFuture {
 /// than failing.
 pub fn read_rgba8(ctx: &DeviceCtx, tex: &wgpu::Texture, size: (u32, u32)) -> Image {
     let (width, height) = size;
-    let (buffer, padded_bpr) = copy_to_buffer(ctx, tex, (width, height, 1), 4);
+    let (buffer, padded_bpr) = copy_to_buffer(ctx, tex, (width, height, 1), 4, 0);
+    map_blocking(ctx, &buffer);
+    let pixels = unpad(&buffer, padded_bpr, width * 4, height);
+    Image { width, height, pixels }
+}
+
+/// One mip level of an `Rgba8Unorm`-family texture; its size follows from the
+/// texture's.
+pub fn read_rgba8_mip(ctx: &DeviceCtx, tex: &wgpu::Texture, level: u32) -> Image {
+    let width = (tex.width() >> level).max(1);
+    let height = (tex.height() >> level).max(1);
+    let (buffer, padded_bpr) = copy_to_buffer(ctx, tex, (width, height, 1), 4, level);
     map_blocking(ctx, &buffer);
     let pixels = unpad(&buffer, padded_bpr, width * 4, height);
     Image { width, height, pixels }
@@ -246,7 +258,7 @@ pub fn read_rgba8(ctx: &DeviceCtx, tex: &wgpu::Texture, size: (u32, u32)) -> Ima
 /// [`read_rgba8`] without the device poll; see the module docs.
 pub async fn read_rgba8_async(ctx: &DeviceCtx, tex: &wgpu::Texture, size: (u32, u32)) -> Image {
     let (width, height) = size;
-    let (buffer, padded_bpr) = copy_to_buffer(ctx, tex, (width, height, 1), 4);
+    let (buffer, padded_bpr) = copy_to_buffer(ctx, tex, (width, height, 1), 4, 0);
     map_async_await(&buffer).await;
     let pixels = unpad(&buffer, padded_bpr, width * 4, height);
     Image { width, height, pixels }
@@ -255,7 +267,7 @@ pub async fn read_rgba8_async(ctx: &DeviceCtx, tex: &wgpu::Texture, size: (u32, 
 /// Copy the array layers of an `Rgba8Unorm` texture back to the CPU, as one
 /// image with the layers stacked top to bottom: `size.1 * size.2` rows.
 pub fn read_rgba8_layers(ctx: &DeviceCtx, tex: &wgpu::Texture, size: (u32, u32, u32)) -> Image {
-    let (buffer, padded_bpr) = copy_to_buffer(ctx, tex, size, 4);
+    let (buffer, padded_bpr) = copy_to_buffer(ctx, tex, size, 4, 0);
     map_blocking(ctx, &buffer);
     stacked(&buffer, padded_bpr, size)
 }
@@ -266,7 +278,7 @@ pub async fn read_rgba8_layers_async(
     tex: &wgpu::Texture,
     size: (u32, u32, u32),
 ) -> Image {
-    let (buffer, padded_bpr) = copy_to_buffer(ctx, tex, size, 4);
+    let (buffer, padded_bpr) = copy_to_buffer(ctx, tex, size, 4, 0);
     map_async_await(&buffer).await;
     stacked(&buffer, padded_bpr, size)
 }
@@ -304,7 +316,7 @@ pub fn read_scalar_volume(
     format: ScalarFormat,
 ) -> ScalarImage {
     let bpt = format.bytes_per_texel();
-    let (buffer, padded_bpr) = copy_to_buffer(ctx, tex, size, bpt);
+    let (buffer, padded_bpr) = copy_to_buffer(ctx, tex, size, bpt, 0);
     map_blocking(ctx, &buffer);
     scalar_image(&buffer, padded_bpr, size, format)
 }
@@ -317,7 +329,7 @@ pub async fn read_scalar_volume_async(
     format: ScalarFormat,
 ) -> ScalarImage {
     let bpt = format.bytes_per_texel();
-    let (buffer, padded_bpr) = copy_to_buffer(ctx, tex, size, bpt);
+    let (buffer, padded_bpr) = copy_to_buffer(ctx, tex, size, bpt, 0);
     map_async_await(&buffer).await;
     scalar_image(&buffer, padded_bpr, size, format)
 }
