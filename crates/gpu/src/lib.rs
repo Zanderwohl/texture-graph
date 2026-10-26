@@ -24,6 +24,13 @@ pub use baker::{
     VolumeOutput,
 };
 pub use device::DeviceCtx;
+
+/// What every `Rgba8Unorm` texture this crate makes may also be viewed as.
+/// Those textures hold sRGB-encoded bytes, since wgpu forbids storage writes
+/// to sRGB formats. egui-wgpu draws the bytes as they are; a host that blends
+/// in linear space, such as bevy_egui, views them as `Rgba8UnormSrgb` so the
+/// GPU decodes them.
+pub const SRGB_VIEW: &[wgpu::TextureFormat] = &[wgpu::TextureFormat::Rgba8UnormSrgb];
 pub use readback::{
     Image, ScalarImage, read_rgba8, read_rgba8_async, read_rgba8_layers, read_rgba8_layers_async, read_scalar, read_scalar_async,
     read_scalar_volume, read_scalar_volume_async,

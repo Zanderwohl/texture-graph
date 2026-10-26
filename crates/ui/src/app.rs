@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use eframe::CreationContext;
 use egui::mutex::RwLock;
-use texture_graph_editor::{Editor, GpuBits, TextureRegistry};
+use texture_graph_editor::{Editor, Gpu, TextureRegistry};
 use texture_graph_gpu::{Baker, DeviceCtx};
 
 use crate::file_io;
@@ -28,6 +28,8 @@ impl TextureRegistry for EguiWgpuTextures {
 
 pub struct TextureGraphApp {
     pub editor: Editor,
+    /// Lent to the editor each frame; absent with no wgpu render state.
+    textures: Option<EguiWgpuTextures>,
 }
 
 impl TextureGraphApp {
@@ -38,18 +40,22 @@ impl TextureGraphApp {
         #[cfg(not(target_arch = "wasm32"))]
         let default_size = 512;
 
-        let gpu = cc.wgpu_render_state.as_ref().map(|rs| {
-            let device_ctx = DeviceCtx::from_shared(
-                Arc::new(rs.adapter.clone()),
-                Arc::new(rs.device.clone()),
-                Arc::new(rs.queue.clone()),
-            );
-            let textures = EguiWgpuTextures {
-                device: rs.device.clone(),
-                renderer: rs.renderer.clone(),
-            };
-            GpuBits::new(Baker::new(device_ctx), Box::new(textures))
-        });
+        let (gpu, textures) = cc
+            .wgpu_render_state
+            .as_ref()
+            .map(|rs| {
+                let device_ctx = DeviceCtx::from_shared(
+                    Arc::new(rs.adapter.clone()),
+                    Arc::new(rs.device.clone()),
+                    Arc::new(rs.queue.clone()),
+                );
+                let textures = EguiWgpuTextures {
+                    device: rs.device.clone(),
+                    renderer: rs.renderer.clone(),
+                };
+                (Gpu::new(Baker::new(device_ctx)), textures)
+            })
+            .unzip();
         if gpu.is_none() {
             log::warn!("no wgpu render state on eframe — preview will use CPU path");
         }
@@ -60,7 +66,7 @@ impl TextureGraphApp {
             default_size,
         );
 
-        Self { editor: Editor::new(gpu, default_size) }
+        Self { editor: Editor::new(gpu, default_size), textures }
     }
 }
 
@@ -79,6 +85,7 @@ impl eframe::App for TextureGraphApp {
         file_io::handle_wants_open(&mut self.editor.ui, ui.ctx());
         file_io::poll_pending(&mut self.editor.ui);
 
-        self.editor.show(ui);
+        let textures = self.textures.as_mut().map(|t| t as &mut dyn TextureRegistry);
+        self.editor.show(ui, textures);
     }
 }

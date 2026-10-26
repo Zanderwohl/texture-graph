@@ -1268,7 +1268,7 @@ impl Baker {
             usage: wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_DST
                 | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
+            view_formats: crate::SRGB_VIEW,
         });
         let src_slot = *sched.slot_of.get(&root).expect("schedule_layer schedules its root");
 
@@ -2970,7 +2970,7 @@ fn make_volume_texture(device: &wgpu::Device, res: u32, depth: u32, label: &str)
         usage: wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_DST
             | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
+        view_formats: crate::SRGB_VIEW,
     })
 }
 
@@ -3008,7 +3008,7 @@ fn make_output_texture(device: &wgpu::Device, size: (u32, u32), label: &str) -> 
         usage: wgpu::TextureUsages::STORAGE_BINDING
             | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
+        view_formats: crate::SRGB_VIEW,
     })
 }
 

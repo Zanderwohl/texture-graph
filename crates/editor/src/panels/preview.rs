@@ -242,7 +242,7 @@ pub fn show(
                 preview.texture = None;
                 if let Some(g) = gpu.as_deref_mut() {
                     if let Some(old) = &preview.gpu_channels {
-                        free_channels(g.textures.as_mut(), old);
+                        free_channels(&mut *g.textures, old);
                     }
                     if let Some(old) = preview.scene.take() {
                         g.textures.free(old.id);
@@ -373,10 +373,10 @@ pub fn show(
             ) {
                 Ok(out) => {
                     if let Some(old) = preview.gpu_channels.take() {
-                        free_channels(gpu.textures.as_mut(), &old);
+                        free_channels(&mut *gpu.textures, &old);
                     }
                     preview.gpu_channels = Some(register_channels(
-                        gpu.textures.as_mut(),
+                        &mut *gpu.textures,
                         out,
                         want_object_alpha,
                     ));

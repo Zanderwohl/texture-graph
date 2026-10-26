@@ -203,7 +203,7 @@ impl SceneRenderer {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
+            view_formats: crate::SRGB_VIEW,
         })
     }
 

@@ -27,24 +27,54 @@ pub use state::{EditCmd, UiState};
 /// host renderer's job, so the editor never names one.
 pub trait TextureRegistry {
     /// Sampled with linear filtering. The editor keeps `texture` alive until
-    /// it frees the id.
+    /// it frees the id. An `Rgba8Unorm` texture holds sRGB-encoded bytes and
+    /// can be viewed through [`texture_graph_gpu::SRGB_VIEW`].
     fn register(&mut self, texture: &wgpu::Texture, view: &wgpu::TextureView) -> egui::TextureId;
     fn free(&mut self, id: egui::TextureId);
 }
 
-/// Absent when the host has no GPU to share; previews then use the CPU path.
-pub struct GpuBits {
+/// The editor's own GPU state, on the device the host draws with. Absent when
+/// the host has no GPU to share; previews then use the CPU path.
+pub struct Gpu {
     pub baker: Baker,
     pub scene: SceneRenderer,
-    pub textures: Box<dyn TextureRegistry>,
 }
 
-impl GpuBits {
-    /// `baker` must be on the device `textures` draws with.
-    pub fn new(baker: Baker, textures: Box<dyn TextureRegistry>) -> Self {
+impl Gpu {
+    /// `baker` must be on the device the host's [`TextureRegistry`] draws with.
+    pub fn new(baker: Baker) -> Self {
         let scene = SceneRenderer::new(&baker.ctx().device);
-        Self { baker, scene, textures }
+        Self { baker, scene }
     }
+}
+
+/// One frame's GPU access: the editor's [`Gpu`] and the registry the host
+/// lends for the frame. Lent rather than owned, because a host's registry
+/// usually borrows host state (an asset store, a renderer) that it cannot
+/// hand over for the editor's whole life.
+pub struct GpuBits<'a> {
+    pub baker: &'a mut Baker,
+    pub scene: &'a mut SceneRenderer,
+    pub textures: &'a mut dyn TextureRegistry,
+}
+
+/// Reborrows a lent registry for one call. Spelled out because `as_deref_mut`
+/// cannot shorten a trait object's lifetime behind `&mut`.
+fn reborrow<'s>(
+    textures: &'s mut Option<&mut dyn TextureRegistry>,
+) -> Option<&'s mut dyn TextureRegistry> {
+    match textures {
+        Some(textures) => Some(&mut **textures),
+        None => None,
+    }
+}
+
+fn lend<'a>(
+    gpu: &'a mut Option<Gpu>,
+    textures: Option<&'a mut dyn TextureRegistry>,
+) -> Option<GpuBits<'a>> {
+    let Gpu { baker, scene } = gpu.as_mut()?;
+    Some(GpuBits { baker, scene, textures: textures? })
 }
 
 pub struct Editor {
@@ -53,11 +83,11 @@ pub struct Editor {
     pub previews: PreviewCache,
     pub preview_panel: PreviewPanelState,
     pub eval_ctx: EvalCtx,
-    pub gpu: Option<GpuBits>,
+    pub gpu: Option<Gpu>,
 }
 
 impl Editor {
-    pub fn new(gpu: Option<GpuBits>, preview_size: u32) -> Self {
+    pub fn new(gpu: Option<Gpu>, preview_size: u32) -> Self {
         Self {
             graph: Graph::new(),
             ui: UiState::default(),
@@ -70,13 +100,16 @@ impl Editor {
 
     /// Before any panel draws: retires the thumbnails last frame's edits
     /// made stale.
-    pub fn begin_frame(&mut self) {
+    ///
+    /// Here and below, `textures` is the host's registry for this frame;
+    /// without one, or without a [`Gpu`], previews take the CPU path.
+    pub fn begin_frame(&mut self, mut textures: Option<&mut dyn TextureRegistry>) {
         let dirty = self.ui.dirty_previews.replace(HashSet::new());
         self.previews.begin_frame(
             &self.graph,
             self.ui.revision,
             dirty.as_ref(),
-            self.gpu.as_mut(),
+            lend(&mut self.gpu, reborrow(&mut textures)).as_mut(),
         );
     }
 
@@ -87,13 +120,17 @@ impl Editor {
     }
 
     /// Parameters on the left, the preview on the right, the graph between.
-    pub fn show(&mut self, ui: &mut egui::Ui) -> bool {
-        self.begin_frame();
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        mut textures: Option<&mut dyn TextureRegistry>,
+    ) -> bool {
+        self.begin_frame(reborrow(&mut textures));
 
         egui::Panel::right("texture_graph_preview")
             .resizable(true)
             .default_size(360.0)
-            .show(ui, |ui| self.preview(ui));
+            .show(ui, |ui| self.preview(ui, reborrow(&mut textures)));
 
         egui::Panel::left("texture_graph_params")
             .resizable(true)
@@ -102,19 +139,19 @@ impl Editor {
                 egui::ScrollArea::vertical().show(ui, |ui| self.params(ui));
             });
 
-        egui::CentralPanel::default().show(ui, |ui| self.canvas(ui));
+        egui::CentralPanel::default().show(ui, |ui| self.canvas(ui, textures));
 
         self.end_frame()
     }
 
-    pub fn preview(&mut self, ui: &mut egui::Ui) {
+    pub fn preview(&mut self, ui: &mut egui::Ui, mut textures: Option<&mut dyn TextureRegistry>) {
         panels::preview::show(
             ui,
             &self.graph,
             &mut self.ui,
             &mut self.preview_panel,
             &self.eval_ctx,
-            self.gpu.as_mut(),
+            lend(&mut self.gpu, reborrow(&mut textures)).as_mut(),
         );
     }
 
@@ -122,7 +159,7 @@ impl Editor {
         panels::params::show(ui, &self.graph, &mut self.ui, &mut self.eval_ctx);
     }
 
-    pub fn canvas(&mut self, ui: &mut egui::Ui) {
+    pub fn canvas(&mut self, ui: &mut egui::Ui, mut textures: Option<&mut dyn TextureRegistry>) {
         if let Some(err) = &self.ui.last_error {
             ui.colored_label(egui::Color32::LIGHT_RED, err);
         }
@@ -132,7 +169,7 @@ impl Editor {
             &mut self.ui,
             &mut self.previews,
             &self.eval_ctx,
-            self.gpu.as_mut(),
+            lend(&mut self.gpu, reborrow(&mut textures)).as_mut(),
         );
     }
 }
