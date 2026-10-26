@@ -1,16 +1,12 @@
-//! Texture-graph editor UI, shared by the native binary and the Trunk wasm build.
+//! The standalone texture-graph editor: [`texture_graph_editor`] in an eframe
+//! window, with a menu bar and file dialogs. Shared by the native binary and
+//! the Trunk wasm build.
 
 pub mod app;
-pub mod catalog;
-pub mod color_convert;
 pub mod file_io;
-pub mod panels;
-pub mod previews;
+pub mod menu_bar;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod screenshot;
-pub mod state;
-pub mod throttle;
-pub mod widgets;
 
 pub use app::TextureGraphApp;
 

@@ -22,7 +22,7 @@ use std::collections::HashMap;
 
 use texture_graph_core::{EvalCtx, Graph, LayerId};
 
-use crate::app::GpuBits;
+use crate::GpuBits;
 use crate::catalog;
 use crate::previews::PreviewCache;
 use crate::state::{EditCmd, NodeRef, UiState};
@@ -349,13 +349,15 @@ mod canvas_tests {
             let state = &mut self.state;
             let previews = &mut self.previews;
             let eval = &self.eval;
-            let out = self.ctx.run_ui(input, |ctx| {
+            let mut out = self.ctx.run_ui(input, |ctx| {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
                     .show(ctx, |ui| {
                         super::show(ui, graph, state, previews, eval, None);
                     });
             });
+            // No painter here to apply them to.
+            out.textures_delta.clear();
             self.state.drain_into(&mut self.graph);
             let mut n = 0;
             for clipped in &out.shapes {

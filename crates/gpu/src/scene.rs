@@ -285,7 +285,7 @@ impl SceneRenderer {
         };
 
         let aspect  = size.0 as f32 / size.1 as f32;
-        let proj    = Mat4::perspective_rh(camera.fov_y, aspect, 0.1, 20.0);
+        let proj    = glam::camera::rh::proj::directx::perspective(camera.fov_y, aspect, 0.1, 20.0);
         // The camera is fixed and `orientation` rotates the model, so the
         // side facing the viewer is always lit. Orbiting the camera puts the
         // viewer on the unlit side for half a turn.
@@ -294,7 +294,7 @@ impl SceneRenderer {
             camera.distance * camera.pitch.sin(),
             camera.distance * camera.pitch.cos(),
         );
-        let view = Mat4::look_at_rh(cam_pos, Vec3::ZERO, Vec3::Y);
+        let view = glam::camera::rh::view::look_at_mat4(cam_pos, Vec3::ZERO, Vec3::Y);
         let view_proj = proj * view;
 
         let bind_groups: Vec<(&wgpu::RenderPipeline, wgpu::BindGroup)> = layers
@@ -724,7 +724,7 @@ fn make_scene_pipeline(
             module: &shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
-            buffers: &[vertex_layout],
+            buffers: &[Some(vertex_layout)],
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,

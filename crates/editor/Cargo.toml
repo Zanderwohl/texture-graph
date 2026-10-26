@@ -1,0 +1,16 @@
+[package]
+name = "texture-graph-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Only egui and wgpu, no windowing: the standalone app and a bevy_egui host
+# draw the same panels. egui is held to what bevy_egui asks for.
+[dependencies]
+texture-graph-core = { path = "../core", default-features = false }
+texture-graph-gpu = { path = "../gpu" }
+egui = "0.36"
+wgpu.workspace = true
+glam.workspace = true
+palette.workspace = true
+log = "0.4"

@@ -166,7 +166,7 @@ fn copy_to_buffer(
 }
 
 fn unpad(buffer: &wgpu::Buffer, padded_bpr: u32, packed_bpr: u32, rows: u32) -> Vec<u8> {
-    let data = buffer.slice(..).get_mapped_range();
+    let data = buffer.slice(..).get_mapped_range().expect("buffer was mapped");
     let mut out = Vec::with_capacity((packed_bpr * rows) as usize);
     for y in 0..rows {
         out.extend_from_slice(&data[(y * padded_bpr) as usize..][..packed_bpr as usize]);

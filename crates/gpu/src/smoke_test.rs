@@ -139,7 +139,7 @@ fn run_smoke() -> [f32; 4] {
     slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
     ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
     rx.recv().expect("map channel").expect("map");
-    let data = slice.get_mapped_range();
+    let data = slice.get_mapped_range().expect("buffer was mapped");
     let pixel: [f32; 4] = bytemuck::from_bytes::<[f32; 4]>(&data[..16]).clone();
     drop(data);
     readback.unmap();

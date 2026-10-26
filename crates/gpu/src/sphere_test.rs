@@ -307,7 +307,7 @@ fn sample_cubes(ctx: &DeviceCtx, cubes: &[wgpu::TextureView], dirs: &[[f32; 4]])
     ctx.queue.submit([enc.finish()]);
     read_buf.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("map"));
     device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
-    let data = read_buf.slice(..).get_mapped_range();
+    let data = read_buf.slice(..).get_mapped_range().expect("buffer was mapped");
     let values: &[[f32; 4]] = bytemuck::cast_slice(&data);
     values.iter().map(|v| [v[0], v[1], v[2]]).collect()
 }

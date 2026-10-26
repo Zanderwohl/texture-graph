@@ -1,7 +1,7 @@
 //! Per-layer preview cache.
 //!
-//! GPU path: `Baker::bake_previews` bakes thumbnails, registered with
-//! egui-wgpu and kept per layer. CPU fallback bakes lazily via `evaluate`.
+//! GPU path: `Baker::bake_previews` bakes thumbnails, registered through the host's
+//! [`crate::TextureRegistry`] and kept per layer. CPU fallback bakes lazily via `evaluate`.
 //!
 //! # Staleness
 //!
@@ -23,7 +23,7 @@ use egui::{Color32, ColorImage, TextureHandle, TextureId, TextureOptions};
 use texture_graph_core::color::to_srgb8;
 use texture_graph_core::{EvalCtx, Graph, LayerId, Sample, evaluate};
 
-use crate::app::GpuBits;
+use crate::GpuBits;
 use crate::throttle::Throttle;
 
 pub const PREVIEW_SIZE: u32 = 128;
@@ -74,7 +74,7 @@ impl PreviewCache {
         graph: &Graph,
         revision: u64,
         dirty: Option<&HashSet<LayerId>>,
-        gpu: Option<&GpuBits>,
+        gpu: Option<&mut GpuBits>,
     ) {
         self.revision = revision;
         self.rebuilt_this_frame = false;
@@ -201,12 +201,11 @@ impl PreviewCache {
         }
         log::debug!("thumbnail bake done count={}", new_texs.len());
 
-        let device = gpu.baker.ctx().device.clone();
-        let mut r = gpu.renderer.write();
+        let r = &mut gpu.textures;
         let mut replaced: Vec<TextureId> = Vec::new();
         for (lid, tex) in new_texs {
             let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-            let tid = r.register_native_texture(&device, &view, wgpu::FilterMode::Linear);
+            let tid = r.register(&tex, &view);
             // Register the replacement before retiring what it replaces, so
             // nothing on screen has a frame with no texture behind it.
             let old = self.gpu_entries.insert(
@@ -219,11 +218,11 @@ impl PreviewCache {
             self.cpu_entries.remove(&lid);
         }
         for id in replaced {
-            r.free_texture(&id);
+            r.free(id);
         }
     }
 
-    fn forget_dead(&mut self, graph: &Graph, gpu: Option<&GpuBits>) {
+    fn forget_dead(&mut self, graph: &Graph, gpu: Option<&mut GpuBits>) {
         let dead: Vec<LayerId> = self
             .gpu_entries
             .keys()
@@ -244,9 +243,8 @@ impl PreviewCache {
         }
         self.stale_at.retain(|id, _| graph.contains(*id));
         if let Some(gpu) = gpu {
-            let mut r = gpu.renderer.write();
             for id in freed {
-                r.free_texture(&id);
+                gpu.textures.free(id);
             }
         }
     }

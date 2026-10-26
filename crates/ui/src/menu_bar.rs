@@ -1,9 +1,8 @@
 use texture_graph_core::Graph;
-
-use crate::state::{EditCmd, UiState};
+use texture_graph_editor::{EditCmd, UiState};
 
 /// Sets the wants-save/open flags; `file_io` runs the dialogs.
-pub fn show(ui: &mut egui::Ui, _graph: &Graph, state: &mut UiState) {
+pub fn show(ui: &mut egui::Ui, state: &mut UiState) {
     egui::MenuBar::new().ui(ui, |ui| {
         ui.menu_button("File", |ui| {
             if ui.button("New").clicked() {

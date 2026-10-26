@@ -11,7 +11,7 @@ use texture_graph_core::{
     ParamUse, ScalarInput, crater::MAX_CLASSES as MAX_CRATER_CLASSES, noise::MAX_OCTAVES,
 };
 
-use crate::app::GpuBits;
+use crate::GpuBits;
 use crate::color_convert::{oklcha_to_srgba, srgba_to_oklcha};
 use crate::previews::PreviewCache;
 use crate::state::{

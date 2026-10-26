@@ -37,6 +37,7 @@ impl DeviceCtx {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
                 compatible_surface: None,
+                ..Default::default()
             })
             .await
             .map_err(|e| {

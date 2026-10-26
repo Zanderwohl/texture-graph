@@ -14,8 +14,8 @@ have yet, in the order it blocks work.
 
 **Consumer facts that constrain the design:**
 
-- bevy 0.19.1 → wgpu 29.0.4. Our `wgpu = "29.0.3"` already matches, so the
-  consumer links one copy. Keep it that way ([Cargo.toml](../Cargo.toml) already
+- bevy 0.20 → wgpu 30. Our `wgpu = "30.0.1"` matches, so the consumer links
+  one copy. Keep it that way ([Cargo.toml](../Cargo.toml) already
   says so).
 - `DeviceCtx::from_shared` is enough to adopt bevy's device: `RenderAdapter`,
   `RenderDevice`, `RenderQueue` are all `Clone` and bevy inserts them into the
