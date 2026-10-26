@@ -27,7 +27,8 @@ pub use state::{EditCmd, UiState};
 /// host renderer's job, so the editor never names one.
 pub trait TextureRegistry {
     /// Sampled with linear filtering. The editor keeps `texture` alive until
-    /// it frees the id.
+    /// it frees the id. An `Rgba8Unorm` texture holds sRGB-encoded bytes and
+    /// can be viewed through [`texture_graph_gpu::SRGB_VIEW`].
     fn register(&mut self, texture: &wgpu::Texture, view: &wgpu::TextureView) -> egui::TextureId;
     fn free(&mut self, id: egui::TextureId);
 }
