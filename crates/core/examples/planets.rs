@@ -66,6 +66,16 @@ fn main() {
              layer is the relief about zero, for a host to light.",
             airless(),
         ),
+        (
+            "icy.tgraph",
+            "Icy",
+            "Any airless icy world, from Callisto to Europa to Pluto: three series of craters on \
+             ice darkened in places by a lag of rock and organics, young resurfaced plains that \
+             erase the oldest craters, and crossing lineae. Crater densities, the shares of \
+             plains and lag, the lineae's strength and the colors are parameters. Its \"height\" \
+             layer is the relief about zero, for a host to light.",
+            icy(),
+        ),
     ] {
         let meta = FileMetadata {
             name: name.into(),
@@ -698,6 +708,125 @@ fn airless() -> Graph {
     );
 
     let roughness = b.gray("roughness", 0.9);
+    b.finish(color, roughness, None)
+}
+
+fn icy() -> Graph {
+    let mut b = Builder::new();
+    b.param("ancient craters", 0.0, 1.0, 1.0, "The oldest series, which resurfacing erases: 1 is a surface saturated with craters.");
+    b.param("later craters", 0.0, 1.0, 0.35, "The series after the resurfacing, which lands on the plains too.");
+    b.param("fresh craters", 0.0, 1.0, 0.2, "The youngest series, sharp and bright-rayed.");
+    b.param("resurfaced", 0.0, 1.0, 0.3, "How much of the surface is young plains, where ice welled up and erased the old craters. A host picks it from the share of the surface.");
+    b.param("lag", 0.0, 1.0, 0.3, "How much of the old ground lies under a dark lag of rock and organics. A host picks it from the share of the surface.");
+    b.param("fractures", 0.0, 1.0, 0.3, "How strongly the lineae show: 0 is none.");
+    b.param("rays", 0.0, 1.0, 0.7, "How bright fresh ejecta is over the ground it lands on.");
+    b.param_color("frost", oklcha(0.88, 0.012, 230.0, 1.0), "Clean old ice.");
+    b.param_color("dark", oklcha(0.45, 0.02, 60.0, 1.0), "The lag.");
+    b.param_color("plains", oklcha(0.91, 0.01, 220.0, 1.0), "The young plains.");
+    b.param_color("lineae", oklcha(0.62, 0.05, 45.0, 1.0), "The lineae: salts and organics brought up along the cracks.");
+    b.param_color("ejecta", oklcha(0.94, 0.008, 230.0, 1.0), "Fresh ejecta, before radiation darkens it.");
+
+    let sphere = |c: Craters| Craters { surface: CraterSurface::Sphere, relief: CRATER_RELIEF, ..c };
+    let ancient = b.add_layer(
+        "ancient",
+        LayerKind::Craters(sphere(Craters {
+            density: ScalarInput::Param("ancient craters".into()),
+            frequency: 1.5,
+            classes: 6,
+            depth: 0.3,
+            age: 0.8,
+            ..Craters::default()
+        })),
+    );
+
+    // Resurfacing comes up in broad provinces, Ganymede's bright terrain, rather than pooling in
+    // the lowest ground as lava does, so its field is noise alone. It levels the old craters.
+    let provinces = b.fbm("provinces", 22, 0.8, 4, 0.5, FractalMode::Standard);
+    let resurfaced = b.param_gray("resurfaced level", "resurfaced");
+    // Centered on a half, since a Map clamps its value to [0, 1] before the lookup.
+    let datum = b.gray("datum", crater::DATUM);
+    let plains_drive = b.weighted_sum("plains drive", &[(provinces, 1.0), (resurfaced, 1.0), (datum, -1.0)]);
+    let plains = b.remap("plains", plains_drive, 0.49, 0.51);
+    let leveled = b.blend("leveled", ancient, datum, plains);
+
+    let later = b.add_layer(
+        "later",
+        LayerKind::Craters(sphere(Craters {
+            under: ScalarInput::Layer(leveled),
+            density: ScalarInput::Param("later craters".into()),
+            seed_offset: 1,
+            frequency: 2.5,
+            classes: 5,
+            gain: 1.0,
+            depth: 0.35,
+            age: 0.4,
+            ..Craters::default()
+        })),
+    );
+    let fresh_series = sphere(Craters {
+        under: ScalarInput::Layer(later),
+        density: ScalarInput::Param("fresh craters".into()),
+        seed_offset: 2,
+        frequency: 3.0,
+        classes: 5,
+        gain: 1.15,
+        depth: 0.4,
+        peak: 0.5,
+        rays: 0.8,
+        ..Craters::default()
+    });
+    let fresh = b.add_layer("fresh", LayerKind::Craters(fresh_series.clone()));
+
+    // Lineae: the crest lines of two contour fields, which wander and cross as Europa's do.
+    // Low-frequency fields make long gentle arcs; more octaves would curl them into loops.
+    let swirl_a = b.fbm("swirl a", 23, 0.7, 2, 0.35, FractalMode::Standard);
+    let swirl_b = b.fbm("swirl b", 24, 0.9, 2, 0.35, FractalMode::Standard);
+    let crest_a = b.wave("crest a", swirl_a, WaveShape::Triangle, 14.0, 0.0);
+    let crest_b = b.wave("crest b", swirl_b, WaveShape::Triangle, 11.0, 0.0);
+    let crests = b.max("crests", crest_a, crest_b);
+    let lines = b.remap("lines", crests, 0.93, 0.985);
+    let fractures = b.param_gray("fractures level", "fractures");
+    let lineae = b.multiply("lineae", lines, fractures);
+    // A ridge along each, a fraction of a crater's relief.
+    let ridges = b.scale("ridges", lineae, 0.02);
+    let raised = b.add("raised", fresh, ridges);
+    b.sub("height", raised, datum);
+
+    let ejecta = b.add_layer(
+        "ejecta",
+        LayerKind::Craters(Craters {
+            under: ScalarInput::Const(0.0),
+            output: CraterOutput::Ejecta,
+            ..fresh_series
+        }),
+    );
+
+    // The lag gathers on the old ground and never on the plains, which came up after it.
+    let patches = b.fbm("patches", 25, 1.2, 5, 0.55, FractalMode::Standard);
+    let lag = b.param_gray("lag level", "lag");
+    let lag_drive = b.weighted_sum("lag drive", &[(patches, 1.0), (lag, 1.0), (datum, -1.0)]);
+    let lag_cover = b.remap("lag cover", lag_drive, 0.47, 0.53);
+    let one = b.gray("one", 1.0);
+    let old_ground = b.sub("old ground", one, plains);
+    let lagged = b.multiply("lagged", lag_cover, old_ground);
+
+    let frost = b.param_color_layer("frost color", "frost");
+    let dark = b.param_color_layer("dark color", "dark");
+    let plains_color = b.param_color_layer("plains color", "plains");
+    let lineae_color = b.param_color_layer("lineae color", "lineae");
+    let ejecta_color = b.param_color_layer("ejecta color", "ejecta");
+    // Every color mix in linear light, as a renderer mixes albedos.
+    let old = b.linear_blend("old", frost, dark, lagged);
+    let ground = b.linear_blend("ground", old, plains_color, plains);
+    let cracked = b.linear_blend("cracked", ground, lineae_color, lineae);
+    let mottle = b.fbm("mottle", 21, 5.0, 6, 0.55, FractalMode::Standard);
+    let shade = b.scale("shade", mottle, 0.2);
+    let zero = b.black();
+    let mottled = b.linear_blend("mottled", cracked, zero, shade);
+    let bright = b.mix("bright", zero, ejecta, BlendMode::Blend, ScalarInput::Param("rays".into()));
+    let color = b.linear_blend("color", mottled, ejecta_color, bright);
+
+    let roughness = b.gray("roughness", 0.8);
     b.finish(color, roughness, None)
 }
 
